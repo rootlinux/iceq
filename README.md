@@ -100,6 +100,28 @@ Direct-message safety numbers are computed client-side from the two users' UINs 
 - **No-new-privileges** — `no-new-privileges:true` on every container prevents privilege escalation
 - **Resource limits** — each container is capped at CPU and memory to limit blast radius
 
+### Existing database volumes: required security migrations
+
+Docker initdb mounts run only when a fresh, empty volume is created. Before deploying this revision onto existing PostgreSQL or Scylla volumes, run these idempotent commands from the repository root:
+
+```bash
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'psql --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < deploy/init/migrations/005_wiped_accounts.sql
+
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
+  cqlsh < deploy/init/migrations/004_panic_wipe_message_indexes.cql
+```
+
+Credentials expand only inside the containers and passwords are not printed. Both commands are safe to retry because the migrations use `CREATE TABLE IF NOT EXISTS`. Verify PostgreSQL before restarting authenticated services:
+
+```bash
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'psql --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --command "SELECT to_regclass('"'"'public.wiped_accounts'"'"');"'
+```
+
+Until `005_wiped_accounts.sql` is applied, JWT validation cannot prove durable revocation and fails closed. Authenticated REST requests and WebSocket authentication/message checks will therefore be rejected. Apply both migrations before rolling out the updated auth-service or ws-gateway containers.
+
 ## Tor Hidden Service
 
 IceQ runs as a Tor v3 hidden service out of the box. The `.onion` address is auto-generated on first boot and stored in the `tor_keys` Docker volume. Onion-Location is optional and must be enabled after that address is known by setting `ICEQ_ONION_LOCATION` in `deploy/.env.local`.
