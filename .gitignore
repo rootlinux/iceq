@@ -21,4 +21,7 @@ backend/cmd_smoke_msgsvc/smoke
 
 # OS/editor noise
 .DS_Store
+
+# Local isolated development worktrees
+.worktrees/
     
