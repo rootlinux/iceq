@@ -69,6 +69,8 @@ type config struct {
 	RedisAddr       string
 	RedisPassword   string
 	NATSURL         string
+	ScyllaHosts     string
+	ScyllaKeyspace  string
 	JWTSecret       string
 	AllowedOrigins  string
 	ShutdownTimeout time.Duration
@@ -81,6 +83,8 @@ func loadConfig() config {
 		RedisAddr:       envOr("ICEQ_REDIS_ADDR", "redis:6379"),
 		RedisPassword:   envOr("ICEQ_REDIS_PASSWORD", ""),
 		NATSURL:         envOr("ICEQ_NATS_URL", "nats://nats:4222"),
+		ScyllaHosts:     envOr("ICEQ_SCYLLA_HOSTS", "scylla:9042"),
+		ScyllaKeyspace:  envOr("ICEQ_SCYLLA_KEYSPACE", "iceq"),
 		JWTSecret:       envOr("ICEQ_JWT_SECRET", ""),
 		AllowedOrigins:  envOr("ICEQ_ALLOWED_ORIGINS", "https://localhost"),
 		ShutdownTimeout: 10 * time.Second,
@@ -142,6 +146,19 @@ func main() {
 	}
 	defer func() { _ = rdb.Close() }()
 	log.Printf("[auth-service] redis: connected to %s", cfg.RedisAddr)
+
+	// Panic wipe must be able to remove ciphertext rows. Fail startup if the
+	// dependency is unavailable instead of silently shipping a partial wipe.
+	scyllaSession, err := db.NewScyllaSession(db.Config{ScyllaHosts: cfg.ScyllaHosts, ScyllaKeyspace: cfg.ScyllaKeyspace})
+	if err != nil {
+		log.Fatalf("scylla: %v", err)
+	}
+	defer scyllaSession.Close()
+	messageStore, err := handlers.NewScyllaMessageStore(scyllaSession)
+	if err != nil {
+		log.Fatalf("scylla message store: %v", err)
+	}
+	panicWipeDeps := newPanicWipeDeps(pgPool, rdb, messageStore)
 
 	// --- JWT manager ---------------------------------------------------
 	// F-2 / F-5 (JWT assessment): NewManager now requires the pg
@@ -211,11 +228,7 @@ func main() {
 			// because no message-service is wired yet;
 			// step 4 (or whenever the message-service
 			// lands) will fill it in.
-			Wipe: &handlers.PanicWipeDeps{
-				Pool:   pgPool,
-				Redis:  rdb,
-				Scylla: nil, // message-service wires this in step 4+
-			},
+			Wipe: &panicWipeDeps,
 		}))
 		r.With(csrfMW).Post("/refresh", handlers.NewRefreshHandler(handlers.RefreshDeps{
 			Pool:    pgPool,
@@ -254,11 +267,7 @@ func main() {
 		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
 			Manager: mgr,
 		}), csrfMW).Post("/panic-wipe", handlers.NewManualPanicWipeHandler(handlers.ManualPanicWipeDeps{
-			PanicWipeDeps: handlers.PanicWipeDeps{
-				Pool:   pgPool,
-				Redis:  rdb,
-				Scylla: nil,
-			},
+			PanicWipeDeps: panicWipeDeps,
 		}))
 		r.Get("/health", newHealthHandler(pgPool, rdb, VERSION))
 	})
@@ -335,6 +344,10 @@ func main() {
 		log.Printf("[auth-service] nats drain failed: %v", err)
 	}
 	log.Printf("[auth-service] bye")
+}
+
+func newPanicWipeDeps(pool *pgxpool.Pool, redisClient *redis.Client, store handlers.MessageStore) handlers.PanicWipeDeps {
+	return handlers.PanicWipeDeps{Pool: pool, Redis: redisClient, Scylla: store}
 }
 
 // ----------------------------------------------------------------------------

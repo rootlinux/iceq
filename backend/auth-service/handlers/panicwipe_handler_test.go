@@ -11,6 +11,11 @@ import (
 	"github.com/iceq/iceq/shared/middleware"
 )
 
+type recordingMessageStore struct{}
+
+func (*recordingMessageStore) DeleteUserMessages(context.Context, int64) error      { return nil }
+func (*recordingMessageStore) DeleteUserGroupMessages(context.Context, int64) error { return nil }
+
 func TestManualPanicWipeHandlerUsesAuthenticatedUINAndClearsCookies(t *testing.T) {
 	const authenticatedUIN int64 = 10000001
 
@@ -45,6 +50,30 @@ func TestManualPanicWipeHandlerUsesAuthenticatedUINAndClearsCookies(t *testing.T
 	}
 	if refresh.MaxAge != -1 || access.MaxAge != -1 {
 		t.Fatalf("MaxAge refresh=%d access=%d, want -1", refresh.MaxAge, access.MaxAge)
+	}
+}
+
+func TestManualPanicWipeHandlerPassesMessageStoreDependencyToWipe(t *testing.T) {
+	store := &recordingMessageStore{}
+	var got MessageStore
+	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
+		PanicWipeDeps: PanicWipeDeps{Scylla: store},
+		Wipe: func(_ context.Context, deps PanicWipeDeps, _ int64) error {
+			got = deps.Scylla
+			return nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/panic-wipe", nil)
+	req = req.WithContext(middleware.WithUIN(req.Context(), 10000003))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusNoContent)
+	}
+	if got != store {
+		t.Fatalf("message store = %#v, want %#v", got, store)
 	}
 }
 

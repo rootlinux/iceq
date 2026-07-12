@@ -72,6 +72,7 @@ Implemented:
 - Caddy enforces HSTS, CSP, X-Frame-Options, Referrer-Policy, Permissions-Policy, and X-Content-Type-Options.
 - Optional Scylla TTL can expire encrypted message rows.
 - Panic-wipe support removes keys, contacts, refresh tokens, group memberships, and message rows on destructive account wipe.
+- Auth-service now requires its Scylla session at startup and wires a row-specific message store into both automatic and manual panic-wipe paths; Scylla cleanup remains best-effort after the atomic PostgreSQL wipe.
 - CI security workflow now runs backend tests, web tests/build, npm audit, and Compose config validation.
 
 Remaining:
@@ -145,7 +146,7 @@ Run locally before shipping:
 
 ```bash
 cd backend && go test ./...
-cd web && npm ci && npm audit --audit-level=high && node --test tests/*.test.mjs tests/*.test.ts && npm run build
+cd web && npm ci && npm audit --audit-level=high && node --import tsx --test tests/*.test.mjs tests/*.test.ts && npm run build
 cp deploy/.env.example deploy/.env.local
 docker compose -f deploy/docker-compose.yml config --quiet
 ```

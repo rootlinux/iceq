@@ -1,10 +1,24 @@
 package main
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
 )
+
+type routeMessageStore struct{}
+
+func (*routeMessageStore) DeleteUserMessages(context.Context, int64) error      { return nil }
+func (*routeMessageStore) DeleteUserGroupMessages(context.Context, int64) error { return nil }
+
+func TestNewPanicWipeDepsRetainsMessageStore(t *testing.T) {
+	store := &routeMessageStore{}
+	deps := newPanicWipeDeps(nil, nil, store)
+	if deps.Scylla != store {
+		t.Fatalf("Scylla = %#v, want %#v", deps.Scylla, store)
+	}
+}
 
 func TestStateChangingCookieRoutesRequireCSRF(t *testing.T) {
 	src, err := os.ReadFile("main.go")
