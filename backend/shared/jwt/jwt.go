@@ -6,9 +6,9 @@
 // used in place of an access token (or vice versa):
 //
 //   - "access"  — short-lived (15 min), used as the bearer credential for
-//                 every authenticated REST / WebSocket call.
+//     every authenticated REST / WebSocket call.
 //   - "refresh" — long-lived (7 days), used only at the auth-service
-//                 /api/auth/refresh endpoint to mint a new access token.
+//     /api/auth/refresh endpoint to mint a new access token.
 //
 // Revocation is implemented in two layers:
 //
@@ -38,9 +38,16 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
+
+type postgresQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
 
 // ----------------------------------------------------------------------------
 // Errors. Exposed as sentinel values so call-sites can use errors.Is for
@@ -188,7 +195,7 @@ type Claims struct {
 type Manager struct {
 	secret []byte
 	rdb    *redis.Client
-	pg     *pgxpool.Pool
+	pg     postgresQuerier
 }
 
 // NewManager constructs a Manager. The secret must be:
@@ -358,6 +365,14 @@ func (m *Manager) Verify(ctx context.Context, raw string, expectedType string) (
 		return nil, ErrTokenWrongType
 	}
 
+	wiped, err := m.IsAccountWiped(ctx, claims.UIN)
+	if err != nil {
+		return nil, fmt.Errorf("%w: durable wipe lookup: %v", ErrSessionEpochLookup, err)
+	}
+	if wiped {
+		return nil, ErrTokenRevoked
+	}
+
 	// Blocklist check. We do this AFTER signature/expiration/type
 	// validation so a revoked-but-expired token doesn't burn a Redis
 	// round trip. The `EXISTS` command returns 0 or 1 and is cheaper
@@ -396,6 +411,12 @@ func (m *Manager) Verify(ctx context.Context, raw string, expectedType string) (
 	}
 
 	return claims, nil
+}
+
+func (m *Manager) IsAccountWiped(ctx context.Context, uin int64) (bool, error) {
+	var wiped bool
+	err := m.pg.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM wiped_accounts WHERE uin = $1)`, uin).Scan(&wiped)
+	return wiped, err
 }
 
 // SessionEpoch returns the current session_epoch for the user. The

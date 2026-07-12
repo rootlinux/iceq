@@ -91,6 +91,7 @@ services:
       - ./init/migrations/001_session_epoch.sql:/docker-entrypoint-initdb.d/02-session_epoch.sql:ro
       - ./init/migrations/002_prekey_bundle_registration_id.sql:/docker-entrypoint-initdb.d/03-prekey_bundle_registration_id.sql:ro
       - ./init/migrations/003_contacts_requested_by.sql:/docker-entrypoint-initdb.d/04-contacts_requested_by.sql:ro
+      - ./init/migrations/005_wiped_accounts.sql:/docker-entrypoint-initdb.d/05-wiped_accounts.sql:ro
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /run:size=16m,mode=0755

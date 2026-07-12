@@ -319,6 +319,9 @@ func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) error {
 	if _, err := tx.Exec(ctx, qWipeSecuritySettings, uin); err != nil {
 		return fmt.Errorf("panicwipe: delete user_security_settings: %w", err)
 	}
+	if _, err := tx.Exec(ctx, qMarkAccountWiped, uin); err != nil {
+		return fmt.Errorf("panicwipe: mark account wiped: %w", err)
+	}
 
 	// 8. UPDATE users SET ... (anonymize in place; the row stays
 	//    for FK integrity)

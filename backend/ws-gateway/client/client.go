@@ -478,6 +478,12 @@ func (c *Client) readLoop() {
 		// fires while the connection is open. The
 		// per-message EXISTS is the gate.
 		wipeCtx, wipeCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		durablyWiped, derr := c.deps.Manager.IsAccountWiped(wipeCtx, c.uin)
+		if derr != nil || durablyWiped {
+			wipeCancel()
+			_ = c.ws.Close(CloseCodeWiped, "account_wiped")
+			return
+		}
 		wiped, werr := c.deps.Redis.Exists(wipeCtx, wipeCheckPrefix+strconv.FormatInt(c.uin, 10)).Result()
 		wipeCancel()
 		if werr != nil {

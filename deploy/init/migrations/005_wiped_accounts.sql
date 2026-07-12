@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS wiped_accounts (
+  uin BIGINT PRIMARY KEY REFERENCES users(uin),
+  wiped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

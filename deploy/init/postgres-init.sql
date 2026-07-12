@@ -66,6 +66,11 @@ CREATE TABLE users (
   updated_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE wiped_accounts (
+  uin BIGINT PRIMARY KEY REFERENCES users(uin),
+  wiped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE contacts (
   owner_uin        BIGINT REFERENCES users(uin),
   target_uin       BIGINT REFERENCES users(uin),

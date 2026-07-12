@@ -156,6 +156,7 @@ const (
 	// user can re-register with the same UIN in the future, but
 	// the panic-wipe flag should not be inherited.
 	qWipeSecuritySettings = `DELETE FROM user_security_settings WHERE uin = $1`
+	qMarkAccountWiped     = `INSERT INTO wiped_accounts (uin) VALUES ($1) ON CONFLICT (uin) DO NOTHING`
 
 	// qWipeUserAnonymizes the users row. The shell record
 	// stays (so FKs into it still resolve to something) but
@@ -197,6 +198,7 @@ const (
 		    username      = 'deleted_' || $1::text,
 		    password_hash = '',
 		    email         = NULL,
+		    session_epoch = NOW(),
 		    updated_at    = NOW()
 		WHERE uin = $1
 	`

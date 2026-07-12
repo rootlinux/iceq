@@ -72,7 +72,7 @@ Implemented:
 - Caddy enforces HSTS, CSP, X-Frame-Options, Referrer-Policy, Permissions-Policy, and X-Content-Type-Options.
 - Optional Scylla TTL can expire encrypted message rows.
 - Panic-wipe support removes keys, contacts, refresh tokens, group memberships, and message rows on destructive account wipe.
-- Auth-service requires its Scylla session at startup and wires the same message store into automatic and manual panic-wipe paths. Session revocation/blocklisting completes before bounded best-effort ciphertext cleanup. Direct sender/receiver and group-sender index partitions provide exact primary keys, avoiding cluster-wide `ALLOW FILTERING` scans; new message rows and their deletion-index rows are committed in one logged batch.
+- Auth-service requires its Scylla session at startup and wires the same message store into automatic and manual panic-wipe paths. A minimal `wiped_accounts(uin, wiped_at)` marker commits in the PostgreSQL wipe transaction; JWT verification and every inbound WebSocket frame check it before Redis, so Redis is only a cache/fast path. The insert is idempotent and UINs come from a non-reused sequence, so later registrations cannot inherit or erase an old identity's marker. Session blocklisting completes before bounded best-effort ciphertext cleanup. Direct sender/receiver and group-sender index partitions provide exact primary keys, avoiding cluster-wide `ALLOW FILTERING` scans; new message rows and their deletion-index rows are committed in one logged batch.
 - CI security workflow now runs backend tests, web tests/build, npm audit, and Compose config validation.
 
 Remaining:
