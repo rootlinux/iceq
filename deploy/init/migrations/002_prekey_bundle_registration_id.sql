@@ -1,0 +1,2 @@
+ALTER TABLE prekey_bundles
+  ADD COLUMN IF NOT EXISTS registration_id INTEGER NOT NULL DEFAULT 0;

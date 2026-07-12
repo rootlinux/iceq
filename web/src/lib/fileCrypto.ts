@@ -1,0 +1,148 @@
+export type FileEncryptionAlgorithm = "AES-256-GCM";
+
+export interface EncryptedFileManifest {
+  version: 1;
+  algorithm: FileEncryptionAlgorithm;
+  key: string;
+  nonce: string;
+  mime_type: string;
+  size: number;
+  name?: string;
+}
+
+export interface EncryptedFileBlob {
+  encryptedBlob: Blob;
+  manifest: EncryptedFileManifest;
+}
+
+const MANIFEST_VERSION = 1;
+const ALGORITHM: FileEncryptionAlgorithm = "AES-256-GCM";
+const KEY_LENGTH_BITS = 256;
+const NONCE_LENGTH_BYTES = 12;
+const FALLBACK_MIME = "application/octet-stream";
+
+export async function encryptFileBlob(blob: Blob, displayName?: string): Promise<EncryptedFileBlob> {
+  const key = await globalThis.crypto.subtle.generateKey(
+    { name: "AES-GCM", length: KEY_LENGTH_BITS },
+    true,
+    ["encrypt", "decrypt"],
+  );
+  const nonce = new Uint8Array(NONCE_LENGTH_BYTES);
+  globalThis.crypto.getRandomValues(nonce);
+
+  const plaintext = await blob.arrayBuffer();
+  const ciphertext = await globalThis.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: nonce },
+    key,
+    plaintext,
+  );
+  const rawKey = await globalThis.crypto.subtle.exportKey("raw", key);
+  const mimeType = normalizeMimeType(blob.type);
+  const name = sanitizeDisplayName(displayName);
+
+  return {
+    encryptedBlob: new Blob([ciphertext], { type: FALLBACK_MIME }),
+    manifest: {
+      version: MANIFEST_VERSION,
+      algorithm: ALGORITHM,
+      key: arrayBufferToB64Url(rawKey),
+      nonce: arrayBufferToB64Url(nonce.buffer),
+      mime_type: mimeType,
+      size: blob.size,
+      ...(name ? { name } : {}),
+    },
+  };
+}
+
+export async function decryptFileBlob(
+  encryptedBlob: Blob,
+  manifest: EncryptedFileManifest,
+): Promise<Blob> {
+  if (!isEncryptedFileManifest(manifest)) {
+    throw new Error("invalid encrypted file manifest");
+  }
+  const key = await globalThis.crypto.subtle.importKey(
+    "raw",
+    b64UrlToArrayBuffer(manifest.key),
+    { name: "AES-GCM", length: KEY_LENGTH_BITS },
+    false,
+    ["decrypt"],
+  );
+  const plaintext = await globalThis.crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: b64UrlToArrayBuffer(manifest.nonce) },
+    key,
+    await encryptedBlob.arrayBuffer(),
+  );
+  return new Blob([plaintext], { type: manifest.mime_type });
+}
+
+export function isEncryptedFileManifest(value: unknown): value is EncryptedFileManifest {
+  if (!value || typeof value !== "object") return false;
+  const m = value as Partial<EncryptedFileManifest>;
+  return m.version === MANIFEST_VERSION
+    && m.algorithm === ALGORITHM
+    && typeof m.key === "string"
+    && b64UrlByteLength(m.key) === 32
+    && typeof m.nonce === "string"
+    && b64UrlByteLength(m.nonce) === NONCE_LENGTH_BYTES
+    && typeof m.mime_type === "string"
+    && m.mime_type.length > 0
+    && typeof m.size === "number"
+    && Number.isSafeInteger(m.size)
+    && m.size >= 0
+    && (m.name === undefined || (typeof m.name === "string" && m.name.length > 0));
+}
+
+export function serializeEncryptedFileManifest(manifest: EncryptedFileManifest): string {
+  if (!isEncryptedFileManifest(manifest)) {
+    throw new Error("invalid encrypted file manifest");
+  }
+  return JSON.stringify(manifest);
+}
+
+export function parseEncryptedFileManifest(raw: string): EncryptedFileManifest {
+  const parsed = JSON.parse(raw) as unknown;
+  if (!isEncryptedFileManifest(parsed)) {
+    throw new Error("invalid encrypted file manifest");
+  }
+  return parsed;
+}
+
+function normalizeMimeType(type: string): string {
+  const trimmed = type.trim().toLowerCase();
+  if (!trimmed || trimmed.length > 127 || /[\r\n;]/.test(trimmed)) {
+    return FALLBACK_MIME;
+  }
+  return trimmed;
+}
+
+function sanitizeDisplayName(name?: string): string | undefined {
+  if (!name) return undefined;
+  const normalized = name.replace(/\\/g, "/").split("/").filter(Boolean).pop()?.trim();
+  if (!normalized || normalized === "." || normalized === "..") return undefined;
+  return normalized.slice(0, 120);
+}
+
+function arrayBufferToB64Url(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]!);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function b64UrlToArrayBuffer(s: string): ArrayBuffer {
+  const pad = "=".repeat((4 - (s.length % 4)) % 4);
+  const b = atob(s.replace(/-/g, "+").replace(/_/g, "/") + pad);
+  const out = new Uint8Array(b.length);
+  for (let i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
+  return out.buffer;
+}
+
+function b64UrlByteLength(s: string): number {
+  if (!/^[A-Za-z0-9_-]+$/.test(s)) return -1;
+  try {
+    return b64UrlToArrayBuffer(s).byteLength;
+  } catch {
+    return -1;
+  }
+}

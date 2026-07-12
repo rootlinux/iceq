@@ -1,0 +1,393 @@
+package handlers
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/iceq/iceq/auth-service/models"
+	"github.com/iceq/iceq/shared/jwt"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// ----------------------------------------------------------------------------
+// Rate limiter. The limit is enforced before we touch the database
+// or the bcrypt comparison — a brute-force attack should be
+// stopped at the door, not after we've spent 250 ms of CPU on a
+// bcrypt comparison.
+//
+// The Lua script implements a fixed-window counter: it INCRs the
+// per-IP key and, on the first increment only, sets the TTL. The
+// single-shot TTL is critical: resetting the TTL on every
+// increment would turn a 5/minute limit into a "5 per minute of
+// silence" limit, which is the wrong shape.
+// ----------------------------------------------------------------------------
+
+const (
+	// rateLimitPerMinute is the threshold above which login
+	// attempts are rejected with 429. Five per minute matches
+	// the OWASP "credential stuffing cheat sheet" guidance and
+	// tolerates two or three mis-typed passwords by a real user.
+	rateLimitPerMinute = 5
+
+	// rateLimitWindow is the TTL applied to the counter on its
+	// first increment. With a 60 s window, a user who hits the
+	// limit gets a clean slate one minute later — predictable
+	// for both the user (knows when to retry) and the operator
+	// (knows the worst-case attack bandwidth).
+	rateLimitWindow = time.Minute
+
+	// rateLimitKeyPrefix scopes the rate-limit keys so an
+	// SCAN/KEYS against `ratelimit:*` doesn't accidentally hit
+	// the JWT blocklist (`jwt:*`) or the presence map.
+	rateLimitKeyPrefix = "ratelimit:login:"
+)
+
+// rateLimitScript is the atomic INCR + (set TTL on first hit) Lua.
+// Returning the post-increment value lets the handler compare
+// against the limit in a single round trip.
+//
+// KEYS[1] = full per-IP key
+// ARGV[1] = window seconds (rateLimitWindow in seconds)
+const rateLimitScript = `
+local current = redis.call("INCR", KEYS[1])
+if current == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+return current
+`
+
+const qUpdateUserPasswordHash = `
+	UPDATE users
+	SET password_hash = $1,
+	    updated_at = NOW()
+	WHERE uin = $2
+`
+
+// ----------------------------------------------------------------------------
+// Login handler dependencies. The full set of services the login
+// flow touches: Postgres for the user lookup, Redis for the rate
+// limiter and (transitively) for the JWT blocklist, and the JWT
+// manager for signing the new tokens.
+// ----------------------------------------------------------------------------
+
+type LoginDeps struct {
+	Pool    *pgxpool.Pool
+	Redis   *redis.Client
+	Manager *jwt.Manager
+	// Wipe is the optional panic-wipe handler. nil disables
+	// the feature entirely; a non-nil value lets the handler
+	// trigger a self-destruct when the user's threshold is
+	// crossed. The wipe is constructed once in main.go and
+	// passed in; the handler itself does not import the
+	// panicwipe package directly.
+	Wipe *PanicWipeDeps
+}
+
+// NewLoginHandler returns the http.HandlerFunc mounted at
+// POST /api/auth/login.
+func NewLoginHandler(deps LoginDeps) http.HandlerFunc {
+	// Pre-compile the Lua script once at handler-construction
+	// time. The script's SHA1 is cached on the Redis side, so
+	// repeated calls after the first are EVALSHA-only — no
+	// resend of the script body.
+	script := redis.NewScript(rateLimitScript)
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 10 KiB is generous for a login form.
+		var req models.LoginRequest
+		if !decodeJSON(w, r, &req, 10*1024) {
+			return
+		}
+		if err := req.Validate(); err != nil {
+			writeValidationError(w, err)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		// ------------------------------------------------------------
+		// 1. Rate-limit check. Done BEFORE the DB lookup so a
+		// brute-force attempt never reaches the bcrypt path.
+		// ------------------------------------------------------------
+		ip := clientIP(r)
+		key := rateLimitKeyPrefix + ip
+		// windowSeconds is passed as ARGV[1] (string) because
+		// Lua treats every ARGV as a string; Redis implicitly
+		// coerces it to int for EXPIRE.
+		windowSeconds := int(rateLimitWindow.Seconds())
+		count, err := script.Run(ctx, deps.Redis, []string{key}, windowSeconds).Int64()
+		if err != nil {
+			// Fail-closed. A security-critical service should
+			// not silently allow logins when its rate limiter
+			// is degraded; the right move is to surface the
+			// failure to the client (503) and to the operator
+			// (log + metrics).
+			log.Printf("[auth-service] rate limiter unavailable: %v", err)
+			writeError(w, http.StatusServiceUnavailable, "RATE_LIMITER_UNAVAILABLE", "service is temporarily unavailable")
+			return
+		}
+		if count > rateLimitPerMinute {
+			// We don't expose Retry-After because the
+			// window is fixed and the client can't know
+			// when the bucket resets. Adding it would
+			// require a second Redis call (TTL) for a
+			// cosmetic header.
+			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many login attempts; try again later")
+			return
+		}
+
+		// ------------------------------------------------------------
+		// 2. Look up the user by username or email. We keep the
+		// resolution explicit so a username collision with some
+		// other user's email cannot silently authenticate the
+		// wrong row.
+		// that pulls every column the login path needs. The
+		// unique index on the selected field makes this a single B-tree
+		// descent.
+		// ------------------------------------------------------------
+		var (
+			uin          int64
+			username     string
+			email        string
+			passwordHash string
+		)
+		loginValue, byUsername := req.LoginIdentifier()
+		query := qSelectUserByEmail
+		if byUsername {
+			query = qSelectUserByUsername
+		}
+		err = deps.Pool.QueryRow(ctx, query, loginValue).
+			Scan(&uin, &username, &email, &passwordHash)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Generic 401 — no enumeration. We
+				// still burn a bcrypt comparison to
+				// keep the response time roughly
+				// constant against an attacker who
+				// can otherwise distinguish "no
+				// such user" from "wrong password"
+				// by latency.
+				burnCPUToMaskTiming(req.Password)
+				writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid credentials")
+				return
+			}
+			writeDBError(w, err, "login: select user")
+			return
+		}
+
+		// ------------------------------------------------------------
+		// 3. Password verification. New hashes use Argon2id;
+		// legacy bcrypt hashes remain valid and are upgraded
+		// after a successful login.
+		// ------------------------------------------------------------
+		passwordResult := verifyPassword(passwordHash, req.Password)
+		if !passwordResult.OK {
+			// Spec (panic-wipe addendum): after a password
+			// mismatch, increment the per-user failed-attempt
+			// counter and, if the user has panic-wipe enabled
+			// AND the threshold is crossed, trigger the wipe.
+			//
+			// The 401 response is byte-identical to a
+			// non-wiping failure (same status, same error
+			// envelope, same body) so an attacker cannot
+			// tell from the response that the wipe fired.
+			// The legitimate user, hitting the threshold
+			// themselves, just sees "invalid email or
+			// password" forever — which is the point.
+			if deps.Wipe != nil {
+				triggerPanicWipeIfThresholdCrossed(ctx, *deps.Wipe, uin)
+			}
+			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid credentials")
+			return
+		}
+
+		// ------------------------------------------------------------
+		// 4. Mint a fresh access + refresh pair. Both tokens
+		// are signed with the same secret but carry different
+		// `type` claims so the ws-gateway and the /refresh
+		// endpoint can reject cross-type use at the parser.
+		// ------------------------------------------------------------
+		// Reset the failed-login counter on success. A user who
+		// mis-typed their password twice and then succeeded is
+		// back to a clean slate — the counter should not carry
+		// over to the next session. Failure to reset is
+		// non-fatal (we still issue the token); we log so an
+		// operator can correlate a "stuck counter" symptom.
+		if deps.Wipe != nil {
+			if err := resetFailedLoginCounter(ctx, deps.Redis, uin); err != nil {
+				log.Printf("[auth-service] reset failed-login counter: %v", err)
+			}
+		}
+		if passwordResult.NeedsRehash {
+			rehash, err := hashPassword(req.Password)
+			if err != nil {
+				log.Printf("[auth-service] password rehash failed: %v", err)
+			} else if _, err := deps.Pool.Exec(ctx, qUpdateUserPasswordHash, rehash, uin); err != nil {
+				log.Printf("[auth-service] password rehash update failed: %v", err)
+			}
+		}
+
+		tokens, err := issueSession(ctx, deps.Pool, deps.Manager, uin)
+		if err != nil {
+			log.Printf("[auth-service] issue login session: %v", err)
+			writeError(w, http.StatusInternalServerError, "TOKEN_ISSUE_FAILED", "could not issue session")
+			return
+		}
+
+		setSessionCookies(w, tokens)
+		log.Printf("[auth-service] login successful")
+		writeJSON(w, http.StatusOK, models.LoginResponse{
+			AccessToken:  tokens.AccessToken,
+			RefreshToken: tokens.RefreshToken,
+			UIN:          uin,
+			Username:     username,
+			User: models.AuthUser{
+				UIN:      uin,
+				Username: username,
+				Email:    email,
+			},
+			Tokens: tokens,
+		})
+	}
+}
+
+// sha256Hex returns the hex-encoded SHA-256 of s. We use this
+// to fingerprint refresh tokens at rest. Plain SHA-256 is
+// appropriate here because the input (the refresh token) is
+// already a 256-bit random secret — there is no weak password
+// to salt against. The hash exists only so a DB dump can't
+// replay sessions.
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// burnCPUToMaskTiming runs a bcrypt comparison against a known-
+// invalid hash so the time-to-respond for "no such user" is
+// indistinguishable from "wrong password". The decoy hash is
+// generated once at package init time from a fixed plaintext;
+// the comparison will always fail, but the wall-clock cost
+// matches the success path's bcrypt cost.
+//
+// Without this, an attacker can enumerate which emails are
+// registered by timing the response: ~250 ms = real user
+// (real bcrypt compare), ~1 ms = no such user.
+func burnCPUToMaskTiming(password string) {
+	_ = bcrypt.CompareHashAndPassword(decoyBcryptHash, []byte(password))
+	_ = verifyArgon2idPassword(decoyArgon2idHash, password)
+}
+
+// decoyBcryptHash is built once at package init so the cost-12
+// hashing only happens once per process. If generation fails
+// (e.g. /dev/urandom is unavailable, which would prevent any
+// bcrypt operation in this process), we fall back to a no-op
+// decoy — the timing-mask stops working, but the handler still
+// functions. The risk is real but the failure mode is rare
+// enough to log rather than panic on.
+var decoyBcryptHash []byte
+var decoyArgon2idHash string
+
+func init() {
+	const decoyPlaintext = "iceq-login-timing-decoy"
+	h, err := bcrypt.GenerateFromPassword([]byte(decoyPlaintext), bcryptCost)
+	if err != nil {
+		// Fall back to an empty hash. CompareHashAndPassword
+		// will return ErrHashTooShort or similar; the timing
+		// will be off but login still works.
+		log.Printf("[auth-service] could not pre-compute timing decoy hash: %v", err)
+		decoyBcryptHash = []byte("")
+		return
+	}
+	decoyBcryptHash = h
+	if h, err := hashPassword(decoyPlaintext); err != nil {
+		log.Printf("[auth-service] could not pre-compute timing decoy argon2id hash: %v", err)
+	} else {
+		decoyArgon2idHash = h
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Panic-wipe trigger glue. Lives in login.go (not panicwipe.go) so
+// the helper is in the same file as its only caller.
+//
+// triggerPanicWipeIfThresholdCrossed runs the full sequence:
+//
+//  1. INCR the per-user counter (with TTL on first hit).
+//  2. Read the user's security settings.
+//  3. If panic-wipe is enabled AND counter >= threshold, run
+//     PanicWipe().
+//
+// The function never returns an error to its caller; the
+// bcrypt-mismatch path always returns the same 401 to the client
+// regardless of what happened here. We log everything internally.
+// ----------------------------------------------------------------------------
+
+// triggerPanicWipeIfThresholdCrossed is fire-and-forget from the
+// login handler's perspective. It is the implementation of
+// "after a bcrypt mismatch, optionally wipe the account".
+func triggerPanicWipeIfThresholdCrossed(ctx context.Context, deps PanicWipeDeps, uin int64) {
+	// 1. INCR the counter atomically. The script applies the
+	// TTL on the first increment only, so a sustained attack
+	// does not keep the window open indefinitely.
+	//
+	// The script returns the post-increment value but we
+	// intentionally discard it: previously we logged it
+	// (count=%d) on every failed attempt, which leaked the
+	// attempt count to anyone with log read-access. The
+	// threshold check below reads the counter independently
+	// via GET, so the security-critical atomicity of the
+	// INCR+EXPIRE is preserved at the cost of one extra
+	// round trip on the failure path.
+	_, err := failedLoginScriptHandle.Run(
+		ctx,
+		deps.Redis,
+		[]string{loginAttemptsKeyPrefix + itoa(uin)},
+		int(failedAttemptsCounterTTL.Seconds()),
+	).Int64()
+	if err != nil {
+		// Counter unavailable — fail closed. We do NOT
+		// trigger the wipe because the threshold check
+		// would have nothing to compare against. The
+		// counter will be re-attempted on the next failed
+		// login; the rate limiter (5/min/IP) caps the
+		// blast radius of a Redis outage.
+		log.Printf("[auth-service] panicwipe: incr counter: %v", err)
+		return
+	}
+
+	// 2 + 3. Check the threshold and run the wipe if needed.
+	// We do this in one helper rather than two so the read
+	// of the settings row + the wipe call happen with a
+	// consistent view (no race where the threshold is
+	// updated mid-check).
+	if crossed, err := checkPanicWipeThreshold(ctx, deps.Pool, deps.Redis, uin); err != nil {
+		log.Printf("[auth-service] panicwipe: threshold check: %v", err)
+		return
+	} else if !crossed {
+		// Below threshold. No information leaked in the
+		// log line: not the uin, not the count, not the
+		// email, not the source IP. The attacker with
+		// log read-access can observe that *some* failed
+		// login occurred, which is already observable from
+		// the rate-limit metric, but cannot correlate it
+		// to a specific account.
+		log.Printf("[auth-service] failed_login_attempt")
+		return
+	}
+
+	// Threshold crossed. Run the wipe. Errors are logged
+	// but do not propagate to the bcrypt-mismatch handler —
+	// the response is the same 401 either way.
+	if err := PanicWipe(ctx, deps, uin); err != nil {
+		log.Printf("[auth-service] panicwipe: wipe failed: %v", err)
+	}
+}

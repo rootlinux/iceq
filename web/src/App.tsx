@@ -1,0 +1,72 @@
+// src/App.tsx
+//
+// Top-level router. Two top-level paths:
+//
+//   /login, /register   — public, no WebSocket.
+//   /app/*              — authenticated. Mounted only after
+//                          isAuthenticated flips to true. The
+//                          WebSocket hook lives here so the
+//                          socket is bound to the lifetime of
+//                          the chat shell.
+//
+// We also listen for the "iceq:wiped" event fired by
+// useWebSocket on a 4403 close; the auth store clears state
+// and we redirect to /login.
+
+import { useEffect } from "react";
+import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { useAuthStore } from "./store/authStore";
+import { LoginForm } from "./components/Auth/LoginForm";
+import { RegisterForm } from "./components/Auth/RegisterForm";
+import { MainLayout } from "./components/Layout/MainLayout";
+import { ChatShell } from "./components/Chat/ChatShell";
+
+export default function App(): JSX.Element {
+  const isAuthed = useAuthStore((s) => s.isAuthenticated);
+  const hydrated = useAuthStore((s) => s.hydrated);
+  const navigate = useNavigate();
+
+  // The auth-expired event is fired by the api/client when a
+  // refresh fails. We bounce to /login and clear state.
+  useEffect(() => {
+    function onExpired(): void {
+      void useAuthStore.getState().logout();
+      navigate("/login", { replace: true });
+    }
+    function onWiped(): void {
+      // 4403 — the WS hook already cleared IndexedDB /
+      // localStorage. The auth-store logout() runs after;
+      // we just navigate.
+      navigate("/login", { replace: true });
+    }
+    window.addEventListener("iceq:auth-expired", onExpired);
+    window.addEventListener("iceq:wiped", onWiped);
+    return () => {
+      window.removeEventListener("iceq:auth-expired", onExpired);
+      window.removeEventListener("iceq:wiped", onWiped);
+    };
+  }, [navigate]);
+
+  // Don't render anything until the auth store has read
+  // tokens from localStorage. Otherwise we'd flash the
+  // login form for one render before re-routing to /app.
+  if (!hydrated) {
+    return (
+      <div className="flex h-full items-center justify-center bg-bg text-text-2">
+        Loading…
+      </div>
+    );
+  }
+
+  return (
+    <Routes>
+      <Route path="/login" element={isAuthed ? <Navigate to="/app" replace /> : <LoginForm />} />
+      <Route path="/register" element={isAuthed ? <Navigate to="/app" replace /> : <RegisterForm />} />
+      <Route
+        path="/app/*"
+        element={isAuthed ? <MainLayout><ChatShell /></MainLayout> : <Navigate to="/login" replace />}
+      />
+      <Route path="*" element={<Navigate to={isAuthed ? "/app" : "/login"} replace />} />
+    </Routes>
+  );
+}

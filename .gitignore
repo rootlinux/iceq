@@ -1,0 +1,24 @@
+deploy/.env.local
+
+# Frontend dependencies and build output
+web/node_modules/
+web/dist/
+web/.tmp-test-build/
+node_modules/
+dist/
+
+# Local env/secrets
+.env
+.env.*
+!.env.example
+!deploy/.env.example
+
+# Go build/test artifacts
+*.test
+coverage.out
+backend/cmd_smoke_filesvc/smoke
+backend/cmd_smoke_msgsvc/smoke
+
+# OS/editor noise
+.DS_Store
+    

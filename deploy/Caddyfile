@@ -1,0 +1,349 @@
+# IceQ reverse proxy — Caddy v2 with caddy-ratelimit plugin.
+#
+# Custom build required (see deploy/Dockerfile.caddy):
+#   xcaddy build --with github.com/mholt/caddy-ratelimit
+#
+# Security posture:
+#   - HSTS + standard browser-security headers on every response
+#   - Optional Onion-Location on clearnet responses when ICEQ_ONION_LOCATION is set
+#   - Server and X-Powered-By headers stripped
+#   - Access logs: structured JSON, no remote_addr or User-Agent
+#   - /ws and /api/messages/* access logs discarded entirely
+#   - Per-IP rate limits at the edge (caddy-ratelimit)
+#   - Backend transport timeouts on every reverse_proxy block
+#
+# Three listeners share the same route table via the (iceq_routes) snippet:
+#   - :80            — Tor hidden service (plain HTTP; Tor encrypts the wire)
+#   - iceq.space     — public direct browser access with managed TLS
+#   - https://localhost — direct browser access (self-signed dev cert)
+# All get identical IceQ handlers, security headers, rate limits, and SPA
+# serving. Only the transport (and tls directive) differs per site.
+
+{
+    admin localhost:2019
+}
+
+# ── Security headers ──────────────────────────────────────────────────────────
+# Applied via `import security_headers` inside the site block so every
+# response — static files, API, WebSocket upgrade 101 — gets the set.
+(security_headers) {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "DENY"
+        Referrer-Policy           "no-referrer"
+        Permissions-Policy        "camera=(), microphone=(), geolocation=()"
+        Content-Security-Policy   "default-src 'self'; script-src 'self'; connect-src 'self' wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests"
+        -Server
+        -X-Powered-By   
+    }
+}
+
+# ── Upstream forwarding headers ───────────────────────────────────────────────
+(reverse_proxy_common) {
+    header_up Host      {host}
+    # Do not forward the client's real IP address to backend services.
+    # Edge rate limiting still sees {remote_host}; backend rate limiting
+    # must move to an anonymous/session-scoped key before relying on this
+    # value for per-client decisions.
+    header_up X-Real-IP "iceq-edge"
+    header_up X-Forwarded-For "iceq-edge"
+    header_up X-Forwarded-Host {host}
+    header_up X-Forwarded-Proto {scheme}
+}
+
+(reverse_proxy_ws) {
+    import reverse_proxy_common
+    header_up Connection upgrade
+    header_up Upgrade  websocket
+}
+
+# ── Backend transport timeouts ────────────────────────────────────────────────
+# Placed inside every reverse_proxy block via `import proxy_transport`.
+(proxy_transport) {
+    transport http {
+        dial_timeout            5s
+        response_header_timeout 10s
+        read_timeout            30s
+        write_timeout           30s
+    }
+}
+
+# ── Shared IceQ route table ───────────────────────────────────────────────────
+# Imported by BOTH the :80 (Tor) and https://localhost (direct) site blocks.
+# Anything in here runs identically regardless of how the client reached us,
+# so .onion users and direct-browser users get the same IceQ surface.
+(iceq_routes) {
+    encode gzip
+    import security_headers
+
+    # Structured JSON access log. Caddy version field names have changed
+    # across releases, so we delete all known client-IP spellings plus
+    # User-Agent, Authorization, and Cookie.
+    # Safe fields retained: ts, status, method, uri, duration, size.
+    log {
+        output stdout
+        format filter {
+            wrap json
+            fields {
+                request>remote_addr           delete
+                request>remote_ip             delete
+                request>client_ip             delete
+                request>headers>User-Agent    delete
+                request>headers>Authorization delete
+                request>headers>Cookie        delete
+            }
+        }
+    }
+
+    # Discard access logs for WebSocket connections and message-history
+    # routes: both carry opaque E2EE ciphertext that must not appear in
+    # any log, even indirectly via request metadata.
+    @silent {
+        path /ws /ws/* /api/messages/*
+    }
+    log_skip @silent
+
+    # Named matcher for WebSocket upgrade requests.
+    @websockets {
+        path /ws /ws/*
+        header Connection *Upgrade*
+        header Upgrade    websocket
+    }
+
+    @ws_paths {
+        path /ws /ws/*
+    }
+
+    # ── Container liveness ────────────────────────────────────────────
+    handle /health {
+        respond "OK" 200
+    }
+
+    # ── Auth endpoints — tighter rate limits ──────────────────────────
+    # Login: 5 req/min per IP
+    handle /api/auth/login {
+        rate_limit {
+            zone auth_login {
+                key    {remote_host}
+                window 1m
+                events 5
+            }
+        }
+        reverse_proxy auth-service:8080 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    # Register: 3 req/min per IP
+    handle /api/auth/register {
+        rate_limit {
+            zone auth_register {
+                key    {remote_host}
+                window 1m
+                events 3
+            }
+        }
+        reverse_proxy auth-service:8080 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    # All other auth routes: 60 req/min per IP
+    handle /api/auth/* {
+        rate_limit {
+            zone auth_other {
+                key    {remote_host}
+                window 1m
+                events 60
+            }
+        }
+        reverse_proxy auth-service:8080 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    # ── API routes — 60 req/min per IP ───────────────────────────────
+    handle /api/contacts/* {
+        rate_limit {
+            zone contacts {
+                key    {remote_host}
+                window 1m
+                events 60
+            }
+        }
+        reverse_proxy auth-service:8080 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    handle /api/keys/* {
+        rate_limit {
+            zone keys {
+                key    {remote_host}
+                window 1m
+                events 60
+            }
+        }
+        reverse_proxy key-service:8081 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    handle /api/messages/* {
+        rate_limit {
+            zone messages {
+                key    {remote_host}
+                window 1m
+                events 60
+            }
+        }
+        reverse_proxy message-service:8080 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    handle /api/groups* {
+        rate_limit {
+            zone groups {
+                key    {remote_host}
+                window 1m
+                events 60
+            }
+        }
+        reverse_proxy message-service:8080 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    handle /api/presence/* {
+        rate_limit {
+            zone presence {
+                key    {remote_host}
+                window 1m
+                events 60
+            }
+        }
+        reverse_proxy presence-service:8080 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    handle /api/files/* {
+        rate_limit {
+            zone files {
+                key    {remote_host}
+                window 1m
+                events 60
+            }
+        }
+        reverse_proxy file-service:8080 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    # ── WebSocket — 10 connections/min per IP ─────────────────────────
+    handle @websockets {
+        rate_limit {
+            zone ws_upgrade {
+                key    {remote_host}
+                window 1m
+                events 10
+            }
+        }
+        reverse_proxy ws-gateway:8082 {
+            import reverse_proxy_ws
+            import proxy_transport
+        }
+    }
+
+    handle @ws_paths {
+        rate_limit {
+            zone ws_other {
+                key    {remote_host}
+                window 1m
+                events 10
+            }
+        }
+        reverse_proxy ws-gateway:8082 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    # ── PWA static files ──────────────────────────────────────────────
+    @manifest path /manifest.json
+    handle @manifest {
+        header Cache-Control "public, max-age=86400"
+        header Content-Type "application/manifest+json"
+        root * /srv
+        file_server
+    }
+
+    @sw path /sw.js
+    handle @sw {
+        header Cache-Control "no-cache, no-store, must-revalidate"
+        header Service-Worker-Allowed "/"
+        root * /srv
+        file_server
+    }
+
+    @icons path /icons/*
+    handle @icons {
+        header Cache-Control "public, max-age=2592000"
+        root * /srv
+        file_server
+    }
+
+    @wasm path *.wasm
+    handle @wasm {
+        header Content-Type "application/wasm"
+        header Cache-Control "public, max-age=2592000"
+        root * /srv
+        file_server
+    }
+
+    # ── SPA catch-all ─────────────────────────────────────────────────
+    # Must come last: every unmatched path falls through to the React
+    # router. The try_files rewrite sends /app, /app/dm/123, etc. to
+    # /index.html so client-side routing takes over.
+    handle {
+        rewrite * {path}
+        root    * /srv
+        try_files {path} /index.html
+        file_server
+    }
+}
+
+# ── Tor hidden service listener ───────────────────────────────────────────────
+# Plain HTTP only. Tor provides transport-layer encryption between the client
+# and this listener, so serving over plain HTTP inside the Docker network
+# does not weaken end-to-end confidentiality. The goldy/tor-hidden-service
+# container sits in front of Caddy on the iceq-net bridge and forwards .onion
+# traffic to this listener.
+:80 {
+    import iceq_routes
+}
+
+# ── Public TLS listener (direct browser access) ──────────────────────────────
+# Public domains use Caddy-managed TLS on 443.
+iceq.space, www.iceq.space {
+    @hasOnionLocation expression `'{$ICEQ_ONION_LOCATION}' != ''`
+    header @hasOnionLocation Onion-Location "{$ICEQ_ONION_LOCATION}"
+    import iceq_routes
+}
+
+# Self-signed dev cert via `tls internal` for localhost-only development.
+https://localhost {
+    tls internal
+    import iceq_routes
+}

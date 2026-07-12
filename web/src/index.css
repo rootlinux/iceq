@@ -1,0 +1,92 @@
+/* src/index.css — Tailwind base + custom utilities. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ----------------------------------------------------------------------------
+   Global resets. The dark theme is locked in.
+   ---------------------------------------------------------------------------- */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #0a0a0a;
+  color: #e5e5e5;
+}
+
+/* ----------------------------------------------------------------------------
+   Scrollbar styling. The webkit-only styles are fine — Chromium,
+   Safari, and Edge use them; Firefox falls back to its default
+   which is acceptable in dark UI.
+   ---------------------------------------------------------------------------- */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3a;
+}
+
+/* ----------------------------------------------------------------------------
+   Component primitives. Anything in the @layer components block
+   becomes a Tailwind class; utilities can be composed on top.
+
+   We define a small set of "iceq-*" primitives for things that
+   appear in more than one place (settings panel, modal) so we
+   don't have to repeat the same Tailwind soup.
+   ---------------------------------------------------------------------------- */
+@layer components {
+  .iceq-btn-primary {
+    @apply inline-flex items-center justify-center rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-bg hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition;
+  }
+  .iceq-btn-secondary {
+    @apply inline-flex items-center justify-center rounded-md border border-border bg-surface-2 px-3 py-1.5 text-sm font-medium text-text hover:bg-border disabled:opacity-40 disabled:cursor-not-allowed transition;
+  }
+  .iceq-btn-destructive {
+    @apply inline-flex items-center justify-center rounded-md bg-presence-dnd px-3 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition;
+  }
+  .iceq-input {
+    @apply w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text placeholder:text-text-2 focus:border-accent focus:outline-none;
+  }
+  .iceq-card {
+    @apply rounded-lg border border-border bg-surface-2 p-4;
+  }
+  .iceq-settings-panel {
+    @apply space-y-4 p-4;
+  }
+  .iceq-settings-row {
+    @apply flex items-center justify-between gap-4;
+  }
+  .iceq-settings-status {
+    @apply text-sm text-text-2;
+  }
+  .iceq-settings-error {
+    @apply rounded-md border border-presence-dnd bg-surface p-3 text-sm;
+  }
+  .iceq-toggle {
+    @apply inline-flex items-center gap-2 text-sm;
+  }
+  .iceq-modal-backdrop {
+    @apply fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4;
+  }
+  .iceq-modal {
+    @apply w-full max-w-md rounded-lg border border-border bg-surface-2 p-5 shadow-2xl;
+  }
+  .iceq-modal-buttons {
+    @apply mt-4 flex justify-end gap-2;
+  }
+}

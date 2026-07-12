@@ -1,0 +1,662 @@
+# IceQ — docker-compose.yml (Step 11: production hardening)
+#
+# Security posture applied to every service:
+#   - no-new-privileges:true  (process cannot gain new capabilities)
+#   - read_only: true         (root filesystem read-only)
+#   - tmpfs at /tmp           (only writable scratch space is in-memory)
+#   - resource limits         (prevent container runaway)
+#   - secrets via env_file    (no inline secret values)
+#
+# Before running: cp deploy/.env.example deploy/.env.local and fill in values.
+
+name: iceq
+
+networks:
+  iceq-net:
+    name: iceq-net
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  scylla_data:
+    driver: local
+  redis_data:
+    driver: local
+  nats_data:
+    driver: local
+  minio_data:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local
+  tor_keys:
+    driver: local
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Common security options shared by every service.
+x-security: &default-security
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+
+# Default resource limits for lightweight application services.
+x-resources-app: &resources-app
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: 256M
+      reservations:
+        cpus: "0.1"
+        memory: 64M
+
+services:
+
+  # ==========================================================================
+  # PostgreSQL 16
+  # ==========================================================================
+  postgres:
+    <<: *default-security
+    image: postgres:16-alpine
+    container_name: iceq-postgres
+    hostname: postgres
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - .env.local
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init/postgres-init.sql:/docker-entrypoint-initdb.d/01-iceq-schema.sql:ro
+      # Migrations directory is mounted as a *directory* for documentation,
+      # but the official postgres image's entrypoint only executes FILES
+      # directly in /docker-entrypoint-initdb.d/ — files in subdirectories
+      # are silently skipped. So we also bind-mount each .sql migration as
+      # a top-level file, alphabetically after 01-iceq-schema.sql. Add new
+      # migrations to BOTH the init/migrations/ tree (for human readers)
+      # and this block (for the entrypoint to find them). The migration
+      # bodies themselves are idempotent (IF NOT EXISTS) so re-running
+      # them on a future fresh DB is harmless.
+      - ./init/migrations:/docker-entrypoint-initdb.d/migrations:ro
+      - ./init/migrations/001_session_epoch.sql:/docker-entrypoint-initdb.d/02-session_epoch.sql:ro
+      - ./init/migrations/002_prekey_bundle_registration_id.sql:/docker-entrypoint-initdb.d/03-prekey_bundle_registration_id.sql:ro
+      - ./init/migrations/003_contacts_requested_by.sql:/docker-entrypoint-initdb.d/04-contacts_requested_by.sql:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /run:size=16m,mode=0755
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-iceq} -h 127.0.0.1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+    logging: *default-logging
+
+  # ==========================================================================
+  # ScyllaDB 5.4
+  # ==========================================================================
+  scylla:
+    image: scylladb/scylla:5.4
+    container_name: iceq-scylla
+    hostname: scylla
+    restart: unless-stopped
+    networks: [iceq-net]
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - "--smp=1"
+      - "--memory=400M"
+      - "--overprovisioned=1"
+      - "--developer-mode=1"
+      - "--api-address=0.0.0.0"
+    volumes:
+      - scylla_data:/var/lib/scylla
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging: *default-logging
+
+  # ==========================================================================
+  # ScyllaDB schema bootstrap
+  # ==========================================================================
+  scylla-init:
+    image: scylladb/scylla:5.4
+    container_name: iceq-scylla-init
+    restart: on-failure
+    networks: [iceq-net]
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      scylla:
+        condition: service_healthy
+    volumes:
+      - ./init/scylla-init.cql:/init/scylla-init.cql:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        echo "[scylla-init] waiting for scylla CQL endpoint to accept DDL..."
+        attempts=0
+        until cqlsh scylla 9042 -e "SELECT now() FROM system.local" > /dev/null 2>&1; do
+          attempts=$$((attempts + 1))
+          if [ $$attempts -ge 60 ]; then
+            echo "[scylla-init] gave up after 60 attempts (~120s)" >&2
+            exit 1
+          fi
+          echo "  ...still waiting (attempt $$attempts)"
+          sleep 2
+        done
+        echo "[scylla-init] applying /init/scylla-init.cql"
+        cqlsh scylla 9042 -f /init/scylla-init.cql > /tmp/cql.log 2>&1 || true
+        if grep -E '^AlreadyExists:' /tmp/cql.log > /dev/null; then
+          if grep -vE '^(AlreadyExists:|\[scylla-init\] applying|Warnings ?:|/)' /tmp/cql.log | grep -E 'Error|error|ERROR' > /dev/null; then
+            echo "[scylla-init] fatal: non-AlreadyExists error during CQL apply" >&2
+            cat /tmp/cql.log >&2
+            exit 1
+          fi
+          echo "[scylla-init] schema already exists (idempotent OK)"
+        fi
+        echo "[scylla-init] schema applied successfully"
+    logging: *default-logging
+
+  # ==========================================================================
+  # Redis 7
+  # ==========================================================================
+  redis:
+    <<: *default-security
+    image: redis:7-alpine
+    container_name: iceq-redis
+    hostname: redis
+    restart: unless-stopped
+    networks: [iceq-net]
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
+      - "--save"
+      - "60"
+      - "1000"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+    logging: *default-logging
+
+  # ==========================================================================
+  # NATS 2.10
+  # ==========================================================================
+  nats:
+    <<: *default-security
+    image: nats:2.10-alpine
+    container_name: iceq-nats
+    hostname: nats
+    restart: unless-stopped
+    networks: [iceq-net]
+    command:
+      - "--name=iceq-nats"
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--http_port=8222"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider -t 1 http://localhost:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+    logging: *default-logging
+
+  # ==========================================================================
+  # MinIO
+  # ==========================================================================
+  minio:
+    <<: *default-security
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    container_name: iceq-minio
+    hostname: minio
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - .env.local
+    environment:
+      MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_URL:-http://localhost:9001}
+    volumes:
+      - minio_data:/data
+    command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+    logging: *default-logging
+
+  # ==========================================================================
+  # MinIO bucket provisioner
+  # ==========================================================================
+  minio-init:
+    <<: *default-security
+    image: minio/mc:RELEASE.2024-11-17T19-35-25Z
+    container_name: iceq-minio-init
+    restart: on-failure
+    networks: [iceq-net]
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file:
+      - .env.local
+    environment:
+      MC_HOST_iceq: "http://${MINIO_ROOT_USER:-minio}:${MINIO_ROOT_PASSWORD:-changeme}@minio:9000"
+      # mc needs a writable config dir; default ~/.mc fails on read_only FS.
+      MC_CONFIG_DIR: /tmp/.mc
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "[minio-init] waiting for MinIO API via mc alias 'iceq'..."
+        attempts=0
+        until mc ls iceq > /dev/null 2>&1; do
+          attempts=$$((attempts + 1))
+          if [ $$attempts -ge 30 ]; then
+            echo "[minio-init] gave up after 30 attempts (~60s)" >&2
+            exit 1
+          fi
+          echo "  ...still waiting (attempt $$attempts)"
+          sleep 2
+        done
+        echo "[minio-init] ensuring bucket 'iceq-files' exists (private)"
+        mc mb --ignore-existing iceq/iceq-files
+        mc anonymous set none iceq/iceq-files
+        echo "[minio-init] ensuring bucket 'iceq-avatars' exists (public-read)"
+        mc mb --ignore-existing iceq/iceq-avatars
+        mc anonymous set download iceq/iceq-avatars
+        echo "[minio-init] provisioning complete"
+    logging: *default-logging
+
+  # ==========================================================================
+  # Caddy 2 — custom build with caddy-ratelimit plugin
+  # ==========================================================================
+  caddy:
+    <<: *default-security
+    build:
+      context: ../
+      dockerfile: deploy/Dockerfile.caddy
+    image: iceq/caddy:dev
+    container_name: iceq-caddy
+    hostname: caddy
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - .env.local
+    ports:
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider -t 1 http://127.0.0.1:2019/config/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      key-service:
+        condition: service_healthy
+      ws-gateway:
+        condition: service_healthy
+      message-service:
+        condition: service_healthy
+      presence-service:
+        condition: service_healthy
+      file-service:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+    logging: *default-logging
+
+  # ==========================================================================
+  # Tor hidden service — sits in front of Caddy, persists its v3 keypair
+  # in the `tor_keys` volume. Auto-generates a .onion address on first boot.
+  # ==========================================================================
+  tor:
+    image: goldy/tor-hidden-service:latest
+    container_name: iceq-tor
+    restart: unless-stopped
+    networks:
+      - iceq-net
+    depends_on:
+      caddy:
+        condition: service_healthy
+    environment:
+      # goldy/tor-hidden-service expects env vars prefixed with the
+      # service name (regex: [A-Z0-9]+_TOR_SERVICE_*). Using ICECQ as
+      # the prefix → the onion hostname is associated with the "icecq"
+      # service, while still a single hidden service with a single
+      # v3 address.
+      - ICECQ_TOR_SERVICE_HOSTS=80:caddy:80
+      - ICECQ_TOR_SERVICE_VERSION=3
+    volumes:
+      - tor_keys:/var/lib/tor/hidden_service/
+    healthcheck:
+      test: ["CMD-SHELL", "find /var/lib/tor/hidden_service -maxdepth 2 -type f -name hostname | grep -q ."]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    # NOTE: no read_only/tmpfs here — the container must persist its v3
+    # keypair to /var/lib/tor/hidden_service/. The keypair is the only
+    # thing that defines your .onion address; losing it = losing the address.
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 32M
+    logging: *default-logging
+
+  # ==========================================================================
+  # auth-service
+  # ==========================================================================
+  auth-service:
+    <<: [*default-security, *resources-app]
+    build:
+      context: ../
+      dockerfile: backend/auth-service/Dockerfile
+      args:
+        VERSION: ${GIT_SHA:-dev}
+    image: iceq/auth-service:dev
+    container_name: iceq-auth-service
+    hostname: auth-service
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - .env.local
+    environment:
+      # ICEQ_PG_DSN, ICEQ_ALLOWED_ORIGINS, ICEQ_JWT_SECRET are
+      # all loaded from env_file. The previous shell-variable
+      # interpolation here (${POSTGRES_PASSWORD:-changeme})
+      # silently fell back to "changeme" because env_file content
+      # is not part of compose's interpolation scope — the
+      # services then connected with the wrong password.
+      ICEQ_REDIS_ADDR: redis:6379
+      ICEQ_NATS_URL: nats://nats:4222
+      PORT: 8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:8080/api/auth/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  # ==========================================================================
+  # key-service
+  # ==========================================================================
+  key-service:
+    <<: [*default-security, *resources-app]
+    build:
+      context: ../
+      dockerfile: backend/key-service/Dockerfile
+      args:
+        VERSION: ${GIT_SHA:-dev}
+    image: iceq/key-service:dev
+    container_name: iceq-key-service
+    hostname: key-service
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - .env.local
+    environment:
+      ICEQ_REDIS_ADDR: redis:6379
+      PORT: 8081
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:8081/api/keys/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  # ==========================================================================
+  # ws-gateway
+  # ==========================================================================
+  ws-gateway:
+    <<: [*default-security, *resources-app]
+    build:
+      context: ../
+      dockerfile: backend/ws-gateway/Dockerfile
+      args:
+        VERSION: ${GIT_SHA:-dev}
+    image: iceq/ws-gateway:dev
+    container_name: iceq-ws-gateway
+    hostname: ws-gateway
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - .env.local
+    environment:
+      ICEQ_REDIS_ADDR: redis:6379
+      ICEQ_NATS_URL: nats://nats:4222
+      PORT: 8082
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:8082/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  # ==========================================================================
+  # presence-service
+  # ==========================================================================
+  presence-service:
+    <<: [*default-security, *resources-app]
+    build:
+      context: ../
+      dockerfile: backend/presence-service/Dockerfile
+      args:
+        VERSION: ${GIT_SHA:-dev}
+    image: iceq/presence-service:dev
+    container_name: iceq-presence-service
+    hostname: presence-service
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - .env.local
+    environment:
+      ICEQ_NATS_URL: nats://nats:4222
+      ICEQ_REDIS_ADDR: redis:6379
+      PORT: 8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  # ==========================================================================
+  # message-service
+  # ==========================================================================
+  message-service:
+    <<: [*default-security, *resources-app]
+    build:
+      context: ../
+      dockerfile: backend/message-service/Dockerfile
+      args:
+        VERSION: ${GIT_SHA:-dev}
+    image: iceq/message-service:dev
+    container_name: iceq-message-service
+    hostname: message-service
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - .env.local
+    environment:
+      ICEQ_NATS_URL: nats://nats:4222
+      ICEQ_SCYLLA_HOSTS: scylla:9042
+      ICEQ_SCYLLA_KEYSPACE: iceq
+      ICEQ_MESSAGE_TTL_SECONDS: ${ICEQ_MESSAGE_TTL_SECONDS:-0}
+      ICEQ_REDIS_ADDR: redis:6379
+      PORT: 8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      scylla:
+        condition: service_healthy
+      scylla-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  # ==========================================================================
+  # file-service
+  # ==========================================================================
+  file-service:
+    <<: [*default-security, *resources-app]
+    build:
+      context: ../
+      dockerfile: backend/file-service/Dockerfile
+      args:
+        VERSION: ${GIT_SHA:-dev}
+    image: iceq/file-service:dev
+    container_name: iceq-file-service
+    hostname: file-service
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - .env.local
+    environment:
+      ICEQ_MINIO_ENDPOINT: minio:9000
+      ICEQ_MINIO_USE_SSL: "false"
+      ICEQ_REDIS_ADDR: redis:6379
+      PORT: 8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging

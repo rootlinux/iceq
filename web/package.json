@@ -1,0 +1,33 @@
+{
+  "name": "iceq-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "IceQ web client — E2EE messenger frontend (React + Vite + TypeScript)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "icons": "node web/scripts/generate-icons.mjs"
+  },
+  "dependencies": {
+    "@privacyresearch/libsignal-protocol-typescript": "^0.0.16",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.0",
+    "zustand": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.19",
+    "fake-indexeddb": "^6.2.5",
+    "postcss": "^8.4.39",
+    "sharp": "^0.33.5",
+    "tailwindcss": "^3.4.6",
+    "typescript": "^5.5.3",
+    "vite": "^5.3.4"
+  }
+}
