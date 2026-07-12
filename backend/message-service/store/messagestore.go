@@ -237,32 +237,14 @@ func (m *MessageStore) WithTTL(ttl time.Duration) *MessageStore {
 // the returned error wraps the gocql error and is the only
 // signal the handler layer sees.
 func (m *MessageStore) SaveMessage(ctx context.Context, req SaveRequest) error {
+	batch := m.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	batch.SetConsistency(gocql.Quorum)
 	if m.ttl > 0 {
 		const q = `INSERT INTO iceq.messages
 		  (conversation_id, created_at, id, sender_uin, receiver_uin, ciphertext, msg_type, status)
 		  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		  USING TTL ?`
-		return m.session.
-			Query(q,
-				req.ConversationID,
-				req.CreatedAt,
-				req.ID,
-				req.SenderUIN,
-				req.ReceiverUIN,
-				req.Ciphertext,
-				req.MsgType,
-				"",
-				int(m.ttl.Seconds()),
-			).
-			WithContext(ctx).
-			Consistency(gocql.Quorum).
-			Exec()
-	}
-	const q = `INSERT INTO iceq.messages
-	  (conversation_id, created_at, id, sender_uin, receiver_uin, ciphertext, msg_type, status)
-	  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-	return m.session.
-		Query(q,
+		batch.Query(q,
 			req.ConversationID,
 			req.CreatedAt,
 			req.ID,
@@ -271,10 +253,34 @@ func (m *MessageStore) SaveMessage(ctx context.Context, req SaveRequest) error {
 			req.Ciphertext,
 			req.MsgType,
 			"",
-		).
-		WithContext(ctx).
-		Consistency(gocql.Quorum).
-		Exec()
+			int(m.ttl.Seconds()),
+		)
+		const indexQ = `INSERT INTO iceq.message_deletion_index (uin, conversation_id, created_at, id) VALUES (?, ?, ?, ?) USING TTL ?`
+		batch.Query(indexQ, req.SenderUIN, req.ConversationID, req.CreatedAt, req.ID, int(m.ttl.Seconds()))
+		if req.ReceiverUIN != req.SenderUIN {
+			batch.Query(indexQ, req.ReceiverUIN, req.ConversationID, req.CreatedAt, req.ID, int(m.ttl.Seconds()))
+		}
+		return m.session.ExecuteBatch(batch)
+	}
+	const q = `INSERT INTO iceq.messages
+	  (conversation_id, created_at, id, sender_uin, receiver_uin, ciphertext, msg_type, status)
+	  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	batch.Query(q,
+		req.ConversationID,
+		req.CreatedAt,
+		req.ID,
+		req.SenderUIN,
+		req.ReceiverUIN,
+		req.Ciphertext,
+		req.MsgType,
+		"",
+	)
+	const indexQ = `INSERT INTO iceq.message_deletion_index (uin, conversation_id, created_at, id) VALUES (?, ?, ?, ?)`
+	batch.Query(indexQ, req.SenderUIN, req.ConversationID, req.CreatedAt, req.ID)
+	if req.ReceiverUIN != req.SenderUIN {
+		batch.Query(indexQ, req.ReceiverUIN, req.ConversationID, req.CreatedAt, req.ID)
+	}
+	return m.session.ExecuteBatch(batch)
 }
 
 // SaveGroupMessage writes one row to iceq.group_messages.
@@ -284,40 +290,38 @@ func (m *MessageStore) SaveMessage(ctx context.Context, req SaveRequest) error {
 // iceq.messages for each member (TODO future step: confirm
 // fan-out coverage).
 func (m *MessageStore) SaveGroupMessage(ctx context.Context, req SaveGroupRequest) error {
+	batch := m.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+	batch.SetConsistency(gocql.Quorum)
 	if m.ttl > 0 {
 		const q = `INSERT INTO iceq.group_messages
 		  (group_id, created_at, id, sender_uin, ciphertext, msg_type)
 		  VALUES (?, ?, ?, ?, ?, ?)
 		  USING TTL ?`
-		return m.session.
-			Query(q,
-				req.GroupID,
-				req.CreatedAt,
-				req.ID,
-				req.SenderUIN,
-				req.Ciphertext,
-				req.MsgType,
-				int(m.ttl.Seconds()),
-			).
-			WithContext(ctx).
-			Consistency(gocql.Quorum).
-			Exec()
-	}
-	const q = `INSERT INTO iceq.group_messages
-	  (group_id, created_at, id, sender_uin, ciphertext, msg_type)
-	  VALUES (?, ?, ?, ?, ?, ?)`
-	return m.session.
-		Query(q,
+		batch.Query(q,
 			req.GroupID,
 			req.CreatedAt,
 			req.ID,
 			req.SenderUIN,
 			req.Ciphertext,
 			req.MsgType,
-		).
-		WithContext(ctx).
-		Consistency(gocql.Quorum).
-		Exec()
+			int(m.ttl.Seconds()),
+		)
+		batch.Query(`INSERT INTO iceq.group_message_deletion_index (uin, group_id, created_at, id) VALUES (?, ?, ?, ?) USING TTL ?`, req.SenderUIN, req.GroupID, req.CreatedAt, req.ID, int(m.ttl.Seconds()))
+		return m.session.ExecuteBatch(batch)
+	}
+	const q = `INSERT INTO iceq.group_messages
+	  (group_id, created_at, id, sender_uin, ciphertext, msg_type)
+	  VALUES (?, ?, ?, ?, ?, ?)`
+	batch.Query(q,
+		req.GroupID,
+		req.CreatedAt,
+		req.ID,
+		req.SenderUIN,
+		req.Ciphertext,
+		req.MsgType,
+	)
+	batch.Query(`INSERT INTO iceq.group_message_deletion_index (uin, group_id, created_at, id) VALUES (?, ?, ?, ?)`, req.SenderUIN, req.GroupID, req.CreatedAt, req.ID)
+	return m.session.ExecuteBatch(batch)
 }
 
 // ----------------------------------------------------------------------------

@@ -49,3 +49,15 @@ CREATE TABLE iceq.group_messages (
 
 ALTER TABLE iceq.group_messages ADD ciphertext BLOB;
 ALTER TABLE iceq.group_messages ADD msg_type   TEXT;
+
+-- Panic-wipe deletion indexes. Each partition belongs to one UIN and carries
+-- the complete primary key of the opaque message row; no cluster-wide scan is
+-- required during account deletion.
+CREATE TABLE iceq.message_deletion_index (
+  uin BIGINT, conversation_id TEXT, created_at TIMESTAMP, id UUID,
+  PRIMARY KEY ((uin), conversation_id, created_at, id)
+);
+CREATE TABLE iceq.group_message_deletion_index (
+  uin BIGINT, group_id UUID, created_at TIMESTAMP, id UUID,
+  PRIMARY KEY ((uin), group_id, created_at, id)
+);

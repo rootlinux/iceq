@@ -23,7 +23,7 @@ func NewScyllaMessageStore(session *gocql.Session) (*ScyllaMessageStore, error) 
 }
 
 func (s *ScyllaMessageStore) DeleteUserMessages(ctx context.Context, uin int64) error {
-	iter := s.session.Query(`SELECT conversation_id, created_at, id FROM messages WHERE sender_uin = ? ALLOW FILTERING`, uin).WithContext(ctx).Iter()
+	iter := s.session.Query(`SELECT conversation_id, created_at, id FROM message_deletion_index WHERE uin = ?`, uin).WithContext(ctx).Iter()
 	var conversationID string
 	var createdAt time.Time
 	var id gocql.UUID
@@ -34,24 +34,16 @@ func (s *ScyllaMessageStore) DeleteUserMessages(ctx context.Context, uin int64) 
 		}
 	}
 	if err := iter.Close(); err != nil {
-		return fmt.Errorf("scan sent messages: %w", err)
+		return fmt.Errorf("scan message deletion index: %w", err)
 	}
-
-	iter = s.session.Query(`SELECT conversation_id, created_at, id FROM messages WHERE receiver_uin = ? ALLOW FILTERING`, uin).WithContext(ctx).Iter()
-	for iter.Scan(&conversationID, &createdAt, &id) {
-		if err := s.session.Query(`DELETE FROM messages WHERE conversation_id = ? AND created_at = ? AND id = ?`, conversationID, createdAt, id).WithContext(ctx).Exec(); err != nil {
-			_ = iter.Close()
-			return fmt.Errorf("delete received message: %w", err)
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return fmt.Errorf("scan received messages: %w", err)
+	if err := s.session.Query(`DELETE FROM message_deletion_index WHERE uin = ?`, uin).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("delete message index: %w", err)
 	}
 	return nil
 }
 
 func (s *ScyllaMessageStore) DeleteUserGroupMessages(ctx context.Context, uin int64) error {
-	iter := s.session.Query(`SELECT group_id, created_at, id FROM group_messages WHERE sender_uin = ? ALLOW FILTERING`, uin).WithContext(ctx).Iter()
+	iter := s.session.Query(`SELECT group_id, created_at, id FROM group_message_deletion_index WHERE uin = ?`, uin).WithContext(ctx).Iter()
 	var groupID gocql.UUID
 	var createdAt interface{}
 	var id gocql.UUID
@@ -62,7 +54,10 @@ func (s *ScyllaMessageStore) DeleteUserGroupMessages(ctx context.Context, uin in
 		}
 	}
 	if err := iter.Close(); err != nil {
-		return fmt.Errorf("scan group messages: %w", err)
+		return fmt.Errorf("scan group message deletion index: %w", err)
+	}
+	if err := s.session.Query(`DELETE FROM group_message_deletion_index WHERE uin = ?`, uin).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("delete group message index: %w", err)
 	}
 	return nil
 }

@@ -72,13 +72,14 @@ Implemented:
 - Caddy enforces HSTS, CSP, X-Frame-Options, Referrer-Policy, Permissions-Policy, and X-Content-Type-Options.
 - Optional Scylla TTL can expire encrypted message rows.
 - Panic-wipe support removes keys, contacts, refresh tokens, group memberships, and message rows on destructive account wipe.
-- Auth-service now requires its Scylla session at startup and wires a row-specific message store into both automatic and manual panic-wipe paths; Scylla cleanup remains best-effort after the atomic PostgreSQL wipe.
+- Auth-service requires its Scylla session at startup and wires the same message store into automatic and manual panic-wipe paths. Session revocation/blocklisting completes before bounded best-effort ciphertext cleanup. Direct sender/receiver and group-sender index partitions provide exact primary keys, avoiding cluster-wide `ALLOW FILTERING` scans; new message rows and their deletion-index rows are committed in one logged batch.
 - CI security workflow now runs backend tests, web tests/build, npm audit, and Compose config validation.
 
 Remaining:
 - IDOR and tenant isolation need a route-by-route audit.
 - Database at-rest encryption is an operator/storage-layer task and is not fully automated here.
 - Rate limiting is primarily edge-level; service-level abuse controls should be expanded.
+- Ciphertext written before migration `004_panic_wipe_message_indexes.cql` has no deletion-index row. Operators must handle that legacy data with a bounded offline migration or retention expiry; the online panic-wipe path intentionally never performs a cluster-wide scan.
 
 Tradeoff:
 - Cookie refresh improves token secrecy but requires CSRF discipline on state-changing cookie-auth endpoints.

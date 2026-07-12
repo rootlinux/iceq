@@ -162,6 +162,7 @@ services:
         condition: service_healthy
     volumes:
       - ./init/scylla-init.cql:/init/scylla-init.cql:ro
+      - ./init/migrations/004_panic_wipe_message_indexes.cql:/init/004-panic-wipe-message-indexes.cql:ro
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -187,6 +188,7 @@ services:
           fi
           echo "[scylla-init] schema already exists (idempotent OK)"
         fi
+        cqlsh scylla 9042 -f /init/004-panic-wipe-message-indexes.cql
         echo "[scylla-init] schema applied successfully"
     logging: *default-logging
 

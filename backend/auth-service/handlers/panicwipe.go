@@ -332,21 +332,6 @@ func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) error {
 		return fmt.Errorf("panicwipe: commit: %w", err)
 	}
 
-	// ----- 2. ScyllaDB best-effort cleanup ---------------------------------
-	// Steps 1, 2 of the spec: messages and group_messages.
-	// These deletes run AFTER the PG commit. If they fail, the
-	// user's data in PG is still wiped, and the messages in
-	// Scylla are now unreadable ciphertext (the keys are gone).
-	// We log the failure but do NOT roll back the wipe.
-	if deps.Scylla != nil {
-		if err := deps.Scylla.DeleteUserMessages(ctx, uin); err != nil {
-			log.Printf("[auth-service] panicwipe: scylla delete messages failed: %v (ciphertext retained; keys gone)", err)
-		}
-		if err := deps.Scylla.DeleteUserGroupMessages(ctx, uin); err != nil {
-			log.Printf("[auth-service] panicwipe: scylla delete group_messages failed: %v (ciphertext retained; keys gone)", err)
-		}
-	}
-
 	// ----- 9. Wipe blocklist ------------------------------------------------
 	// Sets the per-user blocklist key. The ws-gateway does
 	// EXISTS on this key for every message; if it returns 1,
@@ -358,13 +343,7 @@ func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) error {
 		"1",
 		panicWipeBlocklistTTL,
 	).Err(); err != nil {
-		// The PG portion has already committed; failing to set
-		// the blocklist key means an already-connected client
-		// could keep sending messages until their access token
-		// expires (15 min). The ws-gateway's defence-in-depth
-		// (token verification + presence) limits the blast
-		// radius. We log and continue.
-		log.Printf("[auth-service] panicwipe: set blocklist key failed: %v", err)
+		return fmt.Errorf("panicwipe: revoke active sessions: %w", err)
 	}
 
 	// ----- 10. DEL login_attempts:{uin} ------------------------------------
@@ -382,12 +361,30 @@ func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) error {
 		log.Printf("[auth-service] panicwipe: del presence failed: %v", err)
 	}
 
+	// Ciphertext cleanup is deliberately last. It receives an independent,
+	// bounded context so a slow Scylla node cannot consume the request budget
+	// needed for token/session revocation above.
+	if deps.Scylla != nil {
+		cleanupScylla(ctx, deps.Scylla, uin, 5*time.Second)
+	}
+
 	// Audit log. Spec says: timestamp + uin + "panic_wipe_executed".
 	// We add the threshold-crossed count too, because operations
 	// needs to know whether the wipe fired at 3 attempts
 	// (expected) or at 1 (suspicious).
 	log.Printf("[auth-service] panic_wipe_executed")
 	return nil
+}
+
+func cleanupScylla(parent context.Context, store MessageStore, uin int64, timeout time.Duration) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	defer cancel()
+	if err := store.DeleteUserMessages(cleanupCtx, uin); err != nil {
+		log.Printf("[auth-service] panicwipe: scylla delete messages failed: %v (ciphertext retained; keys gone)", err)
+	}
+	if err := store.DeleteUserGroupMessages(cleanupCtx, uin); err != nil {
+		log.Printf("[auth-service] panicwipe: scylla delete group_messages failed: %v (ciphertext retained; keys gone)", err)
+	}
 }
 
 // ----------------------------------------------------------------------------
