@@ -167,7 +167,7 @@ func handleDirect(c *client.Client, deps client.Deps, env models.Envelope) {
 	// message-service will publish a follow-up ACK with
 	// State="delivered" once it has written to Scylla.
 	ack, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{
-		MessageID:    msgID,
+		MessageID:    ackMessageID(msgID, p.ClientID),
 		State:        models.AckStatePersisted,
 		RecipientUIN: p.ReceiverUIN,
 	})
@@ -344,7 +344,7 @@ func handleGroup(c *client.Client, deps client.Deps, env models.Envelope) {
 		return
 	}
 	ack, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{
-		MessageID: msgID,
+		MessageID: ackMessageID(msgID, p.ClientID),
 		State:     models.AckStatePersisted,
 		// RecipientUIN is the GROUP, encoded as 0 for
 		// "group ack". Recipients are the individual
@@ -353,6 +353,13 @@ func handleGroup(c *client.Client, deps client.Deps, env models.Envelope) {
 		RecipientUIN: 0,
 	})
 	c.TrySend(mustMarshal(ack))
+}
+
+func ackMessageID(serverID, clientID string) string {
+	if clientID != "" {
+		return clientID
+	}
+	return serverID
 }
 
 type groupMessageWirePayload struct {

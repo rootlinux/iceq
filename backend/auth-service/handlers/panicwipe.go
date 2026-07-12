@@ -48,9 +48,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"time"
 
+	"github.com/iceq/iceq/shared/middleware"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -206,6 +208,50 @@ type PanicWipeDeps struct {
 	// interface is satisfied by the message-service's gocql
 	// session in a later step.
 	Scylla MessageStore
+}
+
+// ManualPanicWipeDeps wires the authenticated manual panic-wipe
+// endpoint. Wipe defaults to PanicWipe; tests can replace it so
+// the handler contract stays unit-testable without a live PG/Redis
+// stack.
+type ManualPanicWipeDeps struct {
+	PanicWipeDeps
+	Wipe    func(context.Context, PanicWipeDeps, int64) error
+	Timeout time.Duration
+}
+
+// NewManualPanicWipeHandler returns the handler mounted at
+// POST /api/auth/panic-wipe. The route MUST be wrapped with
+// BearerAuth; the authenticated UIN is the only input to the wipe.
+func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
+	if deps.Wipe == nil {
+		deps.Wipe = PanicWipe
+	}
+	if deps.Timeout <= 0 {
+		deps.Timeout = 10 * time.Second
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		uin, ok := middleware.GetUIN(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "AUTH_MISSING_BEARER", "Authorization header is required")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), deps.Timeout)
+		defer cancel()
+
+		if err := deps.Wipe(ctx, deps.PanicWipeDeps, uin); err != nil {
+			log.Printf("[auth-service] manual panic wipe failed")
+			clearSessionCookies(w)
+			writeError(w, http.StatusServiceUnavailable, "PANIC_WIPE_FAILED",
+				"could not wipe account; please retry")
+			return
+		}
+
+		clearSessionCookies(w)
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 // PanicWipe executes the full wipe sequence. ctx is the request

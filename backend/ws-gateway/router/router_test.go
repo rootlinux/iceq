@@ -125,6 +125,18 @@ func TestForwardDirectPayloadPreservesCiphertextAndMsgType(t *testing.T) {
 	}
 }
 
+func TestAckMessageIDPrefersClientIDForOptimisticUI(t *testing.T) {
+	if got := ackMessageID("server-id", "optimistic-id"); got != "optimistic-id" {
+		t.Fatalf("ackMessageID mismatch: got %q want %q", got, "optimistic-id")
+	}
+}
+
+func TestAckMessageIDFallsBackToServerID(t *testing.T) {
+	if got := ackMessageID("server-id", ""); got != "server-id" {
+		t.Fatalf("ackMessageID mismatch: got %q want %q", got, "server-id")
+	}
+}
+
 func TestEnvelopeTypesMatchWebWireContract(t *testing.T) {
 	if models.EnvelopeTypeDirect != "message" {
 		t.Fatalf("EnvelopeTypeDirect mismatch: got %q want %q", models.EnvelopeTypeDirect, "message")

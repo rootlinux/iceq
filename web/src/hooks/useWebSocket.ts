@@ -304,7 +304,7 @@ export function useWebSocket(): UseWebSocketResult {
         // which is bounded by the chat window's paging.
         for (const [convId, list] of Object.entries(useChatStore.getState().messagesByConversation)) {
           if (list.some((m) => m.id === p.message_id)) {
-            if (p.state === "delivered") useChatStore.getState().markDelivered(p.message_id, convId);
+            if (p.state === "delivered" || p.state === "persisted") useChatStore.getState().markDelivered(p.message_id, convId);
             else if (p.state === "read") useChatStore.getState().markRead(p.message_id, convId);
             return;
           }

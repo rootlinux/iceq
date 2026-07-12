@@ -13,7 +13,7 @@
 // layer.
 
 import { create } from "zustand";
-import { loadPreKeys } from "../lib/indexeddb";
+import { getPrekeyCount } from "../api/keys";
 
 interface SignalState {
   ready: boolean;
@@ -36,8 +36,8 @@ export const useSignalStore = create<SignalState>((set) => ({
   setReady: (ready) => set({ ready }),
 
   refreshPrekeyCount: async () => {
-    const list = await loadPreKeys();
-    set({ prekeyCount: list.length });
+    const count = await getPrekeyCount();
+    set({ prekeyCount: count });
   },
 
   setError: (message) => set({ lastError: message }),

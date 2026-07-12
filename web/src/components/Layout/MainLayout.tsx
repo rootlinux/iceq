@@ -10,7 +10,7 @@ import { useWebSocket } from "../../hooks/useWebSocket";
 import { useOnlineStatus } from "../../hooks/useOnlineStatus";
 import { useAuthStore } from "../../store/authStore";
 import { useSignalStore } from "../../store/signalStore";
-import { ensureOwnBundle } from "../../lib/signalBootstrap";
+import { ensureSignalProvisioning } from "../../lib/signalBootstrap";
 
 interface MainLayoutProps {
   children: React.ReactNode;
@@ -44,7 +44,7 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
     if (selfUin === null) return;
     let cancelled = false;
 
-    void ensureOwnBundle(selfUin)
+    void ensureSignalProvisioning(selfUin)
       .then(() => refreshPrekeyCount())
       .then(() => {
         if (cancelled) return;

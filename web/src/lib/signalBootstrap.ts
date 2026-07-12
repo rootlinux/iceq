@@ -1,7 +1,21 @@
 import { ApiError } from "../api/client";
-import { fetchBundle, uploadBundle, type PreKeyBundleUpload, type RemotePreKeyBundle } from "../api/keys";
-import { loadIdentity, type StoredIdentity } from "./indexeddb";
 import {
+  addPreKeys,
+  fetchBundle,
+  getPrekeyCount,
+  uploadBundle,
+  type OneTimePreKeyUpload,
+  type PreKeyBundleUpload,
+  type RemotePreKeyBundle,
+} from "../api/keys";
+import {
+  loadIdentity,
+  loadNextPreKeyId,
+  saveNextPreKeyId,
+  type StoredIdentity,
+} from "./indexeddb";
+import {
+  generateOneTimePreKeys,
   generatePreKeyBundle,
   restoreOwnIdentity,
   type IdentityKeyPair,
@@ -9,6 +23,9 @@ import {
 
 const DEFAULT_PREKEY_START = 1;
 const DEFAULT_ONE_TIME_PREKEY_COUNT = 20;
+const LEGACY_NEXT_PREKEY_ID = 22;
+const PREKEY_LOW_WATERMARK = 10;
+const PREKEY_TARGET_COUNT = 20;
 
 type RestoredIdentity = IdentityKeyPair & { registrationId: number };
 
@@ -25,6 +42,11 @@ export interface SignalBootstrapDeps {
     registrationId: number,
   ) => Promise<GeneratedBundle>;
   uploadBundle: (bundle: PreKeyBundleUpload) => Promise<void>;
+  getPrekeyCount: () => Promise<number>;
+  loadNextPreKeyId: () => Promise<number | null>;
+  saveNextPreKeyId: (id: number) => Promise<void>;
+  generateOneTimePreKeys: (startId: number, count: number) => Promise<OneTimePreKeyUpload[]>;
+  addPreKeys: (prekeys: OneTimePreKeyUpload[]) => Promise<{ accepted: number }>;
 }
 
 const defaultDeps: SignalBootstrapDeps = {
@@ -33,6 +55,11 @@ const defaultDeps: SignalBootstrapDeps = {
   restoreIdentity: restoreOwnIdentity,
   generatePreKeyBundle,
   uploadBundle,
+  getPrekeyCount,
+  loadNextPreKeyId,
+  saveNextPreKeyId,
+  generateOneTimePreKeys,
+  addPreKeys,
 };
 
 export async function ensureOwnBundle(
@@ -64,4 +91,33 @@ export async function ensureOwnBundle(
   );
   await deps.uploadBundle(bundle);
   return "repaired";
+}
+
+export interface SignalProvisioningResult {
+  bundle: "ok" | "repaired";
+  replenished: boolean;
+  prekeyCount: number;
+}
+
+export async function ensureSignalProvisioning(
+  uin: number,
+  deps: SignalBootstrapDeps = defaultDeps,
+): Promise<SignalProvisioningResult> {
+  const bundle = await ensureOwnBundle(uin, deps);
+  const count = await deps.getPrekeyCount();
+  if (count >= PREKEY_LOW_WATERMARK) {
+    return { bundle, replenished: false, prekeyCount: count };
+  }
+
+  const topUpCount = PREKEY_TARGET_COUNT - count;
+  const startId = (await deps.loadNextPreKeyId()) ?? LEGACY_NEXT_PREKEY_ID;
+  await deps.saveNextPreKeyId(startId + topUpCount);
+  const prekeys = await deps.generateOneTimePreKeys(startId, topUpCount);
+  const uploaded = await deps.addPreKeys(prekeys);
+
+  return {
+    bundle,
+    replenished: uploaded.accepted > 0,
+    prekeyCount: count + uploaded.accepted,
+  };
 }

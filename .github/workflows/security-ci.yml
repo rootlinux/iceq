@@ -1,0 +1,71 @@
+name: Security CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Test backend
+        working-directory: backend
+        run: go test ./...
+
+  web:
+    name: Web tests and audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Audit high-risk dependencies
+        working-directory: web
+        run: npm audit --audit-level=high
+
+      - name: Run web source tests
+        working-directory: web
+        run: npm test
+
+      - name: Build web
+        working-directory: web
+        run: npm run build
+
+  compose:
+    name: Compose validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare local env
+        run: cp deploy/.env.example deploy/.env.local
+
+      - name: Validate compose config
+        run: docker compose -f deploy/docker-compose.yml config --quiet

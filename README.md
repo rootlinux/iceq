@@ -191,6 +191,12 @@ cd web && npm ci && npm run build
 cd backend && go run ./cmd_smoke_step10/
 ```
 
+## Security Status and CI
+
+The current implementation status for the requested Tor, E2EE, backend-hardening, anonymity, frontend, and delivery work is tracked in [`docs/security-status.md`](docs/security-status.md).
+
+GitHub Actions workflow [`security-ci.yml`](.github/workflows/security-ci.yml) runs backend tests, web source tests/build, high-severity `npm audit`, and Docker Compose config validation. These checks are deterministic and do not start the full live stack.
+
 ## Known Limitations
 
 - **Group attachments** — direct-message attachments are encrypted and wired in the chat UI; group attachment E2EE still waits on the group encryption design

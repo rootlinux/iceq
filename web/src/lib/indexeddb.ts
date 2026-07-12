@@ -1,5 +1,5 @@
 // src/lib/indexeddb.ts
-// IceQ IndexedDB schema. Version 2.
+// IceQ IndexedDB schema. Version 3.
 //
 // Stores:
 //
@@ -39,6 +39,10 @@
 //                       window while the history API call is in
 //                       flight.
 //
+//   metadata          — small local counters that do not contain
+//                       key material. Currently used for the
+//                       monotonic one-time-prekey id cursor.
+//
 // The schema is intentionally small. We do not store ciphertext
 // locally — the backend is the durable store. Plaintext is the
 // only thing we cache, and we re-derive it from the Signal
@@ -50,9 +54,11 @@
 // Schema v2 (Step 9): adds signed_prekeys and identities. The
 // privacyresearch Signal library's StorageType interface needs
 // per-peer identity tracking and signed-prekey persistence.
+//
+// Schema v3: adds metadata for the replenishment prekey-id cursor.
 
 export const ICEQ_INDEXEDDB_NAME = "iceq";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 const STORE_IDENTITY = "identity";
 const STORE_SESSIONS = "sessions";
@@ -60,8 +66,10 @@ const STORE_PREKEYS = "prekeys";
 const STORE_SIGNED_PREKEYS = "signed_prekeys";
 const STORE_PEER_IDENTITIES = "identities";
 const STORE_MESSAGES = "messages";
+const STORE_METADATA = "metadata";
 
 const SELF_KEY = "self";
+const NEXT_PREKEY_ID_KEY = "next_prekey_id";
 
 // ----------------------------------------------------------------------------
 // Identity. Own long-term identity. Persisted in IndexedDB only.
@@ -159,6 +167,19 @@ export async function deletePreKey(id: number): Promise<void> {
   db.close();
 }
 
+export async function loadNextPreKeyId(): Promise<number | null> {
+  const db = await openDB();
+  const v = await idbGet<number>(db, STORE_METADATA, NEXT_PREKEY_ID_KEY);
+  db.close();
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+export async function saveNextPreKeyId(id: number): Promise<void> {
+  const db = await openDB();
+  await idbPut(db, STORE_METADATA, id, NEXT_PREKEY_ID_KEY);
+  db.close();
+}
+
 // ----------------------------------------------------------------------------
 // Decrypted message cache. Used by the chat window to re-render
 // the last few messages on page reload while the history API
@@ -229,6 +250,9 @@ function openDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_PEER_IDENTITIES)) {
         db.createObjectStore(STORE_PEER_IDENTITIES);
+      }
+      if (!db.objectStoreNames.contains(STORE_METADATA)) {
+        db.createObjectStore(STORE_METADATA);
       }
     };
     req.onsuccess = () => resolve(req.result);

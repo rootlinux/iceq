@@ -15,6 +15,8 @@
 
 const ACCESS_TOKEN_KEY = "iceq_access_token";
 const REFRESH_TOKEN_KEY = "iceq_refresh_token";
+const CSRF_HEADER_NAME = "X-IceQ-CSRF";
+const CSRF_HEADER_VALUE = "1";
 
 // ----------------------------------------------------------------------------
 // ApiError — typed errors so callers can switch on cause without
@@ -61,7 +63,7 @@ async function attemptRefresh(): Promise<boolean> {
 		try {
 			const resp = await fetch("/api/auth/refresh", {
 				method: "POST",
-				headers: { "Content-Type": "application/json" },
+				headers: { "Content-Type": "application/json", [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE },
 				credentials: "same-origin",
 				body: JSON.stringify({}),
 			});
@@ -120,6 +122,7 @@ export interface FetchOptions {
 }
 
 export async function fetchWithAuth(path: string, opts: FetchOptions = {}, retried = false): Promise<Response> {
+	const method = opts.method ?? (opts.body !== undefined ? "POST" : "GET");
   const headers: Record<string, string> = {
     Accept: "application/json",
     ...(opts.headers ?? {}),
@@ -127,15 +130,18 @@ export async function fetchWithAuth(path: string, opts: FetchOptions = {}, retri
   if (opts.body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
+	if (requiresCSRF(method)) {
+		headers[CSRF_HEADER_NAME] = CSRF_HEADER_VALUE;
+	}
   if (!opts.noAuth) {
     const token = localStorage.getItem(ACCESS_TOKEN_KEY);
     if (token) headers["Authorization"] = `Bearer ${token}`;
   }
 
   let resp: Response;
-  try {
+	try {
 		resp = await fetch(path, {
-			method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
+			method,
 			headers,
 			body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
 			credentials: "same-origin",
@@ -166,6 +172,10 @@ export async function fetchWithAuth(path: string, opts: FetchOptions = {}, retri
     throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status, code, text.slice(0, 500));
   }
   return resp;
+}
+
+function requiresCSRF(method: string): boolean {
+	return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
 // ----------------------------------------------------------------------------

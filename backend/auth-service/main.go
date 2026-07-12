@@ -186,7 +186,7 @@ func main() {
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   strings.Split(cfg.AllowedOrigins, ","),
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Authorization", "Content-Type"},
+		AllowedHeaders:   []string{"Authorization", "Content-Type", middleware.CSRFHeaderName},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
@@ -195,6 +195,7 @@ func main() {
 	// /api/auth prefix and the unauthenticated /health on the
 	// same prefix for symmetry.
 	r.Route("/api/auth", func(r chi.Router) {
+		csrfMW := middleware.RequireCSRF
 		r.Post("/register", handlers.NewRegisterHandler(handlers.RegisterDeps{
 			Pool:    pgPool,
 			Manager: mgr,
@@ -216,7 +217,7 @@ func main() {
 				Scylla: nil, // message-service wires this in step 4+
 			},
 		}))
-		r.Post("/refresh", handlers.NewRefreshHandler(handlers.RefreshDeps{
+		r.With(csrfMW).Post("/refresh", handlers.NewRefreshHandler(handlers.RefreshDeps{
 			Pool:    pgPool,
 			Manager: mgr,
 		}))
@@ -226,7 +227,7 @@ func main() {
 		// into the request context.
 		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
 			Manager: mgr,
-		})).Post("/logout", handlers.NewLogoutHandler(handlers.LogoutDeps{
+		}), csrfMW).Post("/logout", handlers.NewLogoutHandler(handlers.LogoutDeps{
 			Pool:    pgPool,
 			Manager: mgr,
 		}))
@@ -242,13 +243,22 @@ func main() {
 		}))
 		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
 			Manager: mgr,
-		})).Put("/settings", handlers.NewPutSettingsHandler(handlers.SettingsDeps{
+		}), csrfMW).Put("/settings", handlers.NewPutSettingsHandler(handlers.SettingsDeps{
 			Pool: pgPool,
 		}))
 		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
 			Manager: mgr,
 		})).Get("/me", handlers.NewMeHandler(handlers.MeDeps{
 			Pool: pgPool,
+		}))
+		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
+			Manager: mgr,
+		}), csrfMW).Post("/panic-wipe", handlers.NewManualPanicWipeHandler(handlers.ManualPanicWipeDeps{
+			PanicWipeDeps: handlers.PanicWipeDeps{
+				Pool:   pgPool,
+				Redis:  rdb,
+				Scylla: nil,
+			},
 		}))
 		r.Get("/health", newHealthHandler(pgPool, rdb, VERSION))
 	})
@@ -265,10 +275,10 @@ func main() {
 	authMW := middleware.NewBearerAuth(middleware.BearerAuthConfig{Manager: mgr})
 	r.Route("/api/contacts", func(r chi.Router) {
 		r.With(authMW).Get("/", handlers.NewListContactsHandler(contactsDeps))
-		r.With(authMW).Post("/", handlers.NewAddContactHandler(contactsDeps))
-		r.With(authMW).Put("/{target_uin}/accept", handlers.NewAcceptContactHandler(contactsDeps))
-		r.With(authMW).Put("/{target_uin}/block", handlers.NewBlockContactHandler(contactsDeps))
-		r.With(authMW).Delete("/{target_uin}", handlers.NewRemoveContactHandler(contactsDeps))
+		r.With(authMW, middleware.RequireCSRF).Post("/", handlers.NewAddContactHandler(contactsDeps))
+		r.With(authMW, middleware.RequireCSRF).Put("/{target_uin}/accept", handlers.NewAcceptContactHandler(contactsDeps))
+		r.With(authMW, middleware.RequireCSRF).Put("/{target_uin}/block", handlers.NewBlockContactHandler(contactsDeps))
+		r.With(authMW, middleware.RequireCSRF).Delete("/{target_uin}", handlers.NewRemoveContactHandler(contactsDeps))
 	})
 
 	// --- HTTP server + graceful shutdown -------------------------------

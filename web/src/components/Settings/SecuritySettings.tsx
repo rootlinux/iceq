@@ -38,6 +38,7 @@ import {
   getSettings,
   putSettings,
 } from "../../api/settings";
+import { loadIdentity } from "../../lib/indexeddb";
 
 type Status =
   | { kind: "loading" }
@@ -48,6 +49,11 @@ type ConfirmState =
   | { kind: "none" }
   | { kind: "enable"; threshold: number };
 
+type FingerprintStatus =
+  | { kind: "loading" }
+  | { kind: "ready"; fingerprint: string | null }
+  | { kind: "error" };
+
 export function SecuritySettings(): JSX.Element {
   const [status, setStatus] = useState<Status>({ kind: "loading" });
   // Working copy of the threshold. Kept separate from
@@ -56,6 +62,9 @@ export function SecuritySettings(): JSX.Element {
   // rendered "currently saved" value.
   const [draftThreshold, setDraftThreshold] = useState<number>(DEFAULT_THRESHOLD);
   const [confirm, setConfirm] = useState<ConfirmState>({ kind: "none" });
+  const [fingerprintStatus, setFingerprintStatus] = useState<FingerprintStatus>({
+    kind: "loading",
+  });
   const [saving, setSaving] = useState(false);
 
   // Initial fetch.
@@ -70,6 +79,26 @@ export function SecuritySettings(): JSX.Element {
       } catch (e) {
         if (cancelled) return;
         setStatus({ kind: "error", message: (e as Error).message });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const identity = await loadIdentity();
+        const fingerprint = identity
+          ? await fingerprintIdentityKey(identity.publicKey)
+          : null;
+        if (cancelled) return;
+        setFingerprintStatus({ kind: "ready", fingerprint });
+      } catch {
+        if (cancelled) return;
+        setFingerprintStatus({ kind: "error" });
       }
     })();
     return () => {
@@ -206,6 +235,17 @@ export function SecuritySettings(): JSX.Element {
           : "Auto-wipe: OFF"}
       </div>
 
+      <div className="iceq-settings-row">
+        <div className="iceq-settings-status">
+          <strong>Local identity fingerprint</strong>
+          <div>{renderFingerprint(fingerprintStatus)}</div>
+          <p>
+            Compare this fingerprint out-of-band with contacts. This only verifies
+            the key stored on this device.
+          </p>
+        </div>
+      </div>
+
       {confirm.kind === "enable" && (
         <div className="iceq-modal-backdrop" role="dialog" aria-modal="true">
           <div className="iceq-modal">
@@ -238,6 +278,28 @@ export function SecuritySettings(): JSX.Element {
       )}
     </div>
   );
+}
+
+function renderFingerprint(status: FingerprintStatus): string {
+  if (status.kind === "loading") return "Loading...";
+  if (status.kind === "error") return "Fingerprint unavailable.";
+  return status.fingerprint ?? "No identity key on this device yet.";
+}
+
+async function fingerprintIdentityKey(publicKey: string): Promise<string> {
+  const digest = new Uint8Array(
+    await globalThis.crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(publicKey),
+    ),
+  );
+  const groups: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const offset = i * 2;
+    const value = ((digest[offset] ?? 0) << 8) | (digest[offset + 1] ?? 0);
+    groups.push(value.toString(16).padStart(4, "0"));
+  }
+  return groups.join(" ").toUpperCase();
 }
 
 export default SecuritySettings;

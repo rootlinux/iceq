@@ -30,6 +30,7 @@ import type {
 } from "@privacyresearch/libsignal-protocol-typescript";
 import {
   fetchBundle,
+  type OneTimePreKeyUpload,
   type RemotePreKeyBundle,
 } from "../api/keys";
 export { computeSafetyNumber, type SafetyIdentity } from "./safetyFingerprint";
@@ -334,6 +335,23 @@ export async function generatePreKeyBundle(
     one_time_pre_keys: oneTime,
     registration_id: registrationId,
   };
+}
+
+export async function generateOneTimePreKeys(startId: number, count: number): Promise<OneTimePreKeyUpload[]> {
+  const { runtime } = await ensureBoot();
+  const store = getSignalStore();
+  const prekeys: OneTimePreKeyUpload[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const otp = await runtime.KeyHelper.generatePreKey(startId + i);
+    await store.storePreKey(otp.keyId, otp.keyPair);
+    prekeys.push({
+      id: otp.keyId,
+      public_key: encodePreKeyPublicKeyForWire(new Uint8Array(otp.keyPair.pubKey)),
+    });
+  }
+
+  return prekeys;
 }
 
 // ============================================================================

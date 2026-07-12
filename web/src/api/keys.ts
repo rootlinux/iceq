@@ -4,7 +4,8 @@
 //
 //   POST /api/keys/bundle       — upload own bundle
 //   POST /api/keys/prekeys      — top up one-time prekeys
-//   GET  /api/keys/bundle/:uin  — fetch a peer's bundle
+//   GET  /api/keys/prekeys/count — unused server-side prekey count
+//   GET  /api/keys/bundle/:uin   — fetch a peer's bundle
 //                                  (used by Signal X3DH)
 //
 // Privacy note: the bundle contains public-key material only.
@@ -46,6 +47,11 @@ export async function addPreKeys(prekeys: OneTimePreKeyUpload[]): Promise<{ acce
     body: { prekeys },
   });
   return { accepted: prekeys.length };
+}
+
+export async function getPrekeyCount(): Promise<number> {
+  const resp = await fetchJSON<{ count: number }>("/api/keys/prekeys/count", { method: "GET" });
+  return resp.count;
 }
 
 export interface RemotePreKeyBundle {
