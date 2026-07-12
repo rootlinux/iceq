@@ -154,7 +154,7 @@ docker compose -f deploy/docker-compose.yml config --quiet
 
 ## Existing-volume rollout prerequisite
 
-Docker initdb mounts execute only for fresh volumes. Existing deployments must apply PostgreSQL migration `005_wiped_accounts.sql` and Scylla migration `004_panic_wipe_message_indexes.cql` before starting the updated auth-service or ws-gateway. The README section “Existing database volumes: required security migrations” provides exact idempotent commands that expand credentials inside the containers without printing passwords. Until `wiped_accounts` exists, authenticated REST and WebSocket checks deliberately fail closed rather than accepting a token whose durable wipe status cannot be established.
+Docker initdb mounts execute only for fresh volumes. Existing deployments must apply and verify Scylla migration `004_panic_wipe_message_indexes.cql` before starting the updated message-service, because its writes require both deletion-index tables. Separately, apply and verify PostgreSQL migration `005_wiped_accounts.sql` before starting the updated auth-service or ws-gateway. The README section “Existing database volumes: required security migrations” provides exact idempotent apply commands plus PostgreSQL and Scylla checks; the Scylla check exits non-zero if either required table is missing. Until `wiped_accounts` exists, authenticated REST and WebSocket checks deliberately fail closed rather than accepting a token whose durable wipe status cannot be established.
 
 ## Highest Priority Next Work
 

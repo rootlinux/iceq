@@ -120,7 +120,17 @@ docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T
   sh -c 'psql --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --command "SELECT to_regclass('"'"'public.wiped_accounts'"'"');"'
 ```
 
-Until `005_wiped_accounts.sql` is applied, JWT validation cannot prove durable revocation and fails closed. Authenticated REST requests and WebSocket authentication/message checks will therefore be rejected. Apply both migrations before rolling out the updated auth-service or ws-gateway containers.
+Verify both Scylla tables. This command exits non-zero if either table is missing:
+
+```bash
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
+  sh -ec 'tables="$(cqlsh --no-color -e "SELECT table_name FROM system_schema.tables WHERE keyspace_name = '\''iceq'\'' AND table_name IN ('\''message_deletion_index'\'', '\''group_message_deletion_index'\'');")"; printf "%s\n" "$tables" | grep -qw message_deletion_index; printf "%s\n" "$tables" | grep -qw group_message_deletion_index'
+```
+
+Rollout ordering is service-specific:
+
+1. Apply and verify migration `004_panic_wipe_message_indexes.cql` **before starting the updated message-service**; otherwise new messages cannot create their deletion-index rows.
+2. Apply and verify migration `005_wiped_accounts.sql` **before starting the updated auth-service or ws-gateway**. Until 005 exists, JWT validation cannot prove durable revocation and fails closed, so authenticated REST requests and WebSocket authentication/message checks are rejected.
 
 ## Tor Hidden Service
 
