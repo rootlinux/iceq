@@ -195,3 +195,29 @@ func TestContactDeleteOnlyDeletesAuthenticatedOwnersEdge(t *testing.T) {
 		t.Fatalf("args=%v", db.calls[0].args)
 	}
 }
+
+func TestContactBlockOnlyMutatesAuthenticatedOwnersEdge(t *testing.T) {
+	for _, actor := range []int64{100, 300} {
+		db := &contactFakeDB{execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 1")}}
+		rr := httptest.NewRecorder()
+		NewBlockContactHandler(ContactsDeps{Pool: db})(rr, contactRequest(http.MethodPut, "/api/contacts/200/block", "", actor))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("actor=%d status=%d body=%s", actor, rr.Code, rr.Body.String())
+		}
+		if db.calls[0].args[0] != actor || db.calls[0].args[1] != int64(200) {
+			t.Fatalf("actor=%d args=%v", actor, db.calls[0].args)
+		}
+	}
+}
+
+func TestContactBlockCreatesOnlyActorsEdgeWhenMissing(t *testing.T) {
+	db := &contactFakeDB{execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0"), pgconn.NewCommandTag("INSERT 1")}}
+	rr := httptest.NewRecorder()
+	NewBlockContactHandler(ContactsDeps{Pool: db})(rr, contactRequest(http.MethodPut, "/api/contacts/200/block", "", 100))
+	if rr.Code != http.StatusOK || len(db.calls) != 2 {
+		t.Fatalf("status=%d calls=%d body=%s", rr.Code, len(db.calls), rr.Body.String())
+	}
+	if db.calls[1].args[0] != int64(100) || db.calls[1].args[1] != int64(200) {
+		t.Fatalf("insert args=%v", db.calls[1].args)
+	}
+}

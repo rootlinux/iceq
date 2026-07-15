@@ -147,3 +147,19 @@ func TestUnrelatedUserCannotGrantOwnersObject(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
+
+func TestForeignActorCannotRevokeGrantAndGrantRemains(t *testing.T) {
+	key := "123e4567-e89b-12d3-a456-426614174000"
+	owners := &fakeOwners{owner: map[string]int64{key: 100}, grants: map[string]map[int64]bool{key: {200: true}}}
+	h := &Handler{Minio: fakeSigner{}, Owners: owners}
+	req := httptest.NewRequest(http.MethodDelete, "/api/files/grants", strings.NewReader(`{"object_key":"`+key+`","grantee_uin":200}`))
+	req = req.WithContext(middleware.WithUIN(req.Context(), 300))
+	rr := httptest.NewRecorder()
+	h.RevokeGrant(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !owners.grants[key][200] {
+		t.Fatal("foreign revoke removed grant")
+	}
+}

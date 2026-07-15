@@ -335,10 +335,14 @@ func (h *Handler) RevokeGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_GRANT", "grant is invalid")
 		return
 	}
-	_, err := h.Owners.Revoke(r.Context(), req.ObjectKey, owner, req.GranteeUIN)
+	revoked, err := h.Owners.Revoke(r.Context(), req.ObjectKey, owner, req.GranteeUIN)
 	if err != nil {
 		log.Printf("[file-service] revoke object grant: %v", err)
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to revoke grant")
+		return
+	}
+	if !revoked {
+		writeError(w, http.StatusNotFound, "OBJECT_NOT_FOUND", "object does not exist")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

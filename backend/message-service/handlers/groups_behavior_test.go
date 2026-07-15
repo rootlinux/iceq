@@ -28,9 +28,15 @@ type groupFakeDB struct {
 	rowsQueue [][][]any
 	tags      []pgconn.CommandTag
 	calls     []groupCall
+	tx        *groupFakeTx
 }
 
-func (f *groupFakeDB) Begin(context.Context) (pgx.Tx, error) { return nil, errors.New("unused") }
+func (f *groupFakeDB) Begin(context.Context) (pgx.Tx, error) {
+	if f.tx != nil {
+		return f.tx, nil
+	}
+	return nil, errors.New("unused")
+}
 func (f *groupFakeDB) Exec(_ context.Context, q string, a ...any) (pgconn.CommandTag, error) {
 	f.calls = append(f.calls, groupCall{q, a})
 	tag := pgconn.NewCommandTag("UPDATE 1")
@@ -105,6 +111,36 @@ func groupAssign(dst, src []any) error {
 	}
 	return nil
 }
+
+type groupFakeTx struct {
+	row       []any
+	calls     []groupCall
+	committed bool
+}
+
+func (t *groupFakeTx) Begin(context.Context) (pgx.Tx, error) { return nil, errors.New("unused") }
+func (t *groupFakeTx) Commit(context.Context) error          { t.committed = true; return nil }
+func (t *groupFakeTx) Rollback(context.Context) error        { return nil }
+func (t *groupFakeTx) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
+	return 0, errors.New("unused")
+}
+func (t *groupFakeTx) SendBatch(context.Context, *pgx.Batch) pgx.BatchResults { return nil }
+func (t *groupFakeTx) LargeObjects() pgx.LargeObjects                         { return pgx.LargeObjects{} }
+func (t *groupFakeTx) Prepare(context.Context, string, string) (*pgconn.StatementDescription, error) {
+	return nil, errors.New("unused")
+}
+func (t *groupFakeTx) Exec(_ context.Context, q string, a ...any) (pgconn.CommandTag, error) {
+	t.calls = append(t.calls, groupCall{q, a})
+	return pgconn.NewCommandTag("INSERT 1"), nil
+}
+func (t *groupFakeTx) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("unused")
+}
+func (t *groupFakeTx) QueryRow(_ context.Context, q string, a ...any) pgx.Row {
+	t.calls = append(t.calls, groupCall{q, a})
+	return groupFakeRow{t.row}
+}
+func (t *groupFakeTx) Conn() *pgx.Conn { return nil }
 func groupRequest(method, path, body string, uin int64) *http.Request {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req = req.WithContext(middleware.WithUIN(req.Context(), uin))
@@ -140,6 +176,25 @@ func TestGroupListIsScopedToAuthenticatedMember(t *testing.T) {
 	}
 	if db.calls[0].args[0] != int64(200) {
 		t.Fatalf("args=%v", db.calls[0].args)
+	}
+}
+
+func TestGroupCreateUsesAuthenticatedActorAsOwnerAndAdmin(t *testing.T) {
+	now := time.Now()
+	tx := &groupFakeTx{row: []any{behaviorGroupID, "team", int64(100), now}}
+	db := &groupFakeDB{tx: tx}
+	rr := httptest.NewRecorder()
+	NewCreateGroupHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodPost, "/api/groups/", `{"name":"team"}`, 100))
+	if rr.Code != http.StatusCreated || !tx.committed {
+		t.Fatalf("status=%d committed=%v body=%s", rr.Code, tx.committed, rr.Body.String())
+	}
+	if tx.calls[0].args[1] != int64(100) || tx.calls[1].args[1] != int64(100) {
+		t.Fatalf("calls=%v", tx.calls)
+	}
+	bad := httptest.NewRecorder()
+	NewCreateGroupHandler(GroupsDeps{PG: db})(bad, groupRequest(http.MethodPost, "/api/groups/", `{"name":"team","owner_uin":999}`, 100))
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("client actor field status=%d body=%s", bad.Code, bad.Body.String())
 	}
 }
 func TestGroupMembersRequireMembershipAndUseUniformForbiddenShape(t *testing.T) {

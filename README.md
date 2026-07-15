@@ -217,15 +217,22 @@ for an existing volume. Before deploying code that issues file grants, back up
 PostgreSQL and apply both idempotent migrations in order:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec -T postgres \
-  psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iceq}" \
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'exec psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iceq}"' \
   < deploy/init/migrations/006_file_object_owners.sql
-docker compose -f deploy/docker-compose.yml exec -T postgres \
-  psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iceq}" \
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'exec psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iceq}"' \
   < deploy/init/migrations/007_file_object_grants.sql
 ```
 
-Verify with `\d file_objects` and `\d file_object_grants`. Legacy MinIO UUIDs
+Verify without expanding or printing credentials in the host shell:
+
+```bash
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'exec psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iceq}" -c "\\d file_objects" -c "\\d file_object_grants"'
+```
+
+Legacy MinIO UUIDs
 remain unavailable unless the operator has a separate trusted record mapping
 each UUID to its uploader. Never infer ownership from message metadata, bucket
 listing order, timestamps, or possession of the UUID. Import a verified mapping
