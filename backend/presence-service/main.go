@@ -186,8 +186,11 @@ func main() {
 	r.Get("/health", newHealthHandler(presenceStore, pgPool, bus, VERSION))
 	r.Route("/api/presence", func(r chi.Router) {
 		r.Use(middleware.NewBearerAuth(middleware.BearerAuthConfig{Manager: mgr}))
-		r.Get("/{uin}", newGetPresenceHandler(presenceStore, pgPool))
-		r.Post("/bulk", newGetBulkPresenceHandler(presenceStore, pgPool))
+		rate := func(action string, limit int64) func(http.Handler) http.Handler {
+			return middleware.NewAuthenticatedRateLimit(middleware.AuthenticatedRateLimitConfig{Redis: rdb, Action: action, Limit: limit, Window: time.Minute})
+		}
+		r.With(rate("presence:read", 120)).Get("/{uin}", newGetPresenceHandler(presenceStore, pgPool))
+		r.With(rate("presence:bulk", 30)).Post("/bulk", newGetBulkPresenceHandler(presenceStore, pgPool))
 	})
 
 	// --- HTTP server + graceful shutdown -------------------------------
