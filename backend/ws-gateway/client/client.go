@@ -126,6 +126,15 @@ func parseAuthToken(raw []byte) (string, error) {
 	if frame.Type != "auth" {
 		return "", errors.New("auth_required")
 	}
+	sources := 0
+	for _, token := range []string{frame.Token, frame.Payload.AccessToken, frame.Payload.Token} {
+		if token != "" {
+			sources++
+		}
+	}
+	if sources != 1 {
+		return "", errors.New("auth_required")
+	}
 	switch {
 	case frame.Token != "":
 		return frame.Token, nil

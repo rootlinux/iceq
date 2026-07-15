@@ -27,3 +27,20 @@ func TestParseAuthToken_RejectsMissingToken(t *testing.T) {
 		t.Fatal("parseAuthToken() error = nil, want non-nil")
 	}
 }
+
+func TestParseAuthToken_RejectsConflictingAuthObjects(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"auth","token":"one","payload":{"access_token":"two"}}`),
+		[]byte(`{"type":"auth","payload":{"access_token":"one","token":"two"}}`),
+	} {
+		if _, err := parseAuthToken(raw); err == nil {
+			t.Fatalf("parseAuthToken(%s) accepted conflicting token sources", raw)
+		}
+	}
+}
+
+func TestParseAuthToken_RejectsNonAuthObject(t *testing.T) {
+	if _, err := parseAuthToken([]byte(`{"type":"message","token":"token"}`)); err == nil {
+		t.Fatal("parseAuthToken accepted non-auth object")
+	}
+}

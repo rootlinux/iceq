@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/iceq/iceq/key-service/models"
-	"github.com/iceq/iceq/key-service/store"
 	"github.com/iceq/iceq/shared/middleware"
 )
 
@@ -21,7 +20,7 @@ import (
 
 // PrekeyDeps captures the dependencies both prekey handlers need.
 type PrekeyDeps struct {
-	Keystore *store.Keystore
+	Keystore keyStore
 }
 
 // NewAddPrekeysHandler returns the http.HandlerFunc mounted at

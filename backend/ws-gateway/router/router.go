@@ -116,6 +116,10 @@ func handleDirect(c *client.Client, deps client.Deps, env models.Envelope) {
 	// user, NEVER the client-claimed sender_uin. A tampered
 	// client cannot impersonate another user.
 	p.SenderUIN = c.UIN()
+	if err := authorizeDirectConversation(p, c.UIN()); err != nil {
+		sendErrorFrame(c, "NOT_A_MEMBER", err.Error())
+		return
+	}
 
 	// Truncate timestamp to the minute. The spec mandates
 	// this; it (a) makes timing-correlation attacks against
@@ -250,6 +254,21 @@ func validateDirectPayload(p models.DirectMessagePayload) error {
 
 func isValidMessageType(msgType string) bool {
 	return msgType == "signal_message" || msgType == "prekey_message"
+}
+
+func authorizeDirectConversation(p models.DirectMessagePayload, senderUIN int64) error {
+	if senderUIN <= 0 || p.ReceiverUIN <= 0 || senderUIN == p.ReceiverUIN {
+		return fmt.Errorf("sender is not a member of this conversation")
+	}
+	a, b := senderUIN, p.ReceiverUIN
+	if a > b {
+		a, b = b, a
+	}
+	want := fmt.Sprintf("dm:%d:%d", a, b)
+	if p.ConversationID != want {
+		return fmt.Errorf("sender is not a member of this conversation")
+	}
+	return nil
 }
 
 func forwardDirectPayload(p models.DirectMessagePayload, senderUIN int64) models.DirectMessagePayload {

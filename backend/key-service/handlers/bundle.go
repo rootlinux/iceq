@@ -26,8 +26,15 @@ import (
 // ----------------------------------------------------------------------------
 
 // BundleDeps captures the dependencies both bundle handlers need.
+type keyStore interface {
+	GetBundle(context.Context, int64) (models.BundleResponse, error)
+	UpsertBundle(context.Context, int64, string, models.SignedPrekey, int) error
+	AddOneTimePrekeys(context.Context, int64, []models.OneTimePrekey) error
+	CountUnusedPrekeys(context.Context, int64) (int, error)
+}
+
 type BundleDeps struct {
-	Keystore *store.Keystore
+	Keystore keyStore
 }
 
 // NewGetBundleHandler returns the http.HandlerFunc mounted at

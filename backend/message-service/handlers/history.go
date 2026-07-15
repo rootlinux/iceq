@@ -414,7 +414,7 @@ func parseDMMembers(convID string, requestingUIN int64) (int64, bool) {
 	}
 	a, errA := strconv.ParseInt(parts[1], 10, 64)
 	b, errB := strconv.ParseInt(parts[2], 10, 64)
-	if errA != nil || errB != nil || a <= 0 || b <= 0 || a == b {
+	if errA != nil || errB != nil || a <= 0 || b <= 0 || a >= b {
 		return 0, false
 	}
 	switch requestingUIN {

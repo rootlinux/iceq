@@ -99,6 +99,28 @@ func TestValidateDirectPayloadRejectsMissingBody(t *testing.T) {
 	}
 }
 
+func TestAuthorizeDirectConversationRejectsForeignOrMismatchedObject(t *testing.T) {
+	tests := []models.DirectMessagePayload{
+		{ConversationID: "dm:7:99", ReceiverUIN: 42},
+		{ConversationID: "dm:42:99", ReceiverUIN: 42},
+		{ConversationID: "dm:42:7", ReceiverUIN: 42},
+	}
+	for _, payload := range tests {
+		if authorizeDirectConversation(payload, 7) == nil {
+			t.Fatalf("authorized mismatched payload: %+v", payload)
+		}
+	}
+}
+
+func TestAuthorizeDirectConversationAcceptsCanonicalTwoUserObject(t *testing.T) {
+	if err := authorizeDirectConversation(models.DirectMessagePayload{
+		ConversationID: "dm:7:42",
+		ReceiverUIN:    42,
+	}, 7); err != nil {
+		t.Fatalf("canonical conversation rejected: %v", err)
+	}
+}
+
 func TestForwardDirectPayloadPreservesCiphertextAndMsgType(t *testing.T) {
 	in := models.DirectMessagePayload{
 		ConversationID: "dm:7:42",
