@@ -52,7 +52,7 @@ import (
 	"github.com/iceq/iceq/shared/models"
 	"github.com/iceq/iceq/shared/natsclient"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ----------------------------------------------------------------------------
@@ -63,8 +63,15 @@ import (
 // needs. The pool is required; the bus is required because the
 // "add member" path publishes a notification to the new member.
 type GroupsDeps struct {
-	PG  *pgxpool.Pool
+	PG  groupDB
 	Bus *natsclient.Client
+}
+
+type groupDB interface {
+	Begin(context.Context) (pgx.Tx, error)
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
 // ----------------------------------------------------------------------------
@@ -125,8 +132,9 @@ type addMemberRequest struct {
 // Body: { "name": "<3-50 chars>" }
 //
 // The handler runs two inserts in a single transaction:
-//   1. INSERT INTO groups → returns the new group_id (UUID).
-//   2. INSERT INTO group_members (group_id, owner_uin, 'admin').
+//  1. INSERT INTO groups → returns the new group_id (UUID).
+//  2. INSERT INTO group_members (group_id, owner_uin, 'admin').
+//
 // If either fails, both roll back so we never leave a group
 // without its owner-membership row.
 func NewCreateGroupHandler(deps GroupsDeps) http.HandlerFunc {
@@ -166,10 +174,10 @@ func NewCreateGroupHandler(deps GroupsDeps) http.HandlerFunc {
 		defer tx.Rollback(ctx) //nolint:errcheck
 
 		var (
-			groupID   string
+			groupID    string
 			storedName string
-			ownerOut  int64
-			createdAt time.Time
+			ownerOut   int64
+			createdAt  time.Time
 		)
 		err = tx.QueryRow(ctx, qCreateGroup, name, ownerUIN).Scan(
 			&groupID, &storedName, &ownerOut, &createdAt,
@@ -393,10 +401,10 @@ func NewAddGroupMemberHandler(deps GroupsDeps) http.HandlerFunc {
 //
 // Two cases:
 //
-//   1. The path uin equals the requester's own UIN → "leave".
-//      Any member (admin or member) can leave a group.
-//   2. The path uin is someone else's UIN → "kick". Only
-//      the group's admin can kick.
+//  1. The path uin equals the requester's own UIN → "leave".
+//     Any member (admin or member) can leave a group.
+//  2. The path uin is someone else's UIN → "kick". Only
+//     the group's admin can kick.
 //
 // After the membership row is deleted we re-count members.
 // If the group is now empty, we DELETE the group (the schema's
@@ -612,7 +620,7 @@ func parseGroupIDParam(r *http.Request) (string, error) {
 // group_members. A non-existent group looks identical to a
 // non-member (both return false) — intentional, to prevent
 // group-ID enumeration via the membership check.
-func isMemberOf(ctx context.Context, pg *pgxpool.Pool, groupID string, uin int64) (bool, error) {
+func isMemberOf(ctx context.Context, pg groupDB, groupID string, uin int64) (bool, error) {
 	var role string
 	err := pg.QueryRow(ctx, qGetGroupRole, groupID, uin).Scan(&role)
 	if err != nil {
@@ -626,7 +634,7 @@ func isMemberOf(ctx context.Context, pg *pgxpool.Pool, groupID string, uin int64
 
 // getGroupRole returns the actor's role in a group. An empty
 // string and a nil error means "not a member".
-func getGroupRole(ctx context.Context, pg *pgxpool.Pool, groupID string, uin int64) (string, error) {
+func getGroupRole(ctx context.Context, pg groupDB, groupID string, uin int64) (string, error) {
 	var role string
 	err := pg.QueryRow(ctx, qGetGroupRole, groupID, uin).Scan(&role)
 	if err != nil {

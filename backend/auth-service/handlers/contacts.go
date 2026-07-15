@@ -50,7 +50,7 @@ import (
 	"github.com/iceq/iceq/shared/models"
 	"github.com/iceq/iceq/shared/natsclient"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ----------------------------------------------------------------------------
@@ -65,8 +65,15 @@ import (
 // it the social graph would be silently invisible to the other
 // party.
 type ContactsDeps struct {
-	Pool *pgxpool.Pool
+	Pool contactDB
 	Bus  *natsclient.Client
+}
+
+type contactDB interface {
+	Begin(context.Context) (pgx.Tx, error)
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
 // ----------------------------------------------------------------------------

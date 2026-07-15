@@ -1,0 +1,247 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/gocql/gocql"
+	"github.com/iceq/iceq/message-service/store"
+	"github.com/iceq/iceq/shared/middleware"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const behaviorGroupID = "7f0300f2-0494-4f61-9f41-7c198f73b2fa"
+
+type groupCall struct {
+	sql  string
+	args []any
+}
+type groupFakeDB struct {
+	rowQueue  [][]any
+	rowsQueue [][][]any
+	tags      []pgconn.CommandTag
+	calls     []groupCall
+}
+
+func (f *groupFakeDB) Begin(context.Context) (pgx.Tx, error) { return nil, errors.New("unused") }
+func (f *groupFakeDB) Exec(_ context.Context, q string, a ...any) (pgconn.CommandTag, error) {
+	f.calls = append(f.calls, groupCall{q, a})
+	tag := pgconn.NewCommandTag("UPDATE 1")
+	if len(f.tags) > 0 {
+		tag = f.tags[0]
+		f.tags = f.tags[1:]
+	}
+	return tag, nil
+}
+func (f *groupFakeDB) Query(_ context.Context, q string, a ...any) (pgx.Rows, error) {
+	f.calls = append(f.calls, groupCall{q, a})
+	var rows [][]any
+	if len(f.rowsQueue) > 0 {
+		rows = f.rowsQueue[0]
+		f.rowsQueue = f.rowsQueue[1:]
+	}
+	return &groupFakeRows{rows: rows}, nil
+}
+func (f *groupFakeDB) QueryRow(_ context.Context, q string, a ...any) pgx.Row {
+	f.calls = append(f.calls, groupCall{q, a})
+	var row []any
+	if len(f.rowQueue) > 0 {
+		row = f.rowQueue[0]
+		f.rowQueue = f.rowQueue[1:]
+	}
+	return groupFakeRow{row}
+}
+
+type groupFakeRow struct{ vals []any }
+
+func (r groupFakeRow) Scan(d ...any) error {
+	if r.vals == nil {
+		return pgx.ErrNoRows
+	}
+	return groupAssign(d, r.vals)
+}
+
+type groupFakeRows struct {
+	rows [][]any
+	i    int
+}
+
+func (r *groupFakeRows) Close()                                       {}
+func (r *groupFakeRows) Err() error                                   { return nil }
+func (r *groupFakeRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *groupFakeRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *groupFakeRows) Next() bool {
+	if r.i >= len(r.rows) {
+		return false
+	}
+	r.i++
+	return true
+}
+func (r *groupFakeRows) Scan(d ...any) error    { return groupAssign(d, r.rows[r.i-1]) }
+func (r *groupFakeRows) Values() ([]any, error) { return r.rows[r.i-1], nil }
+func (r *groupFakeRows) RawValues() [][]byte    { return nil }
+func (r *groupFakeRows) Conn() *pgx.Conn        { return nil }
+func groupAssign(dst, src []any) error {
+	for i := range dst {
+		switch p := dst[i].(type) {
+		case *int:
+			*p = src[i].(int)
+		case *int64:
+			*p = src[i].(int64)
+		case *string:
+			*p = src[i].(string)
+		case *time.Time:
+			*p = src[i].(time.Time)
+		default:
+			return errors.New("unsupported scan")
+		}
+	}
+	return nil
+}
+func groupRequest(method, path, body string, uin int64) *http.Request {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req = req.WithContext(middleware.WithUIN(req.Context(), uin))
+	rc := chi.NewRouteContext()
+	rc.URLParams.Add("group_id", behaviorGroupID)
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) > 4 {
+		rc.URLParams.Add("uin", parts[4])
+	}
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rc))
+}
+
+type historyFakeStore struct {
+	rows  []store.GroupMessageRow
+	calls []store.GroupHistoryRequest
+}
+
+func (s *historyFakeStore) GetHistory(context.Context, store.HistoryRequest) ([]store.MessageRow, error) {
+	return nil, nil
+}
+func (s *historyFakeStore) GetGroupHistory(_ context.Context, r store.GroupHistoryRequest) ([]store.GroupMessageRow, error) {
+	s.calls = append(s.calls, r)
+	return s.rows, nil
+}
+
+func TestGroupListIsScopedToAuthenticatedMember(t *testing.T) {
+	now := time.Now()
+	db := &groupFakeDB{rowsQueue: [][][]any{{{behaviorGroupID, "team", int64(100), now, 2}}}}
+	rr := httptest.NewRecorder()
+	NewListGroupsHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodGet, "/api/groups/", "", 200))
+	if rr.Code != 200 || !strings.Contains(rr.Body.String(), behaviorGroupID) {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if db.calls[0].args[0] != int64(200) {
+		t.Fatalf("args=%v", db.calls[0].args)
+	}
+}
+func TestGroupMembersRequireMembershipAndUseUniformForbiddenShape(t *testing.T) {
+	var bodies []string
+	for _, actor := range []int64{200, 300} {
+		db := &groupFakeDB{rowQueue: [][]any{nil}}
+		rr := httptest.NewRecorder()
+		NewListGroupMembersHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodGet, "/api/groups/"+behaviorGroupID+"/members", "", actor))
+		if rr.Code != 403 {
+			t.Fatalf("actor=%d status=%d body=%s", actor, rr.Code, rr.Body.String())
+		}
+		bodies = append(bodies, rr.Body.String())
+		if db.calls[0].args[1] != actor {
+			t.Fatalf("actor predicate args=%v", db.calls[0].args)
+		}
+	}
+	if bodies[0] != bodies[1] {
+		t.Fatalf("different forbidden shapes: %q vs %q", bodies[0], bodies[1])
+	}
+}
+func TestGroupMemberListSucceedsForMember(t *testing.T) {
+	db := &groupFakeDB{rowQueue: [][]any{{"member"}}, rowsQueue: [][][]any{{{int64(100), "alice", "", "admin"}, {int64(200), "bob", "", "member"}}}}
+	rr := httptest.NewRecorder()
+	NewListGroupMembersHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodGet, "/api/groups/"+behaviorGroupID+"/members", "", 200))
+	if rr.Code != 200 || !strings.Contains(rr.Body.String(), `"uin":100`) {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+func TestOnlyAdminCanAddGroupMember(t *testing.T) {
+	for _, tc := range []struct {
+		role   string
+		status int
+	}{{"member", 403}, {"admin", 201}} {
+		db := &groupFakeDB{rowQueue: [][]any{{tc.role}, {"team"}}}
+		rr := httptest.NewRecorder()
+		NewAddGroupMemberHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodPost, "/api/groups/"+behaviorGroupID+"/members", `{"uin":300}`, 200))
+		if rr.Code != tc.status {
+			t.Fatalf("role=%s status=%d body=%s", tc.role, rr.Code, rr.Body.String())
+		}
+		if db.calls[0].args[1] != int64(200) {
+			t.Fatalf("role predicate args=%v", db.calls[0].args)
+		}
+	}
+}
+func TestOnlyAdminCanRemoveAnotherGroupMember(t *testing.T) {
+	for _, tc := range []struct {
+		role   string
+		status int
+	}{{"member", 403}, {"admin", 204}} {
+		rows := [][]any{{tc.role}}
+		if tc.role == "admin" {
+			rows = append(rows, []any{int64(100)}, []any{2})
+		}
+		db := &groupFakeDB{rowQueue: rows}
+		rr := httptest.NewRecorder()
+		NewRemoveGroupMemberHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodDelete, "/api/groups/"+behaviorGroupID+"/members/300", "", 200))
+		if rr.Code != tc.status {
+			t.Fatalf("role=%s status=%d body=%s", tc.role, rr.Code, rr.Body.String())
+		}
+	}
+}
+func TestGroupDeleteUsesOwnerPredicateAndUniformNotFoundShape(t *testing.T) {
+	var bodies []string
+	for _, actor := range []int64{200, 300} {
+		db := &groupFakeDB{tags: []pgconn.CommandTag{pgconn.NewCommandTag("DELETE 0")}}
+		rr := httptest.NewRecorder()
+		NewDeleteGroupHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodDelete, "/api/groups/"+behaviorGroupID, "", actor))
+		if rr.Code != 404 {
+			t.Fatalf("actor=%d status=%d", actor, rr.Code)
+		}
+		if db.calls[0].args[1] != actor {
+			t.Fatalf("owner predicate args=%v", db.calls[0].args)
+		}
+		bodies = append(bodies, rr.Body.String())
+	}
+	if bodies[0] != bodies[1] {
+		t.Fatalf("different not-found shapes: %q vs %q", bodies[0], bodies[1])
+	}
+	db := &groupFakeDB{tags: []pgconn.CommandTag{pgconn.NewCommandTag("DELETE 1")}}
+	rr := httptest.NewRecorder()
+	NewDeleteGroupHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodDelete, "/api/groups/"+behaviorGroupID, "", 100))
+	if rr.Code != 204 {
+		t.Fatalf("owner status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+func TestGroupHistoryChecksActorMembershipBeforeReading(t *testing.T) {
+	gid, _ := gocql.ParseUUID(behaviorGroupID)
+	hs := &historyFakeStore{rows: []store.GroupMessageRow{{GroupID: gid, ID: gocql.TimeUUID(), SenderUIN: 100, Ciphertext: []byte("x"), CreatedAt: time.Now()}}}
+	db := &groupFakeDB{rowQueue: [][]any{{1}}}
+	rr := httptest.NewRecorder()
+	NewGetGroupHistoryHandler(HistoryDeps{PG: db, Store: hs})(rr, groupRequest(http.MethodGet, "/api/messages/group-history?group_id="+behaviorGroupID, "", 200))
+	if rr.Code != 200 || len(hs.calls) != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", rr.Code, len(hs.calls), rr.Body.String())
+	}
+	if db.calls[0].args[1] != int64(200) {
+		t.Fatalf("membership args=%v", db.calls[0].args)
+	}
+	db = &groupFakeDB{rowQueue: [][]any{nil}}
+	hs = &historyFakeStore{}
+	rr = httptest.NewRecorder()
+	NewGetGroupHistoryHandler(HistoryDeps{PG: db, Store: hs})(rr, groupRequest(http.MethodGet, "/api/messages/group-history?group_id="+behaviorGroupID, "", 300))
+	if rr.Code != 403 || len(hs.calls) != 0 {
+		t.Fatalf("status=%d store calls=%d body=%s", rr.Code, len(hs.calls), rr.Body.String())
+	}
+}

@@ -14,7 +14,6 @@ import (
 	"github.com/gocql/gocql"
 	"github.com/iceq/iceq/message-service/store"
 	"github.com/iceq/iceq/shared/middleware"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ----------------------------------------------------------------------------
@@ -61,8 +60,13 @@ import (
 // handlers need. Inject once in main.go and pass by value
 // to the handler constructors.
 type HistoryDeps struct {
-	Store *store.MessageStore
-	PG    *pgxpool.Pool
+	Store historyStore
+	PG    groupDB
+}
+
+type historyStore interface {
+	GetHistory(context.Context, store.HistoryRequest) ([]store.MessageRow, error)
+	GetGroupHistory(context.Context, store.GroupHistoryRequest) ([]store.GroupMessageRow, error)
 }
 
 // ----------------------------------------------------------------------------
@@ -433,7 +437,7 @@ func parseDMMembers(convID string, requestingUIN int64) (int64, bool) {
 // non-member (both return false) — this is intentional,
 // to prevent group-ID enumeration via the history
 // endpoint.
-func isGroupMember(ctx context.Context, pg *pgxpool.Pool, groupID gocql.UUID, uin int64) (bool, error) {
+func isGroupMember(ctx context.Context, pg groupDB, groupID gocql.UUID, uin int64) (bool, error) {
 	const q = `SELECT 1 FROM group_members WHERE group_id = $1 AND uin = $2 LIMIT 1`
 	var x int
 	err := pg.QueryRow(ctx, q, groupID, uin).Scan(&x)
