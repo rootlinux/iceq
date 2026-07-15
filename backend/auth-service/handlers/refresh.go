@@ -7,11 +7,11 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/iceq/iceq/auth-service/models"
 	"github.com/iceq/iceq/shared/jwt"
+	"github.com/iceq/iceq/shared/middleware"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -50,8 +50,11 @@ func NewRedisRefreshRateLimiter(client *redis.Client) *RedisRefreshRateLimiter {
 }
 
 func (l *RedisRefreshRateLimiter) Allow(ctx context.Context, uin int64, action string) (bool, error) {
-	key := "ratelimit:uin:" + strconv.FormatInt(uin, 10) + ":" + action
-	count, err := l.script.Run(ctx, l.client, []string{key}, int(rateLimitWindow.Seconds())).Int64()
+	key, err := middleware.AuthenticatedRateLimitKey(uin, action)
+	if err != nil {
+		return false, err
+	}
+	count, err := l.script.Run(ctx, l.client, []string{"ratelimit:" + key}, int(rateLimitWindow.Seconds())).Int64()
 	if err != nil {
 		return false, err
 	}
