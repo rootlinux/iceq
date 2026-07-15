@@ -235,7 +235,7 @@ func main() {
 	// 415 we want to emit for a disallowed content
 	// type in the request body.
 
-	h := handlers.New(mc)
+	h := handlers.New(mc, pgPool)
 
 	// /api/files/* requires BearerAuth. The
 	// middleware injects the verified UIN into the

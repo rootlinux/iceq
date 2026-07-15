@@ -11,6 +11,7 @@ import (
 
 	"github.com/iceq/iceq/auth-service/models"
 	"github.com/iceq/iceq/shared/jwt"
+	"github.com/iceq/iceq/shared/middleware"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -82,6 +83,9 @@ type LoginDeps struct {
 	Pool    *pgxpool.Pool
 	Redis   *redis.Client
 	Manager *jwt.Manager
+	// RateLimitSecret keys rotating HMAC buckets. Reusing the already
+	// mandatory high-entropy service secret avoids another operator secret.
+	RateLimitSecret []byte
 	// Wipe is the optional panic-wipe handler. nil disables
 	// the feature entirely; a non-nil value lets the handler
 	// trigger a self-destruct when the user's threshold is
@@ -118,8 +122,13 @@ func NewLoginHandler(deps LoginDeps) http.HandlerFunc {
 		// 1. Rate-limit check. Done BEFORE the DB lookup so a
 		// brute-force attempt never reaches the bcrypt path.
 		// ------------------------------------------------------------
-		ip := clientIP(r)
-		key := rateLimitKeyPrefix + ip
+		edgeIdentity := r.Header.Get("X-IceQ-RateLimit-Identity")
+		bucket, err := middleware.AnonymousRateLimitBucket(deps.RateLimitSecret, edgeIdentity, "login", time.Now())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "RATE_LIMIT_IDENTITY_UNAVAILABLE", "service is temporarily unavailable")
+			return
+		}
+		key := rateLimitKeyPrefix + bucket
 		// windowSeconds is passed as ARGV[1] (string) because
 		// Lua treats every ARGV as a string; Redis implicitly
 		// coerces it to int for EXPIRE.

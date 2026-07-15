@@ -48,6 +48,10 @@
     # value for per-client decisions.
     header_up X-Real-IP "iceq-edge"
     header_up X-Forwarded-For "iceq-edge"
+	# Used transiently by auth-service to derive a rotating HMAC bucket.
+	# The service never persists this raw value and Caddy's filtered logs
+	# delete request headers. Do not reuse it as an application identity.
+	header_up X-IceQ-RateLimit-Identity {remote_host}
     header_up X-Forwarded-Host {host}
     header_up X-Forwarded-Proto {scheme}
 }

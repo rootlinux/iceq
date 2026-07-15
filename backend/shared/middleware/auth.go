@@ -7,8 +7,12 @@ package middleware
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -16,6 +20,37 @@ import (
 	"github.com/iceq/iceq/shared/jwt"
 	"github.com/iceq/iceq/shared/models"
 )
+
+// AnonymousRateLimitBucket creates the only value an unauthenticated service
+// may persist for abuse control. The edge supplies an opaque network identity;
+// neither that identity nor User-Agent/IP bytes are retained. Daily rotation
+// limits long-term linkability if the rate-limit store is inspected.
+func AnonymousRateLimitBucket(secret []byte, edgeIdentity, action string, now time.Time) (string, error) {
+	if len(secret) < 32 {
+		return "", errors.New("rate-limit HMAC secret must be at least 32 bytes")
+	}
+	edgeIdentity = strings.TrimSpace(edgeIdentity)
+	action = strings.TrimSpace(action)
+	if edgeIdentity == "" || action == "" {
+		return "", errors.New("rate-limit identity and action are required")
+	}
+	day := now.UTC().Format("2006-01-02")
+	rotation := hmac.New(sha256.New, secret)
+	_, _ = rotation.Write([]byte(day))
+	bucket := hmac.New(sha256.New, rotation.Sum(nil))
+	_, _ = bucket.Write([]byte(action + "\x00" + edgeIdentity))
+	return "anon:" + action + ":" + base64.RawURLEncoding.EncodeToString(bucket.Sum(nil)), nil
+}
+
+// AuthenticatedRateLimitKey scopes an abuse bucket to the verified actor and
+// action. Callers must obtain uin from GetUIN, never from request input.
+func AuthenticatedRateLimitKey(uin int64, action string) (string, error) {
+	action = strings.TrimSpace(action)
+	if uin <= 0 || action == "" {
+		return "", errors.New("valid authenticated uin and action are required")
+	}
+	return fmt.Sprintf("auth:%d:%s", uin, action), nil
+}
 
 // ----------------------------------------------------------------------------
 // Context key. Unexported on purpose: a string key is a footgun because

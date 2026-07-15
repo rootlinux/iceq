@@ -28,6 +28,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -37,6 +38,7 @@ import (
 	"github.com/iceq/iceq/file-service/minio"
 	"github.com/iceq/iceq/shared/middleware"
 	"github.com/iceq/iceq/shared/models"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ----------------------------------------------------------------------------
@@ -47,13 +49,37 @@ import (
 // need. Constructed once in main.go and passed by value
 // to the route registrations.
 type Handler struct {
-	Minio *minio.MinioClient
+	Minio  FileSigner
+	Owners OwnerRegistry
+}
+
+type FileSigner interface {
+	GenerateUploadURL(context.Context, minio.UploadRequest) (*minio.UploadURLResponse, error)
+	GenerateDownloadURL(context.Context, string) (*minio.DownloadURLResponse, error)
+	GenerateAvatarUploadURL(context.Context, int64) (*minio.UploadURLResponse, error)
+}
+
+type OwnerRegistry interface {
+	Register(context.Context, string, int64) error
+	Owns(context.Context, string, int64) (bool, error)
+}
+
+type postgresOwnerRegistry struct{ pool *pgxpool.Pool }
+
+func (p postgresOwnerRegistry) Register(ctx context.Context, key string, uin int64) error {
+	_, err := p.pool.Exec(ctx, `INSERT INTO file_objects (object_key, owner_uin) VALUES ($1, $2)`, key, uin)
+	return err
+}
+func (p postgresOwnerRegistry) Owns(ctx context.Context, key string, uin int64) (bool, error) {
+	var ok bool
+	err := p.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM file_objects WHERE object_key = $1 AND owner_uin = $2)`, key, uin).Scan(&ok)
+	return ok, err
 }
 
 // New is a thin constructor so main.go doesn't have to
 // name the struct literal inline.
-func New(m *minio.MinioClient) *Handler {
-	return &Handler{Minio: m}
+func New(m *minio.MinioClient, pool *pgxpool.Pool) *Handler {
+	return &Handler{Minio: m, Owners: postgresOwnerRegistry{pool: pool}}
 }
 
 // ----------------------------------------------------------------------------
@@ -102,13 +128,19 @@ var objectKeyPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-
 // range-checked.
 //
 // Status codes:
-//   200 — success
-//   400 — body malformed
-//   401 — auth (handled by middleware)
-//   413 — size out of range
-//   415 — content type not on the allowlist
-//   500 — MinIO unreachable / presign failed
+//
+//	200 — success
+//	400 — body malformed
+//	401 — auth (handled by middleware)
+//	413 — size out of range
+//	415 — content type not on the allowlist
+//	500 — MinIO unreachable / presign failed
 func (h *Handler) UploadURL(w http.ResponseWriter, r *http.Request) {
+	uin, ok := middleware.GetUIN(r.Context())
+	if !ok || uin <= 0 {
+		writeError(w, http.StatusUnauthorized, "AUTH_REQUIRED", "authentication is required")
+		return
+	}
 	var req uploadURLRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_BODY", "request body is not valid JSON")
@@ -143,6 +175,11 @@ func (h *Handler) UploadURL(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to generate upload URL")
 		return
 	}
+	if err := h.Owners.Register(r.Context(), resp.ObjectKey, uin); err != nil {
+		log.Printf("[file-service] register object owner: %v", err)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to register upload")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -162,11 +199,17 @@ func (h *Handler) UploadURL(w http.ResponseWriter, r *http.Request) {
 // before the request leaves our process.
 //
 // Status codes:
-//   200 — success
-//   400 — body malformed or object_key not a UUID
-//   401 — auth (handled by middleware)
-//   500 — MinIO unreachable / presign failed
+//
+//	200 — success
+//	400 — body malformed or object_key not a UUID
+//	401 — auth (handled by middleware)
+//	500 — MinIO unreachable / presign failed
 func (h *Handler) DownloadURL(w http.ResponseWriter, r *http.Request) {
+	uin, ok := middleware.GetUIN(r.Context())
+	if !ok || uin <= 0 {
+		writeError(w, http.StatusUnauthorized, "AUTH_REQUIRED", "authentication is required")
+		return
+	}
 	var req downloadURLRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_BODY", "request body is not valid JSON")
@@ -177,6 +220,16 @@ func (h *Handler) DownloadURL(w http.ResponseWriter, r *http.Request) {
 		// this is the path-traversal defense
 		// described in the doc comment.
 		writeError(w, http.StatusBadRequest, "INVALID_OBJECT_KEY", "object_key must be a UUID")
+		return
+	}
+	owned, err := h.Owners.Owns(r.Context(), req.ObjectKey, uin)
+	if err != nil {
+		log.Printf("[file-service] object owner lookup: %v", err)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to authorize download")
+		return
+	}
+	if !owned {
+		writeError(w, http.StatusNotFound, "OBJECT_NOT_FOUND", "object does not exist")
 		return
 	}
 
@@ -201,11 +254,12 @@ func (h *Handler) DownloadURL(w http.ResponseWriter, r *http.Request) {
 // namespace.
 //
 // Status codes:
-//   200 — success
-//   401 — auth (handled by middleware; the missing
-//         UIN case is also a 401 because it should
-//         not happen behind the auth gate)
-//   500 — MinIO unreachable / presign failed
+//
+//	200 — success
+//	401 — auth (handled by middleware; the missing
+//	      UIN case is also a 401 because it should
+//	      not happen behind the auth gate)
+//	500 — MinIO unreachable / presign failed
 func (h *Handler) AvatarUploadURL(w http.ResponseWriter, r *http.Request) {
 	uin, ok := middleware.GetUIN(r.Context())
 	if !ok || uin <= 0 {

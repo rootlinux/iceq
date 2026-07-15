@@ -214,13 +214,16 @@ func main() {
 	r.Route("/api/auth", func(r chi.Router) {
 		csrfMW := middleware.RequireCSRF
 		r.Post("/register", handlers.NewRegisterHandler(handlers.RegisterDeps{
-			Pool:    pgPool,
-			Manager: mgr,
+			Pool:            pgPool,
+			Manager:         mgr,
+			Redis:           rdb,
+			RateLimitSecret: []byte(cfg.JWTSecret),
 		}))
 		r.Post("/login", handlers.NewLoginHandler(handlers.LoginDeps{
-			Pool:    pgPool,
-			Redis:   rdb,
-			Manager: mgr,
+			Pool:            pgPool,
+			Redis:           rdb,
+			Manager:         mgr,
+			RateLimitSecret: []byte(cfg.JWTSecret),
 			// Wipe is the optional panic-wipe deps. nil
 			// here would disable the feature entirely;
 			// passing the populated struct below enables

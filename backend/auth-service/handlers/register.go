@@ -8,15 +8,19 @@ import (
 
 	"github.com/iceq/iceq/auth-service/models"
 	"github.com/iceq/iceq/shared/jwt"
+	"github.com/iceq/iceq/shared/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 // RegisterDeps captures the dependencies the register handler
 // needs. Constructed once in main.go and passed in via the
 // handler factory pattern below.
 type RegisterDeps struct {
-	Pool    *pgxpool.Pool
-	Manager *jwt.Manager
+	Pool            *pgxpool.Pool
+	Manager         *jwt.Manager
+	Redis           *redis.Client
+	RateLimitSecret []byte
 }
 
 // NewRegisterHandler returns the http.HandlerFunc mounted at
@@ -24,7 +28,24 @@ type RegisterDeps struct {
 // dependency wiring (which needs main.go's locals) out of the
 // package init path.
 func NewRegisterHandler(deps RegisterDeps) http.HandlerFunc {
+	script := redis.NewScript(rateLimitScript)
 	return func(w http.ResponseWriter, r *http.Request) {
+		bucket, err := middleware.AnonymousRateLimitBucket(deps.RateLimitSecret, r.Header.Get("X-IceQ-RateLimit-Identity"), "register", time.Now())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "RATE_LIMIT_IDENTITY_UNAVAILABLE", "service is temporarily unavailable")
+			return
+		}
+		ctxLimit, cancelLimit := context.WithTimeout(r.Context(), 2*time.Second)
+		count, err := script.Run(ctxLimit, deps.Redis, []string{"ratelimit:register:" + bucket}, int(rateLimitWindow.Seconds())).Int64()
+		cancelLimit()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "RATE_LIMITER_UNAVAILABLE", "service is temporarily unavailable")
+			return
+		}
+		if count > 3 {
+			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many registration attempts; try again later")
+			return
+		}
 		// Hard cap of 10 KiB on the request body. A legitimate
 		// registration form is well under 1 KiB; anything larger
 		// is either malicious or a bug in the client.
