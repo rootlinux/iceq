@@ -240,17 +240,17 @@ func main() {
 	}
 
 	r.Route("/api/messages", func(r chi.Router) {
+		authMW := middleware.NewBearerAuth(middleware.BearerAuthConfig{Manager: mgr})
+		rate := func(action string) func(http.Handler) http.Handler {
+			return middleware.NewAuthenticatedRateLimit(middleware.AuthenticatedRateLimitConfig{Redis: rdb, Action: action, Limit: 60, Window: time.Minute})
+		}
 		// Both history endpoints are auth-gated. The
 		// BearerAuth middleware injects the requesting
 		// UIN into the request context; the handlers
 		// use it for the dm:/group: membership check.
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		})).Get("/history", handlers.NewGetHistoryHandler(historyDeps))
+		r.With(authMW, rate("messages:history")).Get("/history", handlers.NewGetHistoryHandler(historyDeps))
 
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		})).Get("/group-history", handlers.NewGetGroupHistoryHandler(historyDeps))
+		r.With(authMW, rate("messages:group-history")).Get("/group-history", handlers.NewGetGroupHistoryHandler(historyDeps))
 	})
 
 	// /api/groups (Step 10). All six routes are
@@ -258,13 +258,16 @@ func main() {
 	// the JWT context, NEVER from the request body — a
 	// tampered client cannot impersonate other members.
 	authMW := middleware.NewBearerAuth(middleware.BearerAuthConfig{Manager: mgr})
+	groupRate := func(action string, limit int64) func(http.Handler) http.Handler {
+		return middleware.NewAuthenticatedRateLimit(middleware.AuthenticatedRateLimitConfig{Redis: rdb, Action: action, Limit: limit, Window: time.Minute})
+	}
 	r.Route("/api/groups", func(r chi.Router) {
-		r.With(authMW).Post("/", handlers.NewCreateGroupHandler(groupsDeps))
-		r.With(authMW).Get("/", handlers.NewListGroupsHandler(groupsDeps))
-		r.With(authMW).Get("/{group_id}/members", handlers.NewListGroupMembersHandler(groupsDeps))
-		r.With(authMW).Post("/{group_id}/members", handlers.NewAddGroupMemberHandler(groupsDeps))
-		r.With(authMW).Delete("/{group_id}/members/{uin}", handlers.NewRemoveGroupMemberHandler(groupsDeps))
-		r.With(authMW).Delete("/{group_id}", handlers.NewDeleteGroupHandler(groupsDeps))
+		r.With(authMW, groupRate("groups:create", 20)).Post("/", handlers.NewCreateGroupHandler(groupsDeps))
+		r.With(authMW, groupRate("groups:list", 60)).Get("/", handlers.NewListGroupsHandler(groupsDeps))
+		r.With(authMW, groupRate("groups:members:list", 60)).Get("/{group_id}/members", handlers.NewListGroupMembersHandler(groupsDeps))
+		r.With(authMW, groupRate("groups:members:add", 30)).Post("/{group_id}/members", handlers.NewAddGroupMemberHandler(groupsDeps))
+		r.With(authMW, groupRate("groups:members:remove", 30)).Delete("/{group_id}/members/{uin}", handlers.NewRemoveGroupMemberHandler(groupsDeps))
+		r.With(authMW, groupRate("groups:delete", 10)).Delete("/{group_id}", handlers.NewDeleteGroupHandler(groupsDeps))
 	})
 
 	// /health is unauthenticated. Caddy / k8s liveness

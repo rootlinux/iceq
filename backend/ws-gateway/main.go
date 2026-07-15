@@ -9,13 +9,13 @@
 // ciphertext, does not perform key exchange, does not inspect
 // the contents of an envelope. Its only responsibilities are:
 //
-//   1. Authenticate the connection (JWT, access token type).
-//   2. Enforce the per-message wipe check (panic-wipe
-//      blocklist).
-//   3. Rate-limit inbound messages.
-//   4. Publish on the right NATS subject.
-//   5. Deliver inbound NATS messages to the right local
-//      connection (or queue them if the user is offline).
+//  1. Authenticate the connection (JWT, access token type).
+//  2. Enforce the per-message wipe check (panic-wipe
+//     blocklist).
+//  3. Rate-limit inbound messages.
+//  4. Publish on the right NATS subject.
+//  5. Deliver inbound NATS messages to the right local
+//     connection (or queue them if the user is offline).
 //
 // Process shape:
 //
@@ -46,6 +46,7 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/iceq/iceq/shared/db"
 	"github.com/iceq/iceq/shared/jwt"
+	"github.com/iceq/iceq/shared/middleware"
 	"github.com/iceq/iceq/shared/natsclient"
 	"github.com/iceq/iceq/ws-gateway/client"
 	"github.com/iceq/iceq/ws-gateway/hub"
@@ -56,7 +57,8 @@ import (
 )
 
 // VERSION is overridable at build time via
-//   go build -ldflags "-X main.VERSION=$(git rev-parse --short HEAD)"
+//
+//	go build -ldflags "-X main.VERSION=$(git rev-parse --short HEAD)"
 var VERSION = "dev"
 
 // ----------------------------------------------------------------------------
@@ -170,6 +172,12 @@ func main() {
 		Manager:  mgr,
 		PG:       pgPool,
 		Dispatch: router.Dispatch,
+		ConnectRateLimiter: middleware.NewAuthenticatedRateLimiter(middleware.AuthenticatedRateLimitConfig{
+			Redis: rdb, Action: "ws:connect", Limit: 20, Window: time.Minute,
+		}),
+		FrameRateLimiter: middleware.NewAuthenticatedRateLimiter(middleware.AuthenticatedRateLimitConfig{
+			Redis: rdb, Action: "ws:frame", Limit: 30, Window: time.Minute, Timeout: 200 * time.Millisecond,
+		}),
 	}
 
 	// --- NATS subscribers. These run for the lifetime of the process
@@ -192,7 +200,7 @@ func main() {
 		client.ServeHTTP(deps, w, req)
 	})
 	// /health: standard 30 s timeout (short-lived probe).
-	r.With(chimw.Timeout(30 * time.Second)).Get("/health", newHealthHandler(pgPool, rdb, nc, VERSION))
+	r.With(chimw.Timeout(30*time.Second)).Get("/health", newHealthHandler(pgPool, rdb, nc, VERSION))
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

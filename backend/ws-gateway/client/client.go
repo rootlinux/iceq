@@ -22,7 +22,7 @@
 //   - Wipe check (EXISTS jwt:blocklist:wipe:{uin}). This is the
 //     primary defense-in-depth against a token that was valid at
 //     connect time but whose account was wiped mid-session.
-//   - Rate limit (INCR ratelimit:{uin}:msg, drop on overflow).
+//   - Shared authenticated action rate limit, drop on overflow.
 //   - Frame dispatch to the router.
 //
 // The package contains no package-level mutable state. The Hub,
@@ -41,6 +41,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/iceq/iceq/shared/jwt"
+	"github.com/iceq/iceq/shared/middleware"
 	"github.com/iceq/iceq/shared/models"
 	"github.com/iceq/iceq/shared/natsclient"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -86,24 +87,6 @@ const (
 	// undeliveredKeyPrefix is the per-user undelivered-envelope
 	// list in Redis. Must match hub.UndeliveredKeyPrefix.
 	undeliveredKeyPrefix = "undelivered:"
-
-	// rateLimitKeyPrefix scopes the per-user message rate-limit
-	// counter. Different from the auth-service's
-	// `ratelimit:login:` prefix; this one rate-limits outbound
-	// messages from a CONNECTED user, not login attempts.
-	rateLimitKeyPrefix = "ratelimit:msg:"
-
-	// rateLimitPerMinute is the threshold above which inbound
-	// messages are dropped with a RATE_LIMITED error frame. 30
-	// messages per minute = 1 message every 2 seconds, which is
-	// well above human typing speed and well below the rate a
-	// malicious client would push to flood the recipient.
-	rateLimitPerMinute = 30
-
-	// rateLimitWindow is the TTL applied on the first INCR. A
-	// fixed 60-second window matches the auth-service's login
-	// rate limiter for consistency.
-	rateLimitWindow = 60 * time.Second
 )
 
 // ----------------------------------------------------------------------------
@@ -173,12 +156,14 @@ func parseAuthToken(raw []byte) (string, error) {
 // for the *Client type), so the wire is a function set in
 // main.go after both packages are constructed.
 type Deps struct {
-	NATS     *natsclient.Client
-	Hub      HubRegister
-	Redis    *redis.Client
-	Manager  *jwt.Manager
-	PG       *pgxpool.Pool
-	Dispatch func(c *Client, env models.Envelope)
+	NATS               *natsclient.Client
+	Hub                HubRegister
+	Redis              *redis.Client
+	Manager            *jwt.Manager
+	PG                 *pgxpool.Pool
+	Dispatch           func(c *Client, env models.Envelope)
+	ConnectRateLimiter *middleware.AuthenticatedRateLimiter
+	FrameRateLimiter   *middleware.AuthenticatedRateLimiter
 }
 
 // HubRegister is the slice of the hub.Hub API the client needs.
@@ -336,6 +321,19 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uin := claims.UIN
+	if deps.ConnectRateLimiter == nil {
+		_ = ws.Close(websocket.StatusTryAgainLater, "rate_limit_unavailable")
+		return
+	}
+	allowed, err := deps.ConnectRateLimiter.Allow(r.Context(), uin)
+	if err != nil {
+		_ = ws.Close(websocket.StatusTryAgainLater, "rate_limit_unavailable")
+		return
+	}
+	if !allowed {
+		_ = ws.Close(websocket.StatusPolicyViolation, "rate_limited")
+		return
+	}
 
 	// 4. Wipe check. Same key shape as the auth-service's
 	// panic-wipe blocklist. We do this BEFORE the upgrade is
@@ -502,7 +500,12 @@ func (c *Client) readLoop() {
 		// 2. Rate limit. We do this AFTER the wipe check
 		// so a wiped user does not get a free rate-limit
 		// budget before being kicked.
-		if !c.checkRateLimit() {
+		allowed, rateErr := c.checkRateLimit()
+		if rateErr != nil {
+			_ = c.ws.Close(websocket.StatusTryAgainLater, "rate_limit_unavailable")
+			return
+		}
+		if !allowed {
 			// Send an error frame and continue. The
 			// error frame does NOT close the connection;
 			// a rate-limited client can recover in 60 s.
@@ -620,44 +623,18 @@ func syncCloseOnce(ch chan struct{}) func() {
 }
 
 // ----------------------------------------------------------------------------
-// Rate limit. Per-user counter on Redis. Returns true if the
-// message should be allowed, false if the user is over the
-// limit. The counter uses SET NX + EXPIRE for first-hit
-// initialization, mirroring the auth-service's login
-// rate-limiter pattern.
+// Rate limit. The reusable authenticated limiter owns the atomic Redis
+// counter and explicit ws:frame action budget.
 // ----------------------------------------------------------------------------
 
 // checkRateLimit performs the per-user message rate-limit.
 // Returns true if the message is allowed, false if the user
 // has exceeded the per-minute threshold.
-//
-// Implementation:
-//
-//  1. SET NX ratelimit:msg:{uin} 0 EX 60 — initialize the
-//     counter on first hit in this minute.
-//  2. INCR ratelimit:msg:{uin} — atomic increment.
-//  3. Compare to the threshold; if over, return false.
-func (c *Client) checkRateLimit() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	key := rateLimitKeyPrefix + strconv.FormatInt(c.uin, 10)
-	// SET NX 0 EX 60 is a no-op if the key already exists
-	// (the counter persists across the window).
-	if err := c.deps.Redis.SetNX(ctx, key, 0, rateLimitWindow).Err(); err != nil {
-		// Fail-open on the rate-limiter itself: a Redis
-		// blip should not turn into "no messages can be
-		// sent". The wipe check, by contrast, fails
-		// closed; the trade-off is that a missed wipe
-		// check is a security incident, while a missed
-		// rate-limit check is a temporary spam window.
-		// We return true (allow) and continue.
-		return true
+func (c *Client) checkRateLimit() (bool, error) {
+	if c.deps.FrameRateLimiter == nil {
+		return false, errors.New("ws frame rate limiter is not configured")
 	}
-	count, err := c.deps.Redis.Incr(ctx, key).Result()
-	if err != nil {
-		return true
-	}
-	return count <= rateLimitPerMinute
+	return c.deps.FrameRateLimiter.Allow(context.Background(), c.uin)
 }
 
 // ----------------------------------------------------------------------------

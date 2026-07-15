@@ -170,23 +170,21 @@ func main() {
 	// Every other route is gated.
 	r.Route("/api/keys", func(r chi.Router) {
 		r.Get("/bundle/{uin}", handlers.NewGetBundleHandler(bundleDeps))
+		authMW := middleware.NewBearerAuth(middleware.BearerAuthConfig{Manager: mgr})
+		rate := func(action string, limit int64) func(http.Handler) http.Handler {
+			return middleware.NewAuthenticatedRateLimit(middleware.AuthenticatedRateLimitConfig{Redis: rdb, Action: action, Limit: limit, Window: time.Minute})
+		}
 
 		// Authenticated bundle upload: client uploads its
 		// OWN bundle. The BearerAuth middleware injects
 		// the authenticated UIN; the handler uses that,
 		// never a UIN from the URL.
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		})).Post("/bundle", handlers.NewPostBundleHandler(bundleDeps, fetchRegisteredIdentityKey(pgPool)))
+		r.With(authMW, rate("keys:bundle:upload", 10)).Post("/bundle", handlers.NewPostBundleHandler(bundleDeps, fetchRegisteredIdentityKey(pgPool)))
 
 		// Authenticated prekey management.
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		})).Post("/prekeys", handlers.NewAddPrekeysHandler(prekeyDeps))
+		r.With(authMW, rate("keys:prekeys:add", 20)).Post("/prekeys", handlers.NewAddPrekeysHandler(prekeyDeps))
 
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		})).Get("/prekeys/count", handlers.NewCountPrekeysHandler(prekeyDeps))
+		r.With(authMW, rate("keys:prekeys:count", 60)).Get("/prekeys/count", handlers.NewCountPrekeysHandler(prekeyDeps))
 
 		// Health: unauthenticated by design (k8s liveness
 		// probes don't carry credentials).

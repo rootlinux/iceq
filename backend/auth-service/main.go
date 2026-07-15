@@ -213,6 +213,10 @@ func main() {
 	// same prefix for symmetry.
 	r.Route("/api/auth", func(r chi.Router) {
 		csrfMW := middleware.RequireCSRF
+		authMW := middleware.NewBearerAuth(middleware.BearerAuthConfig{Manager: mgr})
+		rate := func(action string, limit int64, window time.Duration) func(http.Handler) http.Handler {
+			return middleware.NewAuthenticatedRateLimit(middleware.AuthenticatedRateLimitConfig{Redis: rdb, Action: action, Limit: limit, Window: window})
+		}
 		r.Post("/register", handlers.NewRegisterHandler(handlers.RegisterDeps{
 			Pool:            pgPool,
 			Manager:         mgr,
@@ -241,9 +245,7 @@ func main() {
 		// access token. The BearerAuth middleware reads the
 		// header, verifies the token, and injects the UIN
 		// into the request context.
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		}), csrfMW).Post("/logout", handlers.NewLogoutHandler(handlers.LogoutDeps{
+		r.With(authMW, rate("auth:logout", 10, time.Minute), csrfMW).Post("/logout", handlers.NewLogoutHandler(handlers.LogoutDeps{
 			Pool:    pgPool,
 			Manager: mgr,
 		}))
@@ -252,24 +254,16 @@ func main() {
 		// UIN is the primary key, and only the
 		// authenticated user can read or write their own
 		// row.
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		})).Get("/settings", handlers.NewGetSettingsHandler(handlers.SettingsDeps{
+		r.With(authMW, rate("auth:settings:read", 60, time.Minute)).Get("/settings", handlers.NewGetSettingsHandler(handlers.SettingsDeps{
 			Pool: pgPool,
 		}))
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		}), csrfMW).Put("/settings", handlers.NewPutSettingsHandler(handlers.SettingsDeps{
+		r.With(authMW, rate("auth:settings:write", 10, time.Minute), csrfMW).Put("/settings", handlers.NewPutSettingsHandler(handlers.SettingsDeps{
 			Pool: pgPool,
 		}))
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		})).Get("/me", handlers.NewMeHandler(handlers.MeDeps{
+		r.With(authMW, rate("auth:me", 60, time.Minute)).Get("/me", handlers.NewMeHandler(handlers.MeDeps{
 			Pool: pgPool,
 		}))
-		r.With(middleware.NewBearerAuth(middleware.BearerAuthConfig{
-			Manager: mgr,
-		}), csrfMW).Post("/panic-wipe", handlers.NewManualPanicWipeHandler(handlers.ManualPanicWipeDeps{
+		r.With(authMW, rate("auth:panic-wipe", 3, time.Hour), csrfMW).Post("/panic-wipe", handlers.NewManualPanicWipeHandler(handlers.ManualPanicWipeDeps{
 			PanicWipeDeps: panicWipeDeps,
 		}))
 		r.Get("/health", newHealthHandler(pgPool, rdb, VERSION))
@@ -285,12 +279,15 @@ func main() {
 		Bus:  bus,
 	}
 	authMW := middleware.NewBearerAuth(middleware.BearerAuthConfig{Manager: mgr})
+	contactRate := func(action string, limit int64) func(http.Handler) http.Handler {
+		return middleware.NewAuthenticatedRateLimit(middleware.AuthenticatedRateLimitConfig{Redis: rdb, Action: action, Limit: limit, Window: time.Minute})
+	}
 	r.Route("/api/contacts", func(r chi.Router) {
-		r.With(authMW).Get("/", handlers.NewListContactsHandler(contactsDeps))
-		r.With(authMW, middleware.RequireCSRF).Post("/", handlers.NewAddContactHandler(contactsDeps))
-		r.With(authMW, middleware.RequireCSRF).Put("/{target_uin}/accept", handlers.NewAcceptContactHandler(contactsDeps))
-		r.With(authMW, middleware.RequireCSRF).Put("/{target_uin}/block", handlers.NewBlockContactHandler(contactsDeps))
-		r.With(authMW, middleware.RequireCSRF).Delete("/{target_uin}", handlers.NewRemoveContactHandler(contactsDeps))
+		r.With(authMW, contactRate("contacts:list", 60)).Get("/", handlers.NewListContactsHandler(contactsDeps))
+		r.With(authMW, contactRate("contacts:add", 30), middleware.RequireCSRF).Post("/", handlers.NewAddContactHandler(contactsDeps))
+		r.With(authMW, contactRate("contacts:accept", 30), middleware.RequireCSRF).Put("/{target_uin}/accept", handlers.NewAcceptContactHandler(contactsDeps))
+		r.With(authMW, contactRate("contacts:block", 30), middleware.RequireCSRF).Put("/{target_uin}/block", handlers.NewBlockContactHandler(contactsDeps))
+		r.With(authMW, contactRate("contacts:remove", 30), middleware.RequireCSRF).Delete("/{target_uin}", handlers.NewRemoveContactHandler(contactsDeps))
 	})
 
 	// --- HTTP server + graceful shutdown -------------------------------
