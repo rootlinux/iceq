@@ -16,6 +16,7 @@ import (
 	"github.com/iceq/iceq/key-service/models"
 	"github.com/iceq/iceq/key-service/store"
 	"github.com/iceq/iceq/shared/middleware"
+	"github.com/redis/go-redis/v9"
 )
 
 // ----------------------------------------------------------------------------
@@ -34,7 +35,31 @@ type keyStore interface {
 }
 
 type BundleDeps struct {
-	Keystore keyStore
+	Keystore        keyStore
+	RateLimitSecret []byte
+	CheckRateLimit  func(context.Context, string, time.Duration) (int64, error)
+}
+
+const (
+	bundleFetchRateLimit     = int64(30)
+	bundleRateLimitKeyPrefix = "ratelimit:key-bundle:"
+)
+
+const bundleRateLimitScript = `
+local current = redis.call("INCR", KEYS[1])
+if current == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+return current
+`
+
+// NewRedisFixedWindowRateLimiter implements the same atomic INCR plus
+// first-hit expiry semantics used by the auth-service anonymous limiters.
+func NewRedisFixedWindowRateLimiter(rdb *redis.Client) func(context.Context, string, time.Duration) (int64, error) {
+	script := redis.NewScript(bundleRateLimitScript)
+	return func(ctx context.Context, key string, window time.Duration) (int64, error) {
+		return script.Run(ctx, rdb, []string{key}, int(window.Seconds())).Int64()
+	}
 }
 
 // NewGetBundleHandler returns the http.HandlerFunc mounted at
@@ -61,6 +86,35 @@ func NewGetBundleHandler(deps BundleDeps) http.HandlerFunc {
 		uin, err := strconv.ParseInt(uinStr, 10, 64)
 		if err != nil || uin <= 0 {
 			writeError(w, http.StatusBadRequest, "INVALID_UIN", "uin must be a positive integer")
+			return
+		}
+
+		// Enforce the anonymous caller budget before GetBundle can consume a
+		// one-time prekey. The edge identity is transformed immediately into a
+		// daily rotating HMAC bucket; raw IP and User-Agent values never enter
+		// the persisted Redis key.
+		bucket, err := middleware.AnonymousRateLimitBucket(
+			deps.RateLimitSecret,
+			r.Header.Get("X-IceQ-RateLimit-Identity"),
+			"key-bundle",
+			time.Now(),
+		)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "RATE_LIMIT_IDENTITY_UNAVAILABLE", "service is temporarily unavailable")
+			return
+		}
+		if deps.CheckRateLimit == nil {
+			writeError(w, http.StatusServiceUnavailable, "RATE_LIMITER_UNAVAILABLE", "service is temporarily unavailable")
+			return
+		}
+		count, err := deps.CheckRateLimit(r.Context(), bundleRateLimitKeyPrefix+bucket, time.Minute)
+		if err != nil {
+			log.Printf("[key-service] bundle rate limiter unavailable: %v", err)
+			writeError(w, http.StatusServiceUnavailable, "RATE_LIMITER_UNAVAILABLE", "service is temporarily unavailable")
+			return
+		}
+		if count > bundleFetchRateLimit {
+			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many bundle requests; try again later")
 			return
 		}
 

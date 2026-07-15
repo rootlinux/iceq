@@ -147,7 +147,11 @@ func main() {
 	// --- Keystore + handlers ------------------------------------------
 	ks := store.NewKeystore(pgPool)
 
-	bundleDeps := handlers.BundleDeps{Keystore: ks}
+	bundleDeps := handlers.BundleDeps{
+		Keystore:        ks,
+		RateLimitSecret: []byte(cfg.JWTSecret),
+		CheckRateLimit:  handlers.NewRedisFixedWindowRateLimiter(rdb),
+	}
 	prekeyDeps := handlers.PrekeyDeps{Keystore: ks}
 
 	// --- Router --------------------------------------------------------

@@ -42,7 +42,7 @@ func bundleRequest(t *testing.T, deps BundleDeps) *httptest.ResponseRecorder {
 func TestGetBundleFailsClosedBeforeOPKConsumptionWhenLimiterUnavailable(t *testing.T) {
 	store := &bundleRateLimitStore{}
 	rr := bundleRequest(t, BundleDeps{
-		Keystore:       store,
+		Keystore:        store,
 		RateLimitSecret: []byte(strings.Repeat("s", 32)),
 		CheckRateLimit: func(context.Context, string, time.Duration) (int64, error) {
 			return 0, errors.New("redis unavailable")
@@ -64,7 +64,7 @@ func TestGetBundleReturns429BeforeOPKConsumptionAndPersistsOnlyHMACBucket(t *tes
 	store := &bundleRateLimitStore{}
 	var persistedKey string
 	rr := bundleRequest(t, BundleDeps{
-		Keystore:       store,
+		Keystore:        store,
 		RateLimitSecret: []byte(strings.Repeat("s", 32)),
 		CheckRateLimit: func(_ context.Context, key string, window time.Duration) (int64, error) {
 			persistedKey = key
@@ -99,7 +99,7 @@ func TestGetBundleFailsClosedWhenEdgeIdentityMissing(t *testing.T) {
 	called := false
 	r := chi.NewRouter()
 	r.Get("/api/keys/bundle/{uin}", NewGetBundleHandler(BundleDeps{
-		Keystore:       store,
+		Keystore:        store,
 		RateLimitSecret: []byte(strings.Repeat("s", 32)),
 		CheckRateLimit: func(context.Context, string, time.Duration) (int64, error) {
 			called = true
