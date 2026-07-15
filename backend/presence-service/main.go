@@ -46,8 +46,11 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/iceq/iceq/presence-service/store"
 	"github.com/iceq/iceq/shared/db"
+	"github.com/iceq/iceq/shared/jwt"
+	"github.com/iceq/iceq/shared/middleware"
 	"github.com/iceq/iceq/shared/models"
 	"github.com/iceq/iceq/shared/natsclient"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 )
@@ -72,6 +75,7 @@ type config struct {
 	RedisAddr       string
 	RedisPassword   string
 	PostgresDSN     string
+	JWTSecret       string
 	ShutdownTimeout time.Duration
 }
 
@@ -82,6 +86,7 @@ func loadConfig() config {
 		RedisAddr:       envOr("ICEQ_REDIS_ADDR", "redis:6379"),
 		RedisPassword:   envOr("ICEQ_REDIS_PASSWORD", ""),
 		PostgresDSN:     envOr("ICEQ_PG_DSN", "postgres://postgres:postgres@postgres:5432/iceq?sslmode=disable"),
+		JWTSecret:       envOr("ICEQ_JWT_SECRET", ""),
 		ShutdownTimeout: 10 * time.Second,
 	}
 }
@@ -104,6 +109,9 @@ func envOr(name, fallback string) string {
 func main() {
 	cfg := loadConfig()
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	if cfg.JWTSecret == "" {
+		log.Fatalf("ICEQ_JWT_SECRET is not set; refusing to start")
+	}
 
 	// 30 s ceiling for the whole bootstrap. Each factory has
 	// its own tighter internal timeout, but a total budget
@@ -144,6 +152,10 @@ func main() {
 	log.Printf("[presence-service] redis: connected to %s", cfg.RedisAddr)
 
 	presenceStore := store.New(rdb)
+	mgr, err := jwt.NewManager(cfg.JWTSecret, rdb, pgPool)
+	if err != nil {
+		log.Fatalf("jwt manager: %v", err)
+	}
 
 	// --- NATS bus ------------------------------------------------------
 	// Connect first; if NATS is down, the service is useless
@@ -169,14 +181,14 @@ func main() {
 	r.Use(chimw.Timeout(30 * time.Second))
 	r.Use(chimw.RequestSize(1 << 20)) // 1 MiB max body
 
-	// /health is unauthenticated and is the only path Caddy
-	// should call from outside the Docker network. The
-	// /api/presence/* routes are documented as "internal
-	// only via Docker network" — Caddy's reverse_proxy
-	// keeps them on the local bridge.
+	// /health is unauthenticated. Presence reads require an access
+	// token and enforce self-or-accepted-contact authorization.
 	r.Get("/health", newHealthHandler(presenceStore, pgPool, bus, VERSION))
-	r.Get("/api/presence/{uin}", newGetPresenceHandler(presenceStore))
-	r.Post("/api/presence/bulk", newGetBulkPresenceHandler(presenceStore))
+	r.Route("/api/presence", func(r chi.Router) {
+		r.Use(middleware.NewBearerAuth(middleware.BearerAuthConfig{Manager: mgr}))
+		r.Get("/{uin}", newGetPresenceHandler(presenceStore, pgPool))
+		r.Post("/bulk", newGetBulkPresenceHandler(presenceStore, pgPool))
+	})
 
 	// --- HTTP server + graceful shutdown -------------------------------
 	srv := &http.Server{
@@ -401,9 +413,9 @@ func handlePresenceQuery(bus *natsclient.Client, ps *store.PresenceStore, subjec
 	}
 
 	respEnv, err := models.NewEnvelope(models.EnvelopeTypePresence, models.PresencePayload{
-		UIN:       uin,
-		Status:    state.Status,
-		TS:        state.LastSeen,
+		UIN:    uin,
+		Status: state.Status,
+		TS:     state.LastSeen,
 	})
 	if err != nil {
 		return
@@ -433,15 +445,44 @@ func subjectTail(subject, prefix string) (string, bool) {
 // HTTP handlers.
 // ----------------------------------------------------------------------------
 
+type presenceReader interface {
+	GetPresence(context.Context, int64) (*store.PresenceState, error)
+	GetBulkPresence(context.Context, []int64) (map[int64]*store.PresenceState, error)
+}
+
+type contactChecker interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+const acceptedContactQuery = `
+	SELECT EXISTS (
+		SELECT 1 FROM contacts
+		WHERE owner_uin = $1 AND target_uin = $2 AND status = 'accepted'
+	)`
+
+func mayReadPresence(ctx context.Context, contacts contactChecker, actorUIN, targetUIN int64) (bool, error) {
+	if actorUIN == targetUIN {
+		return true, nil
+	}
+	var accepted bool
+	if err := contacts.QueryRow(ctx, acceptedContactQuery, actorUIN, targetUIN).Scan(&accepted); err != nil {
+		return false, err
+	}
+	return accepted, nil
+}
+
 // newGetPresenceHandler serves GET /api/presence/{uin}.
 //
-// The route is documented as "internal only via Docker network";
-// there is no auth on it. The caller is expected to be the
-// ws-gateway or another IceQ service. A bad UIN (non-integer)
-// is a 400, a successful read is a 200 with the PresenceState
-// JSON body, and a Redis error is a 500 with an empty body.
-func newGetPresenceHandler(ps *store.PresenceStore) http.HandlerFunc {
+// BearerAuth supplies the actor UIN. The actor may read their own
+// record or an accepted contact's record. Unrelated and nonexistent
+// targets share the same 404 response to avoid account enumeration.
+func newGetPresenceHandler(ps presenceReader, contacts contactChecker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		actorUIN, ok := middleware.GetUIN(r.Context())
+		if !ok || actorUIN <= 0 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		uinStr := chi.URLParam(r, "uin")
 		uin, err := strconv.ParseInt(uinStr, 10, 64)
 		if err != nil || uin <= 0 {
@@ -450,6 +491,15 @@ func newGetPresenceHandler(ps *store.PresenceStore) http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
+		allowed, err := mayReadPresence(ctx, contacts, actorUIN, uin)
+		if err != nil {
+			http.Error(w, "authorization error", http.StatusInternalServerError)
+			return
+		}
+		if !allowed {
+			http.Error(w, "presence not found", http.StatusNotFound)
+			return
+		}
 		state, err := ps.GetPresence(ctx, uin)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
@@ -471,9 +521,14 @@ func newGetPresenceHandler(ps *store.PresenceStore) http.HandlerFunc {
 // The body is bounded: we cap the input at 500 UINs to keep
 // the Redis pipeline within a sane round-trip cost. A larger
 // request is rejected with 413.
-func newGetBulkPresenceHandler(ps *store.PresenceStore) http.HandlerFunc {
+func newGetBulkPresenceHandler(ps presenceReader, contacts contactChecker) http.HandlerFunc {
 	const maxBulk = 500
 	return func(w http.ResponseWriter, r *http.Request) {
+		actorUIN, ok := middleware.GetUIN(r.Context())
+		if !ok || actorUIN <= 0 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		var req struct {
 			UINs []int64 `json:"uins"`
 		}
@@ -495,7 +550,26 @@ func newGetBulkPresenceHandler(ps *store.PresenceStore) http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		states, err := ps.GetBulkPresence(ctx, req.UINs)
+		authorized := make([]int64, 0, len(req.UINs))
+		seen := make(map[int64]struct{}, len(req.UINs))
+		for _, targetUIN := range req.UINs {
+			if targetUIN <= 0 {
+				continue
+			}
+			if _, duplicate := seen[targetUIN]; duplicate {
+				continue
+			}
+			seen[targetUIN] = struct{}{}
+			allowed, err := mayReadPresence(ctx, contacts, actorUIN, targetUIN)
+			if err != nil {
+				http.Error(w, "authorization error", http.StatusInternalServerError)
+				return
+			}
+			if allowed {
+				authorized = append(authorized, targetUIN)
+			}
+		}
+		states, err := ps.GetBulkPresence(ctx, authorized)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
