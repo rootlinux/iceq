@@ -246,9 +246,14 @@ func main() {
 			Manager: mgr,
 		}))
 
-		r.Post("/upload-url", h.UploadURL)
-		r.Post("/download-url", h.DownloadURL)
-		r.Post("/avatar-upload-url", h.AvatarUploadURL)
+		rate := func(action string, limit int64) func(http.Handler) http.Handler {
+			return middleware.NewAuthenticatedRateLimit(middleware.AuthenticatedRateLimitConfig{Redis: rdb, Action: action, Limit: limit, Window: time.Minute})
+		}
+		r.With(rate("files:upload", 30)).Post("/upload-url", h.UploadURL)
+		r.With(rate("files:download", 60)).Post("/download-url", h.DownloadURL)
+		r.With(rate("files:avatar-upload", 10)).Post("/avatar-upload-url", h.AvatarUploadURL)
+		r.With(rate("files:grant", 30)).Post("/grants", h.Grant)
+		r.With(rate("files:grant:revoke", 30)).Delete("/grants", h.RevokeGrant)
 	})
 
 	// /health is unauthenticated. Caddy / k8s liveness

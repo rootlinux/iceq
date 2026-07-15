@@ -38,8 +38,10 @@ body, path, or query UIN is never accepted as the actor.
 | `GET /api/presence/{uin}` | **open at service and Caddy** | requested UIN only; no relationship predicate | anyone | edge bucket only | offline sentinel hides existence imperfectly | **OPEN FINDING P-1** |
 | `POST /api/presence/bulk` | **open at service and Caddy** | arbitrary requested UIN set | anyone | edge bucket only | offline sentinel | **OPEN FINDING P-1** |
 | `POST /api/files/upload-url` | Bearer JWT | records generated UUID with authenticated owner in `file_objects` | self | `auth:<uin>:files:upload` contract | generic store/presign failure | no-actor test PASS |
-| `POST /api/files/download-url` | Bearer JWT | `EXISTS file_objects WHERE object_key=$1 AND owner_uin=$2` before presign | recorded owner | `auth:<uin>:files:download` contract | missing and foreign both `404 OBJECT_NOT_FOUND` | unrelated B test PASS |
+| `POST /api/files/download-url` | Bearer JWT | owner-or-explicit-grantee `EXISTS` predicate before presign | recorded owner or grantee | `auth:<uin>:files:download` contract | missing and foreign both `404 OBJECT_NOT_FOUND` | unrelated B and grantee tests PASS |
 | `POST /api/files/avatar-upload-url` | Bearer JWT | key is derived only from authenticated UIN | self | `auth:<uin>:files:avatar` contract | generic auth/store | no-actor test PASS |
+| `POST /api/files/grants` | Bearer JWT | atomic `INSERT ... SELECT` succeeds only when actor owns object | owner | `auth:<uin>:files:grant` contract | missing and foreign both 404 | owner/B behavioral test PASS |
+| `DELETE /api/files/grants` | Bearer JWT | delete is constrained by object, owner actor, and grantee | owner | `auth:<uin>:files:grant-revoke` contract | idempotent 204 | grant/revoke behavioral test PASS |
 | `GET /ws` | Bearer access token in first WebSocket auth envelope; JWT verifier checks session epoch/revocation | sender UIN overwritten from authenticated client; DM receiver/group membership checks occur in router | authenticated sender/current member | edge connection bucket; service contract `auth:<uin>:ws:<envelope-type>` | generic close/error envelope | ws router/client tests PASS |
 
 Health routes outside `/api` are not part of this matrix. Caddy's `/health`
@@ -48,15 +50,18 @@ inside the deployment network except the two `/api/*/health` routes above.
 
 ## File ownership migration contract
 
-`006_file_object_owners.sql` is fail-closed. New upload URL issuance records the
+`006_file_object_owners.sql` and `007_file_object_grants.sql` are fail-closed and
+mounted as top-level PostgreSQL init scripts in Compose. New upload URL issuance records the
 random UUID and authenticated owner before returning the URL. Download URL
-issuance requires the owner-bound row in the database query. Pre-existing MinIO
+issuance requires either that owner row or an explicit owner-created grantee row
+in the database query. The direct-message client grants its intended recipient
+before sending the encrypted attachment envelope and revokes the grant when
+encryption or synchronous transport submission fails. Pre-existing MinIO
 objects have no registry row and therefore become unavailable; an operator may
 backfill only from a trusted ownership source. There is deliberately no
 "allow legacy UUID" fallback because knowledge or guessing of an object key is
-not authorization. Recipient sharing remains an application-level limitation:
-the encrypted message recipient cannot download until an explicit grant model
-is introduced.
+not authorization. Group attachments remain disabled in the UI; no implicit
+group-wide grant is created.
 
 ## Rate-limit and edge privacy contract
 
@@ -89,6 +94,7 @@ not receive or persist raw IP/UA.
   future raw network-identity persistence.
 - Public key-bundle discovery is required for asynchronous Signal session
   setup and is intentionally not treated as private object access.
-- File ownership currently models uploader-only access. A future explicit
-  recipient grant table is required for attachment sharing without reverting
-  to bearer-by-UUID authorization.
+- File grants and WebSocket delivery are separate services, so rollback covers
+  encryption and synchronous send submission failures, not a later negative or
+  missing delivery acknowledgment. Durable ack-coupled grant cleanup remains a
+  future cross-service transaction/outbox concern.

@@ -15,7 +15,7 @@
 // side does the actual HTTP transfer. The file-service never
 // sees the bytes.
 
-import { fetchJSON } from "./client";
+import { fetchJSON, fetchWithAuth } from "./client";
 import {
   decryptFileBlob,
   encryptFileBlob,
@@ -57,6 +57,14 @@ export async function getDownloadURL(objectKey: string): Promise<DownloadURLResp
 
 export async function getAvatarUploadURL(): Promise<UploadURLResponse> {
   return fetchJSON<UploadURLResponse>("/api/files/avatar-upload-url", { method: "POST" });
+}
+
+export async function grantFileAccess(objectKey: string, granteeUin: number): Promise<void> {
+  await fetchWithAuth("/api/files/grants", { method: "POST", body: { object_key: objectKey, grantee_uin: granteeUin } });
+}
+
+export async function revokeFileAccess(objectKey: string, granteeUin: number): Promise<void> {
+  await fetchWithAuth("/api/files/grants", { method: "DELETE", body: { object_key: objectKey, grantee_uin: granteeUin } });
 }
 
 // ----------------------------------------------------------------------------

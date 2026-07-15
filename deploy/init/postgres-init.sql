@@ -80,6 +80,23 @@ CREATE TABLE contacts (
   PRIMARY KEY (owner_uin, target_uin)
 );
 
+CREATE TABLE file_objects (
+  object_key UUID PRIMARY KEY,
+  owner_uin BIGINT NOT NULL REFERENCES users(uin) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_file_objects_owner ON file_objects(owner_uin);
+
+CREATE TABLE file_object_grants (
+  object_key UUID NOT NULL REFERENCES file_objects(object_key) ON DELETE CASCADE,
+  owner_uin BIGINT NOT NULL REFERENCES users(uin) ON DELETE CASCADE,
+  grantee_uin BIGINT NOT NULL REFERENCES users(uin) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (object_key, grantee_uin),
+  CHECK (owner_uin <> grantee_uin)
+);
+CREATE INDEX idx_file_object_grants_grantee ON file_object_grants(grantee_uin, object_key);
+
 CREATE TABLE groups (
   id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   name        TEXT        NOT NULL,

@@ -209,6 +209,41 @@ Tor provides **transport-layer anonymity** for clients reaching your instance. T
 
 ## Development
 
+### Existing-volume file authorization migration
+
+Fresh PostgreSQL volumes apply file ownership/grant migrations through the
+top-level Compose init mounts. The official image does not rerun init scripts
+for an existing volume. Before deploying code that issues file grants, back up
+PostgreSQL and apply both idempotent migrations in order:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec -T postgres \
+  psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iceq}" \
+  < deploy/init/migrations/006_file_object_owners.sql
+docker compose -f deploy/docker-compose.yml exec -T postgres \
+  psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iceq}" \
+  < deploy/init/migrations/007_file_object_grants.sql
+```
+
+Verify with `\d file_objects` and `\d file_object_grants`. Legacy MinIO UUIDs
+remain unavailable unless the operator has a separate trusted record mapping
+each UUID to its uploader. Never infer ownership from message metadata, bucket
+listing order, timestamps, or possession of the UUID. Import a verified mapping
+into a staging table, validate every referenced UIN and UUID, then insert with
+an explicit reviewable query such as:
+
+```sql
+INSERT INTO file_objects (object_key, owner_uin)
+SELECT object_key, owner_uin FROM verified_file_owner_backfill
+ON CONFLICT DO NOTHING;
+```
+
+Rollback application code before rolling back schema. After confirming no
+running version queries these tables, remove grants first, then owners:
+`DROP TABLE file_object_grants; DROP TABLE file_objects;`. This removes access
+metadata, not MinIO ciphertext. Restore the database backup if any backfill was
+incorrect; do not synthesize replacement ownership.
+
 ```bash
 # Build all Go services
 cd backend && go build ./...

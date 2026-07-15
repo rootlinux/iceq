@@ -16,7 +16,7 @@ import { useChatStore, conversationIdForPair } from "../../store/chatStore";
 import { useAuthStore } from "../../store/authStore";
 import { useChatShell } from "../Layout/MainLayout";
 import { encryptMessage, SignalError } from "../../lib/signal";
-import { uploadEncryptedFile } from "../../api/files";
+import { grantFileAccess, revokeFileAccess, uploadEncryptedFile } from "../../api/files";
 import { cryptoRandomId } from "../../hooks/useWebSocket";
 import type { Message } from "../../types/models";
 import type { GroupMessagePayload, MessagePayload } from "../../types/envelope";
@@ -172,9 +172,14 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
     setAttaching(true);
     const clientId = cryptoRandomId();
     const convId = conversationIdForPair(selfUin, peerUin as number);
+	let uploadedObjectKey: string | null = null;
+	let granted = false;
 
     try {
       const uploaded = await uploadEncryptedFile(file, file.name);
+	  uploadedObjectKey = uploaded.object_key;
+	  await grantFileAccess(uploaded.object_key, peerUin as number);
+	  granted = true;
       const attachment = {
         object_key: uploaded.object_key,
         manifest: uploaded.manifest,
@@ -223,6 +228,9 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         payload,
       } satisfies Envelope<typeof payload>);
     } catch (e) {
+	  if (granted && uploadedObjectKey !== null) {
+		await revokeFileAccess(uploadedObjectKey, peerUin as number).catch(() => undefined);
+	  }
       const reason = e instanceof SignalError ? e.message : (e as Error).message;
       if (__DEV__) console.error("[send] attachment failed:", reason);
       useChatStore.setState((s) => {

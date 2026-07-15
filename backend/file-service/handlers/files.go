@@ -62,6 +62,8 @@ type FileSigner interface {
 type OwnerRegistry interface {
 	Register(context.Context, string, int64) error
 	Owns(context.Context, string, int64) (bool, error)
+	Grant(context.Context, string, int64, int64) (bool, error)
+	Revoke(context.Context, string, int64, int64) (bool, error)
 }
 
 type postgresOwnerRegistry struct{ pool *pgxpool.Pool }
@@ -72,8 +74,21 @@ func (p postgresOwnerRegistry) Register(ctx context.Context, key string, uin int
 }
 func (p postgresOwnerRegistry) Owns(ctx context.Context, key string, uin int64) (bool, error) {
 	var ok bool
-	err := p.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM file_objects WHERE object_key = $1 AND owner_uin = $2)`, key, uin).Scan(&ok)
+	err := p.pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM file_objects f WHERE f.object_key = $1 AND
+		(f.owner_uin = $2 OR EXISTS (SELECT 1 FROM file_object_grants g WHERE g.object_key=f.object_key AND g.grantee_uin=$2))
+	)`, key, uin).Scan(&ok)
 	return ok, err
+}
+func (p postgresOwnerRegistry) Grant(ctx context.Context, key string, owner, grantee int64) (bool, error) {
+	tag, err := p.pool.Exec(ctx, `INSERT INTO file_object_grants (object_key, owner_uin, grantee_uin)
+		SELECT object_key, owner_uin, $3 FROM file_objects WHERE object_key=$1 AND owner_uin=$2
+		ON CONFLICT DO NOTHING`, key, owner, grantee)
+	return tag.RowsAffected() > 0, err
+}
+func (p postgresOwnerRegistry) Revoke(ctx context.Context, key string, owner, grantee int64) (bool, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM file_object_grants WHERE object_key=$1 AND owner_uin=$2 AND grantee_uin=$3`, key, owner, grantee)
+	return tag.RowsAffected() > 0, err
 }
 
 // New is a thin constructor so main.go doesn't have to
@@ -100,6 +115,10 @@ type uploadURLRequest struct {
 
 type downloadURLRequest struct {
 	ObjectKey string `json:"object_key"`
+}
+type grantRequest struct {
+	ObjectKey  string `json:"object_key"`
+	GranteeUIN int64  `json:"grantee_uin"`
 }
 
 // objectKeyPattern is the allowlist for /download-url
@@ -279,6 +298,50 @@ func (h *Handler) AvatarUploadURL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) Grant(w http.ResponseWriter, r *http.Request) {
+	owner, ok := middleware.GetUIN(r.Context())
+	if !ok || owner <= 0 {
+		writeError(w, http.StatusUnauthorized, "AUTH_REQUIRED", "authentication is required")
+		return
+	}
+	var req grantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !objectKeyPattern.MatchString(req.ObjectKey) || req.GranteeUIN <= 0 || req.GranteeUIN == owner {
+		writeError(w, http.StatusBadRequest, "INVALID_GRANT", "grant is invalid")
+		return
+	}
+	granted, err := h.Owners.Grant(r.Context(), req.ObjectKey, owner, req.GranteeUIN)
+	if err != nil {
+		log.Printf("[file-service] grant object: %v", err)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to grant object")
+		return
+	}
+	if !granted {
+		writeError(w, http.StatusNotFound, "OBJECT_NOT_FOUND", "object does not exist")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) RevokeGrant(w http.ResponseWriter, r *http.Request) {
+	owner, ok := middleware.GetUIN(r.Context())
+	if !ok || owner <= 0 {
+		writeError(w, http.StatusUnauthorized, "AUTH_REQUIRED", "authentication is required")
+		return
+	}
+	var req grantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !objectKeyPattern.MatchString(req.ObjectKey) || req.GranteeUIN <= 0 {
+		writeError(w, http.StatusBadRequest, "INVALID_GRANT", "grant is invalid")
+		return
+	}
+	_, err := h.Owners.Revoke(r.Context(), req.ObjectKey, owner, req.GranteeUIN)
+	if err != nil {
+		log.Printf("[file-service] revoke object grant: %v", err)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to revoke grant")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ----------------------------------------------------------------------------
