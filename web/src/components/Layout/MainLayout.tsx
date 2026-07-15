@@ -145,7 +145,7 @@ import { createContext, useContext } from "react";
 import type { EnvelopeType } from "../../types/envelope";
 
 export interface ChatShellContextValue {
-  send: (frame: { type: EnvelopeType; id: string; ts: number; payload: unknown }) => void;
+  send: (frame: { type: EnvelopeType; id: string; ts: number; payload: unknown }) => boolean;
   connected: boolean;
 }
 

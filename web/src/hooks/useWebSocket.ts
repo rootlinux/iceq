@@ -65,7 +65,7 @@ export interface UseWebSocketResult {
   // transport can serialise exactly what's on the
   // wire. To keep the call-site short, helper
   // constructors exist next to this hook.
-  send: (frame: Envelope) => void;
+  send: (frame: Envelope) => boolean;
   connected: boolean;
   lastEnvelope: Envelope | null;
 }
@@ -393,10 +393,10 @@ export function useWebSocket(): UseWebSocketResult {
   // frames. We accept the full Envelope so the caller
   // controls id / ts / payload shape exactly.
   // ----------------------------------------------------------------------------
-  function send(frame: Envelope): void {
+  function send(frame: Envelope): boolean {
     const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    safeSend(ws, frame);
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    return safeSend(ws, frame);
   }
 
   // ----------------------------------------------------------------------------
@@ -484,13 +484,15 @@ function buildWSURL(): string {
   return `${scheme}//${loc.host}/ws`;
 }
 
-function safeSend(ws: WebSocket, frame: Envelope): void {
+function safeSend(ws: WebSocket, frame: Envelope): boolean {
   try {
     ws.send(JSON.stringify(frame));
+    return true;
   } catch {
     // The socket may have closed between the OPEN check
     // and the send. Drop the frame; the dispatcher will
     // reconnect on close.
+    return false;
   }
 }
 

@@ -221,12 +221,14 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         ciphertext: sealed.ciphertext,
         msg_type: sealed.msgType,
       };
-      send({
+      if (!send({
         type: "message",
         id: cryptoRandomId(),
         ts: Date.now(),
         payload,
-      } satisfies Envelope<typeof payload>);
+      } satisfies Envelope<typeof payload>)) {
+		throw new Error("message transport is unavailable");
+	  }
     } catch (e) {
 	  if (granted && uploadedObjectKey !== null) {
 		await revokeFileAccess(uploadedObjectKey, peerUin as number).catch(() => undefined);

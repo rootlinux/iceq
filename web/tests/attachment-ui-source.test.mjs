@@ -19,6 +19,7 @@ test("message input sends direct-message attachments as Signal-encrypted manifes
   assert.match(input, /content_type:\s*"file"/);
   assert.match(input, /await grantFileAccess\(uploaded\.object_key, peerUin as number\)/);
   assert.match(input, /await revokeFileAccess\(uploadedObjectKey, peerUin as number\)/);
+  assert.match(input, /if \(!send\(\{/);
   assert.doesNotMatch(input, /file_url:\s*upload\.upload_url/);
 });
 
