@@ -7,12 +7,14 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/iceq/iceq/auth-service/models"
 	"github.com/iceq/iceq/shared/jwt"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 // ----------------------------------------------------------------------------
@@ -28,9 +30,38 @@ import (
 // case) — a deliberate fail-loud trade-off.
 // ----------------------------------------------------------------------------
 
+type RefreshTokenManager interface {
+	Verify(context.Context, string, string) (*jwt.Claims, error)
+	Sign(int64, string) (jwt.SignResult, error)
+	BumpSessionEpoch(context.Context, int64) error
+}
+
+type RefreshRateLimiter interface {
+	Allow(context.Context, int64, string) (bool, error)
+}
+
+type RedisRefreshRateLimiter struct {
+	client *redis.Client
+	script *redis.Script
+}
+
+func NewRedisRefreshRateLimiter(client *redis.Client) *RedisRefreshRateLimiter {
+	return &RedisRefreshRateLimiter{client: client, script: redis.NewScript(rateLimitScript)}
+}
+
+func (l *RedisRefreshRateLimiter) Allow(ctx context.Context, uin int64, action string) (bool, error) {
+	key := "ratelimit:uin:" + strconv.FormatInt(uin, 10) + ":" + action
+	count, err := l.script.Run(ctx, l.client, []string{key}, int(rateLimitWindow.Seconds())).Int64()
+	if err != nil {
+		return false, err
+	}
+	return count <= rateLimitPerMinute, nil
+}
+
 type RefreshDeps struct {
 	Pool    *pgxpool.Pool
-	Manager *jwt.Manager
+	Manager RefreshTokenManager
+	Limiter RefreshRateLimiter
 }
 
 // NewRefreshHandler returns the http.HandlerFunc mounted at
@@ -61,6 +92,17 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 			clearSessionCookies(w)
 			code, msg := classifyJWTError(err)
 			writeError(w, http.StatusUnauthorized, code, msg)
+			return
+		}
+
+		allowed, err := deps.Limiter.Allow(ctx, claims.UIN, "auth:refresh")
+		if err != nil {
+			log.Printf("[auth-service] refresh rate limiter unavailable: %v", err)
+			writeError(w, http.StatusServiceUnavailable, "RATE_LIMITER_UNAVAILABLE", "service is temporarily unavailable")
+			return
+		}
+		if !allowed {
+			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many refresh attempts; try again later")
 			return
 		}
 

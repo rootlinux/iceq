@@ -240,6 +240,7 @@ func main() {
 		r.With(csrfMW).Post("/refresh", handlers.NewRefreshHandler(handlers.RefreshDeps{
 			Pool:    pgPool,
 			Manager: mgr,
+			Limiter: handlers.NewRedisRefreshRateLimiter(rdb),
 		}))
 		// Logout is the only endpoint that REQUIRES the
 		// access token. The BearerAuth middleware reads the
