@@ -30,6 +30,7 @@ import { useChatStore, conversationIdForPair } from "../store/chatStore";
 import { useContactStore } from "../store/contactStore";
 import { clearLocalState, classifyClose } from "../lib/wsCloseCodes";
 import { decryptMessage } from "../lib/signal";
+import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
 import type {
   AckPayload,
   AuthPayload,
@@ -165,6 +166,7 @@ export function useWebSocket(): UseWebSocketResult {
     };
 
     ws.onclose = (ev) => {
+      void attachmentGrantLifecycle.revokeAll();
       cleanupTimers();
       wsRef.current = null;
       const action = classifyClose(ev.code);
@@ -297,6 +299,7 @@ export function useWebSocket(): UseWebSocketResult {
           }
           return;
         }
+        attachmentGrantLifecycle.ack(p.message_id, p.state);
         // Ack frames don't carry a conversation_id; we
         // locate the message in the local store and
         // pick its conversation. The list scan is O(n)
@@ -374,6 +377,9 @@ export function useWebSocket(): UseWebSocketResult {
       }
       case "error": {
         const p = env.payload as ErrorPayload;
+        // Error frames do not currently expose the rejected client_id, so the
+        // safe terminal action is to revoke every grant that is still pending.
+        void attachmentGrantLifecycle.revokeAll();
         if (__DEV__) console.error("[ws] error frame:", p);
         return;
       }
@@ -445,6 +451,7 @@ export function useWebSocket(): UseWebSocketResult {
   // tearDown — clean up everything. Called on unmount.
   // ----------------------------------------------------------------------------
   function tearDown(): void {
+    void attachmentGrantLifecycle.revokeAll();
     cleanupTimers();
     if (wsRef.current) {
       try {

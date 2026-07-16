@@ -14,6 +14,7 @@ import { create } from "zustand";
 import { tokenStore } from "../api/client";
 import * as authApi from "../api/auth";
 import type { UserPublic } from "../api/auth";
+import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
 
 const LOGGED_OUT_MARKER_KEY = "iceq_logged_out";
 
@@ -119,6 +120,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 		// fails. A partial-logout is worse than a full one
 		// (the user thinks they're logged out but the server
 		// still has a live refresh token).
+		await attachmentGrantLifecycle.revokeAll();
 		try {
 			await authApi.logout();
 		} catch {

@@ -16,7 +16,8 @@ import { useChatStore, conversationIdForPair } from "../../store/chatStore";
 import { useAuthStore } from "../../store/authStore";
 import { useChatShell } from "../Layout/MainLayout";
 import { encryptMessage, SignalError } from "../../lib/signal";
-import { grantFileAccess, revokeFileAccess, uploadEncryptedFile } from "../../api/files";
+import { uploadEncryptedFile } from "../../api/files";
+import { attachmentGrantLifecycle } from "../../lib/attachmentGrantLifecycle";
 import { cryptoRandomId } from "../../hooks/useWebSocket";
 import type { Message } from "../../types/models";
 import type { GroupMessagePayload, MessagePayload } from "../../types/envelope";
@@ -172,14 +173,9 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
     setAttaching(true);
     const clientId = cryptoRandomId();
     const convId = conversationIdForPair(selfUin, peerUin as number);
-	let uploadedObjectKey: string | null = null;
-	let granted = false;
-
     try {
       const uploaded = await uploadEncryptedFile(file, file.name);
-	  uploadedObjectKey = uploaded.object_key;
-	  await grantFileAccess(uploaded.object_key, peerUin as number);
-	  granted = true;
+      await attachmentGrantLifecycle.prepare(clientId, uploaded.object_key, peerUin as number);
       const attachment = {
         object_key: uploaded.object_key,
         manifest: uploaded.manifest,
@@ -230,9 +226,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
 		throw new Error("message transport is unavailable");
 	  }
     } catch (e) {
-	  if (granted && uploadedObjectKey !== null) {
-		await revokeFileAccess(uploadedObjectKey, peerUin as number).catch(() => undefined);
-	  }
+      await attachmentGrantLifecycle.fail(clientId).catch(() => undefined);
       const reason = e instanceof SignalError ? e.message : (e as Error).message;
       if (__DEV__) console.error("[send] attachment failed:", reason);
       useChatStore.setState((s) => {
