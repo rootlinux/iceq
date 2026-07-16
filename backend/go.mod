@@ -3,7 +3,7 @@ module github.com/iceq/iceq
 go 1.25.0
 
 require (
-	github.com/alicebob/miniredis/v2 v2.35.0
+	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/go-chi/chi/v5 v5.1.0
 	github.com/go-chi/cors v1.2.2
 	github.com/gocql/gocql v1.7.0
