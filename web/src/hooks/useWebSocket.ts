@@ -426,7 +426,11 @@ export function useWebSocket(): UseWebSocketResult {
   dispatchRef.current = dispatch;
 
   const consumeExternal = useCallback((env: Envelope): boolean => {
-    return consumeEnvelope(env, null);
+	// Poll JSON is untrusted network input too. Re-serialize it through the
+	// exact parser used by WebSocket frames before dispatching callbacks.
+	const parsed = parseEnvelope(JSON.stringify(env));
+	if (!parsed.ok) return false;
+	return consumeEnvelope(parsed.envelope, null);
   // consumeEnvelope reads refs and dispatchRef, so this identity is stable.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
