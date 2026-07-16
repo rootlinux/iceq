@@ -2,47 +2,76 @@ package handlers
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/iceq/iceq/shared/middleware"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestLoginWrongPasswordNeverTriggersPanicWipe(t *testing.T) {
-	src, err := os.ReadFile("login.go")
+	passwordHash, err := hashPassword("correct-password")
 	if err != nil {
-		t.Fatalf("read login.go: %v", err)
+		t.Fatalf("hash password: %v", err)
 	}
-	loginGo := string(src)
-	wrongPasswordStart := strings.Index(loginGo, "if !passwordResult.OK {")
-	if wrongPasswordStart < 0 {
-		t.Fatal("could not locate wrong-password login path")
-	}
-	wrongPasswordEnd := strings.Index(loginGo[wrongPasswordStart:], "// 4. Mint a fresh access + refresh pair")
-	if wrongPasswordEnd < 0 {
-		t.Fatal("could not locate wrong-password login path")
-	}
-	wrongPasswordPath := loginGo[wrongPasswordStart : wrongPasswordStart+wrongPasswordEnd]
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
 
-	for _, forbidden := range []string{
-		"Wipe",
-		"triggerPanicWipeIfThresholdCrossed",
-		"failedLogin",
-		"PanicWipe",
-		"session_epoch",
-		"file_ownership",
-		"wiped_accounts",
-	} {
-		if strings.Contains(wrongPasswordPath, forbidden) {
-			t.Fatalf("wrong-password login path can trigger remote wipe or mutate protected state via %q", forbidden)
+	type protectedState struct {
+		User          LoginUser
+		SessionEpoch  string
+		FileOwnership map[string]int64
+		WipeMarker    bool
+	}
+	state := protectedState{
+		User:          LoginUser{UIN: 10000001, Username: "alice", Email: "alice@example.com", PasswordHash: passwordHash},
+		SessionEpoch:  "2026-07-16T00:00:00Z",
+		FileOwnership: map[string]int64{"object-key": 10000001},
+	}
+	wantState := protectedState{
+		User:          state.User,
+		SessionEpoch:  state.SessionEpoch,
+		FileOwnership: map[string]int64{"object-key": 10000001},
+	}
+	handler := NewLoginHandler(LoginDeps{
+		Redis:           rdb,
+		RateLimitSecret: []byte("01234567890123456789012345678901"),
+		LookupUser: func(context.Context, string, bool) (LoginUser, error) {
+			return state.User, nil
+		},
+	})
+
+	for attempt := 1; attempt <= 5; attempt++ {
+		body, _ := json.Marshal(map[string]string{"username": "alice", "password": "wrong-password"})
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		edgeDigest := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+		req.Header.Set(middleware.EdgeIdentityHeader, "v1.abcdef012345."+edgeDigest)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d status = %d, want 401; body=%q", attempt, rr.Code, rr.Body.String())
+		}
+		if rr.Body.String() != "{\"error\":\"invalid credentials\",\"code\":\"INVALID_CREDENTIALS\"}\n" {
+			t.Fatalf("attempt %d body = %q, want exact generic invalid-credentials response", attempt, rr.Body.String())
 		}
 	}
-	if !strings.Contains(wrongPasswordPath, `writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid credentials")`) {
-		t.Fatal("wrong-password login path must retain the generic 401 response")
+
+	if !reflect.DeepEqual(state, wantState) {
+		t.Fatalf("protected user/session/file/wipe state mutated: got %#v, want %#v", state, wantState)
+	}
+	for _, forbiddenKey := range []string{"login_attempts:10000001", "jwt:blocklist:wipe:10000001"} {
+		if mr.Exists(forbiddenKey) {
+			t.Fatalf("wrong-password login created automatic-wipe state %q", forbiddenKey)
+		}
 	}
 }
 

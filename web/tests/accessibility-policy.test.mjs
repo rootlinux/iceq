@@ -16,7 +16,7 @@ test("settings dialogs manage focus, Escape, and focus return", () => {
 });
 
 test("all dialog surfaces use managed dialog focus", () => {
-  for (const path of ["src/components/Contacts/AddContact.tsx", "src/components/Groups/GroupList.tsx", "src/components/Layout/Sidebar.tsx", "src/components/Settings/SecuritySettings.tsx"]) {
+  for (const path of ["src/components/Contacts/AddContact.tsx", "src/components/Groups/GroupList.tsx", "src/components/Layout/Sidebar.tsx"]) {
     assert.match(read(path), /useDialogFocus/, `${path} lacks managed focus`);
   }
 });

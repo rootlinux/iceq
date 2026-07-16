@@ -88,6 +88,16 @@ type LoginDeps struct {
 	// RateLimitSecret keys rotating HMAC buckets. Reusing the already
 	// mandatory high-entropy service secret avoids another operator secret.
 	RateLimitSecret []byte
+	// LookupUser is an optional narrow test seam for the read-only credential
+	// lookup. Production uses Pool when it is nil.
+	LookupUser func(context.Context, string, bool) (LoginUser, error)
+}
+
+type LoginUser struct {
+	UIN          int64
+	Username     string
+	Email        string
+	PasswordHash string
 }
 
 // NewLoginHandler returns the http.HandlerFunc mounted at
@@ -171,8 +181,14 @@ func NewLoginHandler(deps LoginDeps) http.HandlerFunc {
 		if byUsername {
 			query = qSelectUserByUsername
 		}
-		err = deps.Pool.QueryRow(ctx, query, loginValue).
-			Scan(&uin, &username, &email, &passwordHash)
+		if deps.LookupUser != nil {
+			user, lookupErr := deps.LookupUser(ctx, loginValue, byUsername)
+			err = lookupErr
+			uin, username, email, passwordHash = user.UIN, user.Username, user.Email, user.PasswordHash
+		} else {
+			err = deps.Pool.QueryRow(ctx, query, loginValue).
+				Scan(&uin, &username, &email, &passwordHash)
+		}
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				// Generic 401 — no enumeration. We

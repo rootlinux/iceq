@@ -188,38 +188,9 @@ CREATE INDEX idx_one_time_prekeys_uin_used
   ON one_time_prekeys (uin, key_id)
   WHERE used = false;
 
--- ============================================================================
--- Per-user security settings (added by the panic-wipe addendum).
---
--- panic_wipe_enabled defaults to FALSE: panic-wipe is opt-in, the way
--- Apple's "Erase Data after 10 attempts" toggle works. A user who never
--- visits the security settings page therefore has the safe-by-default
--- behavior of "infinite failed-login tolerance, no auto-wipe".
---
--- panic_wipe_threshold is bounded 1..10 in the application layer
--- (handlers/settings.go). The DB stores whatever the client sends, but
--- the handler refuses to write anything outside [1, 10]. The DEFAULT 3
--- matches the iPhone precedent (10) divided by ~3 — low enough that a
--- brute-force attempt is cut off quickly, high enough that two or three
--- mis-typed passwords by the legitimate owner don't trigger a wipe.
---
--- updated_at is bumped on every UPSERT via the handler using NOW(). We
--- don't add an ON UPDATE trigger because the only writer is the settings
--- handler, and putting the logic in one place (the handler) is easier to
--- audit than a trigger.
--- ============================================================================
+-- Compatibility shell for explicit wipe cleanup. Older deployments stored
+-- automatic-wipe configuration in this table; fresh schemas expose no such
+-- configuration, while the shared table name keeps explicit wipe idempotent.
 CREATE TABLE user_security_settings (
-  uin                  BIGINT       REFERENCES users(uin) PRIMARY KEY,
-  panic_wipe_enabled   BOOLEAN      NOT NULL DEFAULT FALSE,
-  panic_wipe_threshold INT          NOT NULL DEFAULT 3,
-  updated_at           TIMESTAMPTZ  DEFAULT NOW()
+  uin BIGINT REFERENCES users(uin) PRIMARY KEY
 );
-
--- Constraint enforces the 1..10 range at the database level too,
--- so a bug in the handler (or a direct SQL write) can't insert
--- an out-of-band threshold that would break the wipe logic. The
--- login handler reads this row on every failed attempt, and a
--- threshold outside [1, 10] is meaningless by definition.
-ALTER TABLE user_security_settings
-  ADD CONSTRAINT chk_panic_wipe_threshold_range
-  CHECK (panic_wipe_threshold BETWEEN 1 AND 10);

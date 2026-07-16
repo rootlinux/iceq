@@ -114,37 +114,6 @@ const (
 	`
 
 	// ------------------------------------------------------------------------
-	// Security-settings + panic-wipe queries (added by the
-	// panic-wipe addendum).
-	// ------------------------------------------------------------------------
-
-	// qSelectSecuritySettings fetches one user's row from
-	// user_security_settings. May return ErrNoRows if the user
-	// has never visited the settings page; the handler
-	// translates that into the documented defaults rather than
-	// an error.
-	qSelectSecuritySettings = `
-		SELECT panic_wipe_enabled, panic_wipe_threshold, updated_at
-		FROM user_security_settings
-		WHERE uin = $1
-	`
-
-	// qUpsertSecuritySettings creates or replaces a user's
-	// security-settings row. ON CONFLICT (uin) catches the
-	// second-and-later PUT; DO UPDATE rewrites both knobs and
-	// bumps updated_at. The order of SET clauses matters for
-	// diff-friendliness but not for correctness.
-	qUpsertSecuritySettings = `
-		INSERT INTO user_security_settings
-			(uin, panic_wipe_enabled, panic_wipe_threshold, updated_at)
-		VALUES ($1, $2, $3, NOW())
-		ON CONFLICT (uin) DO UPDATE
-		SET panic_wipe_enabled   = EXCLUDED.panic_wipe_enabled,
-		    panic_wipe_threshold = EXCLUDED.panic_wipe_threshold,
-		    updated_at           = NOW()
-	`
-
-	// ------------------------------------------------------------------------
 	// Panic-wipe cleanup queries. PanicWipe() runs these inside
 	// a single PG transaction so the partial state is never
 	// visible to a concurrent reader.

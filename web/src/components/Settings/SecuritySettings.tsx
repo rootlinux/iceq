@@ -1,43 +1,4 @@
-// SecuritySettings — per-user panic-wipe configuration panel.
-//
-// UX flow:
-//
-//   1. On mount, GET /api/auth/settings. Render a loading state
-//      while the request is in flight.
-//   2. When loaded, render the current state:
-//      - toggle off: "Auto-wipe is OFF" + a single "Enable" button
-//      - toggle on:  "Auto-wipe is ON — triggers after N attempts"
-//                    + a threshold selector + "Save" / "Disable"
-//   3. When the user clicks "Enable", open a confirmation modal.
-//      The modal text interpolates the chosen threshold so the
-//      user sees the exact number they're about to commit to.
-//      Buttons: "Enable" (red, destructive) | "Cancel".
-//   4. On confirmation, PUT /api/auth/settings with the new
-//      values. On success, refresh the local state from the
-//      response so the UI shows what the server actually saved.
-//   5. On 4xx/5xx, render an inline error and keep the panel in
-//      its current state (no implicit revert).
-//
-// Why a confirmation modal: the wipe is destructive and the user
-// may have mis-toggled. The modal gives them a moment to read
-// the exact consequence ("after N failed login attempts all your
-// messages, contacts, and keys will be permanently deleted and
-// unrecoverable") before they commit.
-//
-// Why the threshold selector is hidden when disabled: the value
-// has no effect when the feature is off, so showing a number
-// would imply otherwise. The user enables the feature first,
-// then picks the threshold.
-
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  DEFAULT_THRESHOLD,
-  MAX_THRESHOLD,
-  MIN_THRESHOLD,
-  SecuritySettings as Settings,
-  getSettings,
-  putSettings,
-} from "../../api/settings";
+import { useEffect, useState } from "react";
 import { loadIdentity } from "../../lib/indexeddb";
 import { SafetyQr } from "./SafetyQr";
 import { fetchBundle } from "../../api/keys";
@@ -46,17 +7,7 @@ import { acceptPeerIdentity, assessPeerIdentity, verifyPeerIdentity } from "../.
 import { useAuthStore } from "../../store/authStore";
 import { verifySignedPreKeyBundle } from "../../lib/signal";
 import { PrivacySettings } from "./PrivacySettings";
-import { useDialogFocus } from "../../hooks/useDialogFocus";
 import { useI18n } from "../../i18n";
-
-type Status =
-  | { kind: "loading" }
-  | { kind: "loaded"; settings: Settings }
-  | { kind: "error"; message: string };
-
-type ConfirmState =
-  | { kind: "none" }
-  | { kind: "enable"; threshold: number };
 
 type FingerprintStatus =
   | { kind: "loading" }
@@ -66,21 +17,12 @@ type FingerprintStatus =
 export function SecuritySettings(): JSX.Element {
   const i18n = useI18n();
   const selfUin = useAuthStore((state) => state.uin);
-  const [status, setStatus] = useState<Status>({ kind: "loading" });
-  // Working copy of the threshold. Kept separate from
-  // `status.settings.panic_wipe_threshold` so the user can
-  // adjust it before clicking Save without us mutating the
-  // rendered "currently saved" value.
-  const [draftThreshold, setDraftThreshold] = useState<number>(DEFAULT_THRESHOLD);
-  const [confirm, setConfirm] = useState<ConfirmState>({ kind: "none" });
   const [fingerprintStatus, setFingerprintStatus] = useState<FingerprintStatus>({
     kind: "loading",
   });
-  const [saving, setSaving] = useState(false);
   const [peerUin, setPeerUin] = useState("");
   const [peerSafety, setPeerSafety] = useState<{ uin: number; identityKey: string; number: string; changed: boolean; verified: boolean } | null>(null);
   const [peerError, setPeerError] = useState<string | null>(null);
-  const autoWipeTriggerRef = useRef<HTMLInputElement>(null);
 
   const inspectPeer = async (): Promise<void> => {
     const parsed = Number(peerUin);
@@ -100,25 +42,6 @@ export function SecuritySettings(): JSX.Element {
       setPeerError(null);
     } catch (error) { setPeerSafety(null); setPeerError((error as Error).message); }
   };
-
-  // Initial fetch.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const s = await getSettings();
-        if (cancelled) return;
-        setStatus({ kind: "loaded", settings: s });
-        setDraftThreshold(s.panic_wipe_threshold);
-      } catch (e) {
-        if (cancelled) return;
-        setStatus({ kind: "error", message: (e as Error).message });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -140,91 +63,9 @@ export function SecuritySettings(): JSX.Element {
     };
   }, []);
 
-  const onToggle = useCallback(
-    (nextEnabled: boolean) => {
-      if (status.kind !== "loaded") return;
-      if (nextEnabled) {
-        // Open the confirmation modal. We pass the
-        // draftThreshold through the modal so the warning
-        // text interpolates the chosen number.
-        setConfirm({ kind: "enable", threshold: draftThreshold });
-      } else {
-        // Disable is non-destructive — apply immediately.
-        // The user is un-doing an opt-in, not opting in
-        // for the first time, so no modal is needed.
-        void saveSettings(status.settings.panic_wipe_enabled, draftThreshold, false);
-      }
-    },
-    [status, draftThreshold],
-  );
-
-  const onConfirmEnable = useCallback(() => {
-    if (confirm.kind !== "enable") return;
-    setConfirm({ kind: "none" });
-    void saveSettings(true, confirm.threshold, true);
-  }, [confirm]);
-
-  const onCancelConfirm = useCallback(() => {
-    setConfirm({ kind: "none" });
-  }, []);
-  const confirmDialogRef = useDialogFocus(confirm.kind === "enable", onCancelConfirm, autoWipeTriggerRef);
-
-  const saveSettings = useCallback(
-    async (enabled: boolean, threshold: number, _isFirstEnable: boolean) => {
-      setSaving(true);
-      try {
-        const updated = await putSettings({
-          panic_wipe_enabled: enabled,
-          panic_wipe_threshold: threshold,
-        });
-        setStatus({ kind: "loaded", settings: updated });
-        setDraftThreshold(updated.panic_wipe_threshold);
-      } catch (e) {
-        // Inline error. Keep the panel in its current
-        // state so the user can retry without re-entering
-        // values.
-        setStatus({
-          kind: "error",
-          message: (e as Error).message,
-        });
-      } finally {
-        setSaving(false);
-      }
-    },
-    [],
-  );
-
-  if (status.kind === "loading") {
-    return <div className="iceq-settings-panel">{i18n.t("security.loading")}</div>;
-  }
-
-  if (status.kind === "error") {
-    return (
-      <div className="iceq-settings-panel iceq-settings-error">
-        {i18n.t("security.loadError")} {status.message}
-      </div>
-    );
-  }
-
-  const { settings } = status;
-  const isEnabled = settings.panic_wipe_enabled;
-
   return (
     <div className="iceq-settings-panel">
       <h3>{i18n.t("security.title")}</h3>
-
-      <div className="iceq-settings-row">
-        <label className="iceq-toggle">
-          <input
-            ref={autoWipeTriggerRef}
-            type="checkbox"
-            checked={isEnabled}
-            disabled={saving}
-            onChange={(e) => onToggle(e.target.checked)}
-          />
-          <span>{i18n.t("security.autoWipe")}</span>
-        </label>
-      </div>
 
       <PrivacySettings />
       {fingerprintStatus.kind === "ready" && fingerprintStatus.fingerprint && (
@@ -249,51 +90,6 @@ export function SecuritySettings(): JSX.Element {
         </div>
       </div>
 
-      {isEnabled && (
-        <>
-          <div className="iceq-settings-row">
-            <label htmlFor="panic-wipe-threshold">
-              {i18n.t("security.threshold")}
-            </label>
-            <select
-              id="panic-wipe-threshold"
-              value={draftThreshold}
-              disabled={saving}
-              onChange={(e) =>
-                setDraftThreshold(parseInt(e.target.value, 10) || DEFAULT_THRESHOLD)
-              }
-            >
-              {Array.from(
-                { length: MAX_THRESHOLD - MIN_THRESHOLD + 1 },
-                (_, i) => i + MIN_THRESHOLD,
-              ).map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="iceq-settings-row">
-            <button
-              type="button"
-              disabled={saving || draftThreshold === settings.panic_wipe_threshold}
-              onClick={() =>
-                saveSettings(true, draftThreshold, false)
-              }
-            >
-              {saving ? i18n.t("security.saving") : i18n.t("security.save")}
-            </button>
-          </div>
-        </>
-      )}
-
-      <div className="iceq-settings-status">
-        {isEnabled
-          ? i18n.t("security.on", { count: settings.panic_wipe_threshold })
-          : i18n.t("security.off")}
-      </div>
-
       <div className="iceq-settings-row">
         <div className="iceq-settings-status">
           <strong>{i18n.t("security.localFingerprint")}</strong>
@@ -302,32 +98,6 @@ export function SecuritySettings(): JSX.Element {
         </div>
       </div>
 
-      {confirm.kind === "enable" && (
-        <div className="iceq-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="auto-wipe-confirm-title">
-          <div className="iceq-modal" ref={confirmDialogRef}>
-            <h4 id="auto-wipe-confirm-title">{i18n.t("security.enableTitle")}</h4>
-            <p>{i18n.t("security.enableWarning", { count: confirm.threshold })}</p>
-            <div className="iceq-modal-buttons">
-              <button
-                type="button"
-                className="iceq-btn-destructive"
-                onClick={onConfirmEnable}
-                disabled={saving}
-              >
-                {i18n.t("security.enable")}
-              </button>
-              <button
-                type="button"
-                className="iceq-btn-secondary"
-                onClick={onCancelConfirm}
-                disabled={saving}
-              >
-                {i18n.t("common.cancel")}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

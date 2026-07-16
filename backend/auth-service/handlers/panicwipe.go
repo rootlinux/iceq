@@ -1,8 +1,7 @@
 // Package handlers — panicwipe.go
 //
-// PanicWipe is the nuclear option. When a user has panic-wipe enabled
-// and an attacker crosses the failed-attempts threshold, the
-// auth-service self-destructs the user's account: every key, every
+// PanicWipe is the explicit authenticated account-erasure operation. It
+// removes every key, every
 // contact, every group membership, every prekey bundle, every refresh
 // token, and every identifying row is gone. The user's record is
 // anonymized (username -> "deleted_<UIN>", email -> NULL, identity_key
@@ -11,21 +10,14 @@
 //
 // Design constraints from the spec:
 //
-//  1. Indistinguishable response. The HTTP layer returns the same
-//     401 / "invalid credentials" envelope after a wipe as it would
-//     for a normal failed login. The attacker cannot tell whether
-//     the threshold was hit. The legitimate user, hitting the
-//     threshold themselves, just sees "invalid email or password"
-//     forever — which is the point.
-//
-//  2. PG atomicity, Scylla best-effort. Everything inside Postgres
+//  1. PG atomicity, Scylla best-effort. Everything inside Postgres
 //     happens in a single transaction so the partial state is never
 //     visible to a concurrent reader. Scylla deletes run AFTER the
 //     PG commit. We log if a Scylla delete fails, but we do NOT
 //     fail the wipe — ciphertext without the matching private keys
 //     is a successful cryptographic erase.
 //
-//  3. Audit-trail discipline. The log line is timestamp + UIN + the
+//  2. Audit-trail discipline. The log line is timestamp + UIN + the
 //     constant string "panic_wipe_executed". We do NOT log
 //     passwords, the count that triggered the wipe, the source IP,
 //     or any of the field values being scrubbed. A wipe that fires
@@ -33,7 +25,7 @@
 //     incident response, not a side channel for an attacker who
 //     has read access to logs.
 //
-//  4. Blocklist with TTL. The wipe also sets
+//  3. Blocklist with TTL. The wipe also sets
 //     `jwt:blocklist:wipe:{uin}` in Redis with a 7-day TTL. The
 //     ws-gateway checks this key on every inbound message; if it
 //     exists, the connection is closed with code 4403 (custom
@@ -53,7 +45,6 @@ import (
 	"time"
 
 	"github.com/iceq/iceq/shared/middleware"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -65,10 +56,9 @@ import (
 // ----------------------------------------------------------------------------
 
 const (
-	// loginAttemptsKeyPrefix scopes the failed-login counter
-	// keys in Redis. The pattern `login_attempts:{uin}` matches
-	// the spec verbatim.
-	loginAttemptsKeyPrefix = "login_attempts:"
+	// legacyLoginAttemptsKeyPrefix is retained only so an explicit wipe can
+	// remove counters left by older deployments.
+	legacyLoginAttemptsKeyPrefix = "login_attempts:"
 
 	// panicWipeBlocklistPrefix scopes the per-user wipe
 	// blocklist. The ws-gateway does an EXISTS on this key for
@@ -86,14 +76,6 @@ const (
 	// re-attach, so the key can safely expire.
 	panicWipeBlocklistTTL = 7 * 24 * time.Hour
 
-	// failedAttemptsCounterTTL is the lifetime of the
-	// `login_attempts:{uin}` counter. 15 minutes matches the
-	// spec verbatim. The TTL is applied on the FIRST increment
-	// (the counter is created with EXPIRE in the same Lua
-	// script), not on every increment, so a sustained attack
-	// doesn't keep the window open indefinitely.
-	failedAttemptsCounterTTL = 15 * time.Minute
-
 	// presenceKeyPrefix is the convention used by the
 	// presence-service. We hard-code it here rather than
 	// importing the presence package, because importing a
@@ -104,43 +86,6 @@ const (
 	presenceKeyPrefix = "presence:"
 )
 
-// ----------------------------------------------------------------------------
-// Counter helpers. The counter is a Redis STRING holding an integer;
-// we use INCR for atomicity under concurrent failed-login storms and
-// apply the TTL on the first increment only (so a sustained attacker
-// can't keep refreshing the window).
-// ----------------------------------------------------------------------------
-
-// incrFailedLoginAtomically does INCR + (EXPIRE on first hit) in one
-// Lua round trip. Returning the post-increment value lets the caller
-// decide whether to trigger a wipe in the same request.
-//
-// We use a Lua script (not a transaction) for the same reason as
-// rateLimitScript in login.go: a transaction requires at least two
-// round trips (WATCH/MULTI/EXEC), whereas a script is a single
-// EVAL/EVALSHA. The savings matter under a brute-force storm.
-//
-// KEYS[1] = full counter key
-// ARGV[1] = TTL seconds
-const failedLoginScript = `
-local current = redis.call("INCR", KEYS[1])
-if current == 1 then
-    redis.call("EXPIRE", KEYS[1], ARGV[1])
-end
-return current
-`
-
-// failedLoginScriptHandle is the pre-compiled script handle. Created
-// once at package init time, reused on every login attempt.
-var failedLoginScriptHandle = redis.NewScript(failedLoginScript)
-
-// resetFailedLoginCounter removes the counter for uin. Called on
-// successful login so a user who fat-fingers their password twice
-// and then succeeds is back to a clean slate.
-func resetFailedLoginCounter(ctx context.Context, rdb *redis.Client, uin int64) error {
-	return rdb.Del(ctx, loginAttemptsKeyPrefix+itoa(uin)).Err()
-}
-
 // panicWipeBlocklistKey returns the Redis key under which the
 // ws-gateway checks for a wiped user. Exported as a helper so the
 // ws-gateway can use the same string format without re-deriving it.
@@ -150,7 +95,7 @@ func panicWipeBlocklistKey(uin int64) string {
 
 // itoa is a small wrapper around strconv.FormatInt. Kept as a
 // helper so the call sites read like English
-// (loginAttemptsKeyPrefix + itoa(uin)) rather than the noisier
+// (legacyLoginAttemptsKeyPrefix + itoa(uin)) rather than the noisier
 // strconv.FormatInt(uin, 10). UINs are non-negative by
 // construction (the sequence starts at 10_000_000) but the helper
 // is robust to negatives for testing.
@@ -193,9 +138,7 @@ type MessageStore interface {
 	DeleteUserGroupMessages(ctx context.Context, uin int64) error
 }
 
-// PanicWipeDeps bundles the wipe's dependencies. Constructed once
-// in main.go and passed to the login handler so the wipe code has
-// no package-level state to manage.
+// PanicWipeDeps bundles the explicit wipe's dependencies.
 type PanicWipeDeps struct {
 	// Pool is the PG pool. Required.
 	Pool *pgxpool.Pool
@@ -254,8 +197,7 @@ func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 	}
 }
 
-// PanicWipe executes the full wipe sequence. ctx is the request
-// context from the login handler; if it expires mid-wipe the
+// PanicWipe executes the full wipe sequence. If ctx expires mid-wipe the
 // transaction is rolled back and the function returns ctx.Err().
 //
 // The function logs the timestamp + UIN + sentinel string on
@@ -349,10 +291,9 @@ func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) error {
 		return fmt.Errorf("panicwipe: revoke active sessions: %w", err)
 	}
 
-	// ----- 10. DEL login_attempts:{uin} ------------------------------------
-	// The counter is no longer needed; the user is wiped.
-	if err := deps.Redis.Del(ctx, loginAttemptsKeyPrefix+itoa(uin)).Err(); err != nil {
-		log.Printf("[auth-service] panicwipe: del counter failed: %v", err)
+	// Remove any failed-login counter left by a legacy deployment.
+	if err := deps.Redis.Del(ctx, legacyLoginAttemptsKeyPrefix+itoa(uin)).Err(); err != nil {
+		log.Printf("[auth-service] panicwipe: del legacy counter failed: %v", err)
 	}
 
 	// ----- 11. DEL presence:{uin} -------------------------------------------
@@ -371,10 +312,7 @@ func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) error {
 		cleanupScylla(ctx, deps.Scylla, uin, 5*time.Second)
 	}
 
-	// Audit log. Spec says: timestamp + uin + "panic_wipe_executed".
-	// We add the threshold-crossed count too, because operations
-	// needs to know whether the wipe fired at 3 attempts
-	// (expected) or at 1 (suspicious).
+	// Audit log contains no request or account metadata.
 	log.Printf("[auth-service] panic_wipe_executed")
 	return nil
 }
@@ -388,77 +326,4 @@ func cleanupScylla(parent context.Context, store MessageStore, uin int64, timeou
 	if err := store.DeleteUserGroupMessages(cleanupCtx, uin); err != nil {
 		log.Printf("[auth-service] panicwipe: scylla delete group_messages failed: %v (ciphertext retained; keys gone)", err)
 	}
-}
-
-// ----------------------------------------------------------------------------
-// Threshold check. Called by the login handler after a failed
-// bcrypt comparison. Returns true if the wipe should fire.
-// ----------------------------------------------------------------------------
-
-// checkPanicWipeThreshold consults the user's security-settings row
-// and the current failed-attempt counter. If panic-wipe is enabled
-// and the counter has reached the threshold, returns true and resets
-// the counter (so a subsequent wipe attempt by the same attacker is
-// idempotent — the second call sees a freshly-zeroed counter and
-// won't double-wipe).
-//
-// We do NOT trigger the wipe here; the caller decides. Separating
-// "should we wipe?" from "do the wipe" keeps the test surface small
-// and lets the caller log the trigger condition independently.
-func checkPanicWipeThreshold(
-	ctx context.Context,
-	pool *pgxpool.Pool,
-	rdb *redis.Client,
-	uin int64,
-) (bool, error) {
-	// Read the settings row. If absent, the user has not
-	// enabled panic-wipe; the row's default is panic_wipe_enabled=FALSE
-	// so the query result is a deterministic "do not wipe".
-	//
-	// qSelectSecuritySettings returns three columns
-	// (enabled, threshold, updated_at); the helper here
-	// consumes only the first two. Scanning into a discard
-	// variable for updated_at keeps the type check strict
-	// — pgx will error if the column count drifts in the
-	// future, which is exactly the "drift detection" we
-	// want from typed scanning.
-	var (
-		enabled          bool
-		threshold        int
-		updatedAtDiscard time.Time
-	)
-	err := pool.QueryRow(ctx, qSelectSecuritySettings, uin).
-		Scan(&enabled, &threshold, &updatedAtDiscard)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("panicwipe: read settings: %w", err)
-	}
-	if !enabled {
-		return false, nil
-	}
-	// Defensive: the CHECK constraint guarantees 1..10, but a
-	// hand-edited row could be outside. Cap it to a sensible
-	// maximum so a misconfigured row can't trigger a wipe at
-	// threshold=0.
-	if threshold < 1 {
-		threshold = 1
-	}
-	if threshold > 10 {
-		threshold = 10
-	}
-
-	// Read the current counter. We just INCRed it in the login
-	// handler, so a GET here returns the post-increment value.
-	// If the key has expired (15-min TTL), the counter is
-	// effectively zero and the threshold is not crossed.
-	countStr, err := rdb.Get(ctx, loginAttemptsKeyPrefix+itoa(uin)).Int64()
-	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			return false, nil
-		}
-		return false, fmt.Errorf("panicwipe: read counter: %w", err)
-	}
-	return countStr >= int64(threshold), nil
 }
