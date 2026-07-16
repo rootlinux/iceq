@@ -9,18 +9,13 @@
 }
 
 :80 {
-    handle /edge-health {
-        respond "OK" 200
-    }
-
     reverse_proxy https://caddy:443 {
         header_up Host iceq.space
         transport http {
             tls
             tls_server_name iceq.space
-            # The internal hop verifies routing/policy rather than public PKI.
-            # Public TLS remains terminated by the default Caddy edge.
-            tls_insecure_skip_verify
+            # Validate the default edge's public certificate against the
+            # container system trust store; never disable upstream TLS checks.
         }
     }
 }

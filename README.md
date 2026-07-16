@@ -212,7 +212,7 @@ The `goldy/tor-hidden-service` container:
 - strips Tor's transport encryption and forwards plain HTTP into the Docker network
 - exposes the v3 onion address via its `hostname` file (used by the script above)
 
-The default Caddy loads no Tor-only `:80` listener. Enabling the `tor` profile starts the isolated `caddy-tor` internal edge, which forwards onion requests to the default Caddy HTTPS policy surface. This keeps Tor listeners absent from the default stack while reusing the clearnet routes and security headers.
+The default Caddy loads no Tor-only `:80` listener. Enabling the `tor` profile starts the isolated `caddy-tor` internal edge, which forwards onion requests to the default Caddy HTTPS policy surface with normal certificate validation and `iceq.space` SNI. Its healthcheck traverses that same proxy path to the non-sensitive `/health` route, so Tor waits for upstream TLS and route readiness rather than a local synthetic response. This keeps Tor listeners absent from the default stack while reusing the clearnet routes and security headers.
 
 ### Security note
 

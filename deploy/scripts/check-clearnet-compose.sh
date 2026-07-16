@@ -43,8 +43,18 @@ grep -Fq 'reverse_proxy https://caddy:443' "$tor_caddyfile" ||
   fail "isolated Tor edge must forward to the shared clearnet policy edge"
 grep -Fq 'header_up Host iceq.space' "$tor_caddyfile" ||
   fail "isolated Tor edge must select the iceq.space Caddy site"
+if grep -Fq 'tls_insecure_skip_verify' "$tor_caddyfile"; then
+  fail "isolated Tor edge must verify the default Caddy TLS certificate"
+fi
+grep -Fq 'tls_server_name iceq.space' "$tor_caddyfile" ||
+  fail "isolated Tor edge must verify TLS for iceq.space"
 grep -Fq 'ICECQ_TOR_SERVICE_HOSTS=80:caddy-tor:80' "$compose_file" ||
   fail "Tor hidden service must target only the isolated Tor edge"
+grep -Fq 'http://127.0.0.1:80/health' "$compose_file" ||
+  fail "Tor edge healthcheck must exercise the proxied upstream /health route"
+if grep -Fq '/edge-health' "$compose_file" "$tor_caddyfile"; then
+  fail "Tor edge must not use a synthetic local-only health endpoint"
+fi
 
 clearnet_site=$(sed -n '/^iceq\.space, www\.iceq\.space {$/,/^}$/p' "$caddyfile")
 route_snippet=$(sed -n '/^(iceq_routes) {$/,/^# ── Public TLS listener/p' "$caddyfile")

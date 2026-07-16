@@ -416,7 +416,10 @@ services:
       caddy:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:80/edge-health"]
+      # This request traverses caddy-tor's normal HTTPS upstream transport and
+      # reaches default Caddy's public, non-sensitive /health route. It fails
+      # when upstream routing, TLS trust/SNI, or the default edge is unavailable.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:80/health"]
       interval: 10s
       timeout: 5s
       retries: 5
