@@ -7,6 +7,10 @@ caddyfile="$repo_root/deploy/Caddyfile"
 tor_caddyfile="$repo_root/deploy/Caddyfile.tor"
 onion_script="$repo_root/deploy/scripts/onion-address.sh"
 
+# Compose interpolates required service environment before env_file is loaded.
+# Static validation uses a non-secret fixture and never starts the signer.
+export ICEQ_EDGE_IDENTITY_HMAC_SECRET=${ICEQ_EDGE_IDENTITY_HMAC_SECRET:-01234567890123456789012345678901}
+
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
   exit 1

@@ -133,12 +133,20 @@ func (d *atomicRefreshDB) Exec(context.Context, string, ...any) (pgconn.CommandT
 	return pgconn.NewCommandTag("DELETE 1"), nil
 }
 
-type atomicRefreshTx struct{ db *atomicRefreshDB }
+type atomicRefreshTx struct {
+	db                *atomicRefreshDB
+	pendingRevocation bool
+}
 
 func (t *atomicRefreshTx) Begin(context.Context) (pgx.Tx, error) { return nil, errors.New("unused") }
 func (t *atomicRefreshTx) Commit(context.Context) error {
 	if t.db.commitErr != nil {
 		return t.db.commitErr
+	}
+	if t.pendingRevocation {
+		t.db.mu.Lock()
+		t.db.revoked = true
+		t.db.mu.Unlock()
 	}
 	return nil
 }
@@ -159,7 +167,7 @@ func (t *atomicRefreshTx) Exec(_ context.Context, query string, _ ...any) (pgcon
 		if t.db.revokeErr != nil {
 			return pgconn.CommandTag{}, t.db.revokeErr
 		}
-		t.db.revoked = true
+		t.pendingRevocation = true
 		return pgconn.NewCommandTag("DELETE 1"), nil
 	}
 	return pgconn.NewCommandTag("INSERT 1"), nil
@@ -244,6 +252,9 @@ func TestRefreshReuseRevocationFailureNeverClaimsSessionsWereRevoked(t *testing.
 	if strings.Contains(rr.Body.String(), "sessions have been revoked") || strings.Contains(rr.Body.String(), "reuse") {
 		t.Fatalf("public response overclaims revocation or exposes detection detail: %s", rr.Body.String())
 	}
+	if db.revoked {
+		t.Fatal("statement failure exposed a partial revocation")
+	}
 }
 
 func TestRefreshReuseCommitFailureNeverClaimsSessionsWereRevoked(t *testing.T) {
@@ -256,5 +267,8 @@ func TestRefreshReuseCommitFailureNeverClaimsSessionsWereRevoked(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "sessions have been revoked") || strings.Contains(rr.Body.String(), "reuse") {
 		t.Fatalf("public response overclaims revocation or exposes detection detail: %s", rr.Body.String())
+	}
+	if db.revoked {
+		t.Fatal("commit failure exposed a partial revocation")
 	}
 }
