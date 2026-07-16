@@ -47,6 +47,7 @@ import { useAuthStore } from "../../store/authStore";
 import { verifySignedPreKeyBundle } from "../../lib/signal";
 import { PrivacySettings } from "./PrivacySettings";
 import { useDialogFocus } from "../../hooks/useDialogFocus";
+import { useI18n } from "../../i18n";
 
 type Status =
   | { kind: "loading" }
@@ -63,6 +64,7 @@ type FingerprintStatus =
   | { kind: "error" };
 
 export function SecuritySettings(): JSX.Element {
+  const i18n = useI18n();
   const selfUin = useAuthStore((state) => state.uin);
   const [status, setStatus] = useState<Status>({ kind: "loading" });
   // Working copy of the threshold. Kept separate from
@@ -83,11 +85,11 @@ export function SecuritySettings(): JSX.Element {
   const inspectPeer = async (): Promise<void> => {
     const parsed = Number(peerUin);
     if (!Number.isSafeInteger(parsed) || parsed <= 0 || selfUin === null) {
-      setPeerError("Enter a valid contact UIN."); return;
+      setPeerError(i18n.t("security.invalidUin")); return;
     }
     try {
       const [local, remote] = await Promise.all([loadIdentity(), fetchBundle(parsed)]);
-      if (!local) throw new Error("Local identity is unavailable.");
+      if (!local) throw new Error(i18n.t("security.localUnavailable"));
       await verifySignedPreKeyBundle(remote);
       const assessment = await assessPeerIdentity(parsed, remote.identity_key);
       const number = await computeSafetyNumber(
@@ -193,13 +195,13 @@ export function SecuritySettings(): JSX.Element {
   );
 
   if (status.kind === "loading") {
-    return <div className="iceq-settings-panel">Loading security settings…</div>;
+    return <div className="iceq-settings-panel">{i18n.t("security.loading")}</div>;
   }
 
   if (status.kind === "error") {
     return (
       <div className="iceq-settings-panel iceq-settings-error">
-        Could not load security settings: {status.message}
+        {i18n.t("security.loadError")} {status.message}
       </div>
     );
   }
@@ -209,7 +211,7 @@ export function SecuritySettings(): JSX.Element {
 
   return (
     <div className="iceq-settings-panel">
-      <h3>Security</h3>
+      <h3>{i18n.t("security.title")}</h3>
 
       <div className="iceq-settings-row">
         <label className="iceq-toggle">
@@ -220,7 +222,7 @@ export function SecuritySettings(): JSX.Element {
             disabled={saving}
             onChange={(e) => onToggle(e.target.checked)}
           />
-          <span>Auto-wipe on failed logins</span>
+          <span>{i18n.t("security.autoWipe")}</span>
         </label>
       </div>
 
@@ -230,18 +232,18 @@ export function SecuritySettings(): JSX.Element {
       )}
       <div className="iceq-settings-row">
         <div className="iceq-settings-status">
-          <strong>Verify a contact</strong>
-          <input aria-label="Contact UIN" inputMode="numeric" value={peerUin} onChange={(event) => setPeerUin(event.target.value)} />
-          <button type="button" onClick={() => void inspectPeer()}>Load safety number</button>
+          <strong>{i18n.t("security.verifyContact")}</strong>
+          <input aria-label={i18n.t("security.contactUin")} inputMode="numeric" value={peerUin} onChange={(event) => setPeerUin(event.target.value)} />
+          <button type="button" onClick={() => void inspectPeer()}>{i18n.t("security.loadSafety")}</button>
           {peerError && <div role="alert">{peerError}</div>}
           {peerSafety && (
             <div>
               <div>{peerSafety.number}</div>
               <SafetyQr fingerprint={peerSafety.number} />
-              {peerSafety.changed && <div role="alert">Identity changed. Sending is blocked.</div>}
-              {peerSafety.changed && <button type="button" onClick={async () => { await acceptPeerIdentity(peerSafety.uin, peerSafety.identityKey); await inspectPeer(); }}>Accept new identity</button>}
-              {!peerSafety.verified && !peerSafety.changed && <button type="button" onClick={async () => { await verifyPeerIdentity(peerSafety.uin, peerSafety.identityKey); await inspectPeer(); }}>I verified this fingerprint</button>}
-              {peerSafety.verified && <div role="status">Verified on this device</div>}
+              {peerSafety.changed && <div role="alert">{i18n.t("security.identityChanged")}</div>}
+              {peerSafety.changed && <button type="button" onClick={async () => { await acceptPeerIdentity(peerSafety.uin, peerSafety.identityKey); await inspectPeer(); }}>{i18n.t("security.acceptIdentity")}</button>}
+              {!peerSafety.verified && !peerSafety.changed && <button type="button" onClick={async () => { await verifyPeerIdentity(peerSafety.uin, peerSafety.identityKey); await inspectPeer(); }}>{i18n.t("security.markVerified")}</button>}
+              {peerSafety.verified && <div role="status">{i18n.t("security.verified")}</div>}
             </div>
           )}
         </div>
@@ -251,7 +253,7 @@ export function SecuritySettings(): JSX.Element {
         <>
           <div className="iceq-settings-row">
             <label htmlFor="panic-wipe-threshold">
-              Threshold (failed attempts before wipe)
+              {i18n.t("security.threshold")}
             </label>
             <select
               id="panic-wipe-threshold"
@@ -280,7 +282,7 @@ export function SecuritySettings(): JSX.Element {
                 saveSettings(true, draftThreshold, false)
               }
             >
-              {saving ? "Saving…" : "Save"}
+              {saving ? i18n.t("security.saving") : i18n.t("security.save")}
             </button>
           </div>
         </>
@@ -288,30 +290,23 @@ export function SecuritySettings(): JSX.Element {
 
       <div className="iceq-settings-status">
         {isEnabled
-          ? `Auto-wipe: ON — triggers after ${settings.panic_wipe_threshold} failed attempts`
-          : "Auto-wipe: OFF"}
+          ? i18n.t("security.on", { count: settings.panic_wipe_threshold })
+          : i18n.t("security.off")}
       </div>
 
       <div className="iceq-settings-row">
         <div className="iceq-settings-status">
-          <strong>Local identity fingerprint</strong>
-          <div>{renderFingerprint(fingerprintStatus)}</div>
-          <p>
-            Compare this fingerprint out-of-band with contacts. This only verifies
-            the key stored on this device.
-          </p>
+          <strong>{i18n.t("security.localFingerprint")}</strong>
+          <div>{renderFingerprint(fingerprintStatus, i18n.t)}</div>
+          <p>{i18n.t("security.fingerprintHelp")}</p>
         </div>
       </div>
 
       {confirm.kind === "enable" && (
         <div className="iceq-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="auto-wipe-confirm-title">
           <div className="iceq-modal" ref={confirmDialogRef}>
-            <h4 id="auto-wipe-confirm-title">Enable auto-wipe?</h4>
-            <p>
-              If enabled, after {confirm.threshold} failed login attempts all your
-              messages, contacts, and keys will be permanently deleted and
-              unrecoverable. This cannot be undone.
-            </p>
+            <h4 id="auto-wipe-confirm-title">{i18n.t("security.enableTitle")}</h4>
+            <p>{i18n.t("security.enableWarning", { count: confirm.threshold })}</p>
             <div className="iceq-modal-buttons">
               <button
                 type="button"
@@ -319,7 +314,7 @@ export function SecuritySettings(): JSX.Element {
                 onClick={onConfirmEnable}
                 disabled={saving}
               >
-                Enable
+                {i18n.t("security.enable")}
               </button>
               <button
                 type="button"
@@ -327,7 +322,7 @@ export function SecuritySettings(): JSX.Element {
                 onClick={onCancelConfirm}
                 disabled={saving}
               >
-                Cancel
+                {i18n.t("common.cancel")}
               </button>
             </div>
           </div>
@@ -337,10 +332,10 @@ export function SecuritySettings(): JSX.Element {
   );
 }
 
-function renderFingerprint(status: FingerprintStatus): string {
-  if (status.kind === "loading") return "Loading...";
-  if (status.kind === "error") return "Fingerprint unavailable.";
-  return status.fingerprint ?? "No identity key on this device yet.";
+function renderFingerprint(status: FingerprintStatus, translate: ReturnType<typeof useI18n>["t"]): string {
+  if (status.kind === "loading") return translate("security.fingerprintLoading");
+  if (status.kind === "error") return translate("security.fingerprintUnavailable");
+  return status.fingerprint ?? translate("security.noIdentity");
 }
 
 async function fingerprintIdentityKey(publicKey: string): Promise<string> {

@@ -19,7 +19,9 @@ export function createI18n(options: { storage?: StorageLike; browserLanguages?: 
   const listeners = new Set<() => void>();
   return {
     get locale(): Locale { return locale; },
-    t(key: MessageKey): string { return catalogs[locale][key] ?? en[key]; },
+    t(key: MessageKey, values: Record<string, string | number> = {}): string {
+      return (catalogs[locale][key] ?? en[key]).replace(/\{(\w+)\}/g, (token, name: string) => values[name] === undefined ? token : String(values[name]));
+    },
     setLocale(next: Locale): void {
       if (next === locale) return;
       locale = next;

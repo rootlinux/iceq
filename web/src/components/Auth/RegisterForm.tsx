@@ -124,15 +124,11 @@ export function RegisterForm(): JSX.Element {
         className="w-full max-w-sm space-y-4 rounded-lg border border-border bg-surface-2 p-6"
       >
         <h1 className="text-2xl font-semibold text-text">{i18n.t("auth.createTitle")}</h1>
-        <p className="text-sm text-text-2">
-          We will generate an encryption key on this device. Your messages are
-          end-to-end encrypted; we can't read them and we can't recover them if
-          you lose this device.
-        </p>
+        <p className="text-sm text-text-2">{i18n.t("auth.registerHelp")}</p>
 
         <div className="space-y-1">
           <label htmlFor="register-username" className="text-sm text-text-2">
-            Username
+            {i18n.t("auth.username")}
           </label>
           <input
             id="register-username"
@@ -151,7 +147,7 @@ export function RegisterForm(): JSX.Element {
 
         <div className="space-y-1">
           <label htmlFor="register-password" className="text-sm text-text-2">
-            Password
+            {i18n.t("auth.password")}
           </label>
           <input
             id="register-password"
@@ -176,18 +172,18 @@ export function RegisterForm(): JSX.Element {
 
         <button type="submit" className="iceq-btn-primary w-full" disabled={isBusy}>
           {stage === "generating"
-            ? "Generating keys…"
+            ? i18n.t("auth.generatingKeys")
             : stage === "registering"
-              ? "Creating account…"
+              ? i18n.t("auth.creatingAccount")
               : stage === "uploading"
-                ? "Uploading prekeys…"
-                : "Create account"}
+                ? i18n.t("auth.uploadingPrekeys")
+                : i18n.t("auth.createAccount")}
         </button>
 
         <p className="text-sm text-text-2">
-          Already have an account?{" "}
+          {i18n.t("auth.haveAccount")} {" "}
           <Link to="/login" className="text-accent hover:underline">
-            Sign in
+            {i18n.t("auth.signIn")}
           </Link>
         </p>
       </form>

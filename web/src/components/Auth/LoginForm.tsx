@@ -51,7 +51,7 @@ export function LoginForm(): JSX.Element {
 
         <div className="space-y-1">
           <label htmlFor="login-username" className="text-sm text-text-2">
-            Username
+            {i18n.t("auth.username")}
           </label>
           <input
             id="login-username"
@@ -69,7 +69,7 @@ export function LoginForm(): JSX.Element {
 
         <div className="space-y-1">
           <label htmlFor="login-password" className="text-sm text-text-2">
-            Password
+            {i18n.t("auth.password")}
           </label>
           <input
             id="login-password"
@@ -92,13 +92,13 @@ export function LoginForm(): JSX.Element {
         )}
 
         <button type="submit" className="iceq-btn-primary w-full" disabled={submitting}>
-          {submitting ? "Signing in…" : "Sign in"}
+          {submitting ? i18n.t("auth.signingIn") : i18n.t("auth.signIn")}
         </button>
 
         <p className="text-sm text-text-2">
-          Don't have an account?{" "}
+          {i18n.t("auth.noAccount")} {" "}
           <Link to="/register" className="text-accent hover:underline">
-            Register
+            {i18n.t("auth.register")}
           </Link>
         </p>
       </form>

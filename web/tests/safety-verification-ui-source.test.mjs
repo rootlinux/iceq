@@ -9,13 +9,16 @@ const securitySettings = readFileSync(
   resolve(__dirname, "../src/components/Settings/SecuritySettings.tsx"),
   "utf8",
 );
+const englishCatalog = readFileSync(resolve(__dirname, "../src/i18n/en.ts"), "utf8");
 
 test("security settings renders local identity fingerprint guidance without exporting private keys", () => {
   assert.match(securitySettings, /loadIdentity/);
   assert.match(securitySettings, /identity\.publicKey/);
-  assert.match(securitySettings, /Local identity fingerprint/);
-  assert.match(securitySettings, /Compare this fingerprint out-of-band with contacts\./);
-  assert.match(securitySettings, /This only verifies\s+the key stored on this device\./);
+  assert.match(securitySettings, /security\.localFingerprint/);
+  assert.match(securitySettings, /security\.fingerprintHelp/);
+  assert.match(englishCatalog, /Local identity fingerprint/);
+  assert.match(englishCatalog, /Compare this fingerprint out-of-band with contacts\./);
+  assert.match(englishCatalog, /This only verifies the key stored on this device\./);
   assert.doesNotMatch(securitySettings, /identity\.privateKey/);
   assert.doesNotMatch(securitySettings, /privateKey/);
 });
