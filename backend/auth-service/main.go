@@ -228,14 +228,6 @@ func main() {
 			Redis:           rdb,
 			Manager:         mgr,
 			RateLimitSecret: []byte(cfg.JWTSecret),
-			// Wipe is the optional panic-wipe deps. nil
-			// here would disable the feature entirely;
-			// passing the populated struct below enables
-			// it. The Scylla field is nil at step 3
-			// because no message-service is wired yet;
-			// step 4 (or whenever the message-service
-			// lands) will fill it in.
-			Wipe: &panicWipeDeps,
 		}))
 		r.With(csrfMW).Post("/refresh", handlers.NewRefreshHandler(handlers.RefreshDeps{
 			Pool:    pgPool,
@@ -249,17 +241,6 @@ func main() {
 		r.With(authMW, rate("auth:logout", 10, time.Minute), csrfMW).Post("/logout", handlers.NewLogoutHandler(handlers.LogoutDeps{
 			Pool:    pgPool,
 			Manager: mgr,
-		}))
-		// Security settings (panic-wipe configuration).
-		// Both endpoints are behind BearerAuth: the user's
-		// UIN is the primary key, and only the
-		// authenticated user can read or write their own
-		// row.
-		r.With(authMW, rate("auth:settings:read", 60, time.Minute)).Get("/settings", handlers.NewGetSettingsHandler(handlers.SettingsDeps{
-			Pool: pgPool,
-		}))
-		r.With(authMW, rate("auth:settings:write", 10, time.Minute), csrfMW).Put("/settings", handlers.NewPutSettingsHandler(handlers.SettingsDeps{
-			Pool: pgPool,
 		}))
 		r.With(authMW, rate("auth:me", 60, time.Minute)).Get("/me", handlers.NewMeHandler(handlers.MeDeps{
 			Pool: pgPool,

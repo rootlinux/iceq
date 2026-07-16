@@ -5,11 +5,46 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/iceq/iceq/shared/middleware"
 )
+
+func TestLoginWrongPasswordNeverTriggersPanicWipe(t *testing.T) {
+	src, err := os.ReadFile("login.go")
+	if err != nil {
+		t.Fatalf("read login.go: %v", err)
+	}
+	loginGo := string(src)
+	wrongPasswordStart := strings.Index(loginGo, "if !passwordResult.OK {")
+	if wrongPasswordStart < 0 {
+		t.Fatal("could not locate wrong-password login path")
+	}
+	wrongPasswordEnd := strings.Index(loginGo[wrongPasswordStart:], "// 4. Mint a fresh access + refresh pair")
+	if wrongPasswordEnd < 0 {
+		t.Fatal("could not locate wrong-password login path")
+	}
+	wrongPasswordPath := loginGo[wrongPasswordStart : wrongPasswordStart+wrongPasswordEnd]
+
+	for _, forbidden := range []string{
+		"Wipe",
+		"triggerPanicWipeIfThresholdCrossed",
+		"failedLogin",
+		"PanicWipe",
+		"session_epoch",
+		"file_ownership",
+		"wiped_accounts",
+	} {
+		if strings.Contains(wrongPasswordPath, forbidden) {
+			t.Fatalf("wrong-password login path can trigger remote wipe or mutate protected state via %q", forbidden)
+		}
+	}
+	if !strings.Contains(wrongPasswordPath, `writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid credentials")`) {
+		t.Fatal("wrong-password login path must retain the generic 401 response")
+	}
+}
 
 type recordingMessageStore struct{}
 

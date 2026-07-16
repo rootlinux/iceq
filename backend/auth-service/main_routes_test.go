@@ -31,7 +31,6 @@ func TestStateChangingCookieRoutesRequireCSRF(t *testing.T) {
 		`AllowedHeaders:   []string{"Authorization", "Content-Type", middleware.CSRFHeaderName}`,
 		`r.With(csrfMW).Post("/refresh"`,
 		`rate("auth:logout", 10, time.Minute), csrfMW).Post("/logout"`,
-		`rate("auth:settings:write", 10, time.Minute), csrfMW).Put("/settings"`,
 		`rate("auth:panic-wipe", 3, time.Hour), csrfMW).Post("/panic-wipe"`,
 		`contactRate("contacts:add", 30), middleware.RequireCSRF).Post("/"`,
 		`contactRate("contacts:accept", 30), middleware.RequireCSRF).Put("/{target_uin}/accept"`,
@@ -41,5 +40,26 @@ func TestStateChangingCookieRoutesRequireCSRF(t *testing.T) {
 		if !strings.Contains(mainGo, want) {
 			t.Fatalf("main.go does not contain CSRF route wiring %q", want)
 		}
+	}
+}
+
+func TestRoutesDoNotExposeAutomaticPanicWipeSettings(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	mainGo := string(src)
+
+	for _, forbidden := range []string{
+		`Get("/settings"`,
+		`Put("/settings"`,
+		`Wipe: &panicWipeDeps`,
+	} {
+		if strings.Contains(mainGo, forbidden) {
+			t.Fatalf("main.go still exposes automatic panic-wipe behavior via %q", forbidden)
+		}
+	}
+	if !strings.Contains(mainGo, `r.With(authMW, rate("auth:panic-wipe", 3, time.Hour), csrfMW).Post("/panic-wipe"`) {
+		t.Fatal("manual panic-wipe route must retain access-token auth and CSRF protection")
 	}
 }

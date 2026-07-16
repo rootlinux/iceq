@@ -88,13 +88,6 @@ type LoginDeps struct {
 	// RateLimitSecret keys rotating HMAC buckets. Reusing the already
 	// mandatory high-entropy service secret avoids another operator secret.
 	RateLimitSecret []byte
-	// Wipe is the optional panic-wipe handler. nil disables
-	// the feature entirely; a non-nil value lets the handler
-	// trigger a self-destruct when the user's threshold is
-	// crossed. The wipe is constructed once in main.go and
-	// passed in; the handler itself does not import the
-	// panicwipe package directly.
-	Wipe *PanicWipeDeps
 }
 
 // NewLoginHandler returns the http.HandlerFunc mounted at
@@ -204,21 +197,6 @@ func NewLoginHandler(deps LoginDeps) http.HandlerFunc {
 		// ------------------------------------------------------------
 		passwordResult := verifyPassword(passwordHash, req.Password)
 		if !passwordResult.OK {
-			// Spec (panic-wipe addendum): after a password
-			// mismatch, increment the per-user failed-attempt
-			// counter and, if the user has panic-wipe enabled
-			// AND the threshold is crossed, trigger the wipe.
-			//
-			// The 401 response is byte-identical to a
-			// non-wiping failure (same status, same error
-			// envelope, same body) so an attacker cannot
-			// tell from the response that the wipe fired.
-			// The legitimate user, hitting the threshold
-			// themselves, just sees "invalid email or
-			// password" forever — which is the point.
-			if deps.Wipe != nil {
-				triggerPanicWipeIfThresholdCrossed(ctx, *deps.Wipe, uin)
-			}
 			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid credentials")
 			return
 		}
@@ -229,17 +207,6 @@ func NewLoginHandler(deps LoginDeps) http.HandlerFunc {
 		// `type` claims so the ws-gateway and the /refresh
 		// endpoint can reject cross-type use at the parser.
 		// ------------------------------------------------------------
-		// Reset the failed-login counter on success. A user who
-		// mis-typed their password twice and then succeeded is
-		// back to a clean slate — the counter should not carry
-		// over to the next session. Failure to reset is
-		// non-fatal (we still issue the token); we log so an
-		// operator can correlate a "stuck counter" symptom.
-		if deps.Wipe != nil {
-			if err := resetFailedLoginCounter(ctx, deps.Redis, uin); err != nil {
-				log.Printf("[auth-service] reset failed-login counter: %v", err)
-			}
-		}
 		if passwordResult.NeedsRehash {
 			rehash, err := hashPassword(req.Password)
 			if err != nil {
@@ -325,82 +292,5 @@ func init() {
 		log.Printf("[auth-service] could not pre-compute timing decoy argon2id hash: %v", err)
 	} else {
 		decoyArgon2idHash = h
-	}
-}
-
-// ----------------------------------------------------------------------------
-// Panic-wipe trigger glue. Lives in login.go (not panicwipe.go) so
-// the helper is in the same file as its only caller.
-//
-// triggerPanicWipeIfThresholdCrossed runs the full sequence:
-//
-//  1. INCR the per-user counter (with TTL on first hit).
-//  2. Read the user's security settings.
-//  3. If panic-wipe is enabled AND counter >= threshold, run
-//     PanicWipe().
-//
-// The function never returns an error to its caller; the
-// bcrypt-mismatch path always returns the same 401 to the client
-// regardless of what happened here. We log everything internally.
-// ----------------------------------------------------------------------------
-
-// triggerPanicWipeIfThresholdCrossed is fire-and-forget from the
-// login handler's perspective. It is the implementation of
-// "after a bcrypt mismatch, optionally wipe the account".
-func triggerPanicWipeIfThresholdCrossed(ctx context.Context, deps PanicWipeDeps, uin int64) {
-	// 1. INCR the counter atomically. The script applies the
-	// TTL on the first increment only, so a sustained attack
-	// does not keep the window open indefinitely.
-	//
-	// The script returns the post-increment value but we
-	// intentionally discard it: previously we logged it
-	// (count=%d) on every failed attempt, which leaked the
-	// attempt count to anyone with log read-access. The
-	// threshold check below reads the counter independently
-	// via GET, so the security-critical atomicity of the
-	// INCR+EXPIRE is preserved at the cost of one extra
-	// round trip on the failure path.
-	_, err := failedLoginScriptHandle.Run(
-		ctx,
-		deps.Redis,
-		[]string{loginAttemptsKeyPrefix + itoa(uin)},
-		int(failedAttemptsCounterTTL.Seconds()),
-	).Int64()
-	if err != nil {
-		// Counter unavailable — fail closed. We do NOT
-		// trigger the wipe because the threshold check
-		// would have nothing to compare against. The
-		// counter will be re-attempted on the next failed
-		// login; the rate limiter (5/min/IP) caps the
-		// blast radius of a Redis outage.
-		log.Printf("[auth-service] panicwipe: incr counter: %v", err)
-		return
-	}
-
-	// 2 + 3. Check the threshold and run the wipe if needed.
-	// We do this in one helper rather than two so the read
-	// of the settings row + the wipe call happen with a
-	// consistent view (no race where the threshold is
-	// updated mid-check).
-	if crossed, err := checkPanicWipeThreshold(ctx, deps.Pool, deps.Redis, uin); err != nil {
-		log.Printf("[auth-service] panicwipe: threshold check: %v", err)
-		return
-	} else if !crossed {
-		// Below threshold. No information leaked in the
-		// log line: not the uin, not the count, not the
-		// email, not the source IP. The attacker with
-		// log read-access can observe that *some* failed
-		// login occurred, which is already observable from
-		// the rate-limit metric, but cannot correlate it
-		// to a specific account.
-		log.Printf("[auth-service] failed_login_attempt")
-		return
-	}
-
-	// Threshold crossed. Run the wipe. Errors are logged
-	// but do not propagate to the bcrypt-mismatch handler —
-	// the response is the same 401 either way.
-	if err := PanicWipe(ctx, deps, uin); err != nil {
-		log.Printf("[auth-service] panicwipe: wipe failed: %v", err)
 	}
 }
