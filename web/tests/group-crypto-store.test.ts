@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import "fake-indexeddb/auto";
 import { saveGroupCryptoState, loadGroupCryptoState, pruneObsoleteGroupEpochs } from "../src/lib/groupCryptoStore";
+import { hydrateSenderKeyInbox, GROUP_DISTRIBUTION_KIND } from "../src/lib/groupCrypto";
 
 test("group state is versioned and keyed by group, epoch, and sender", async () => {
   indexedDB.deleteDatabase("iceq");
@@ -9,6 +10,18 @@ test("group state is versioned and keyed by group, epoch, and sender", async () 
   await saveGroupCryptoState(record);
   assert.deepEqual(await loadGroupCryptoState("g", 3, 9, "receiver"), record);
   assert.equal(await loadGroupCryptoState("g", 4, 9, "receiver"), null);
+});
+
+test("offline group open hydrates opaque pairwise distributions before content history", async () => {
+  const distribution = { version:1 as const, distribution_id:"d-offline", group_id:"offline", epoch:4, sender_uin:9, chain_key:"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", iteration:0, signing_public_key:"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI" };
+  const installed = await hydrateSenderKeyInbox("offline",4,[7,9],async()=>[{sender_uin:9,ciphertext:"opaque",msg_type:"signal_message"}],async()=>new TextEncoder().encode(JSON.stringify({kind:GROUP_DISTRIBUTION_KIND,distribution})));
+  assert.equal(installed,1);
+  assert.ok(await loadGroupCryptoState("offline",4,9,"receiver"));
+});
+
+test("offline inbox rejects stale epoch distributions after membership rotation", async () => {
+  const stale = { version:1 as const, distribution_id:"d-stale", group_id:"rotated", epoch:3, sender_uin:9, chain_key:"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", iteration:0, signing_public_key:"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI" };
+  await assert.rejects(()=>hydrateSenderKeyInbox("rotated",4,[7,9],async()=>[{sender_uin:9,ciphertext:"opaque",msg_type:"signal_message"}],async()=>new TextEncoder().encode(JSON.stringify({kind:GROUP_DISTRIBUTION_KIND,distribution:stale}))),/epoch|authorized/);
 });
 
 test("obsolete epochs are removed after decrypt-only grace", async () => {

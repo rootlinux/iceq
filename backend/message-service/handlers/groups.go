@@ -389,6 +389,7 @@ func NewAddGroupMemberHandler(deps GroupsDeps) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not add member")
 			return
 		}
+		_, _ = deps.PG.Exec(ctx, `DELETE FROM sender_key_distributions d WHERE d.group_id=$1 AND d.epoch <> (SELECT crypto_epoch FROM groups WHERE id=$1)`, groupID)
 
 		// Look up the group name for the notification body.
 		// Failure here is non-fatal: the membership row is
@@ -512,6 +513,7 @@ func NewRemoveGroupMemberHandler(deps GroupsDeps) http.HandlerFunc {
 			writeError(w, http.StatusNotFound, "NOT_A_MEMBER", "target user is not a member of this group")
 			return
 		}
+		_, _ = deps.PG.Exec(ctx, `DELETE FROM sender_key_distributions d WHERE d.group_id=$1 AND d.epoch <> (SELECT crypto_epoch FROM groups WHERE id=$1)`, groupID)
 
 		// Count remaining members. If zero, the group is
 		// empty → delete it (CASCADE would also work, but

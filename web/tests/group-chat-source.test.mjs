@@ -14,7 +14,8 @@ test("group chat components exist and reuse the shared chat message list/input",
   const groupChat = read("src/components/Groups/GroupChatWindow.tsx");
   assert.match(groupChat, /<MessageList conversationId=\{`group:\$\{group\.group_id\}`\}/);
   assert.match(groupChat, /<MessageInput groupId=\{group\.group_id\}/);
-  assert.match(groupChat, /historyGroup\(group\.group_id/);
+  assert.match(groupChat, /historyGroup\(groupId/);
+  assert.ok(groupChat.indexOf("getSenderKeyDistributions(groupId)") < groupChat.indexOf("historyGroup(groupId"), "offline sender-key inbox must hydrate before group history");
 });
 
 test("group list opens active group conversations instead of static rows", () => {

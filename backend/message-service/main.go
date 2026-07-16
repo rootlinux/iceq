@@ -267,6 +267,8 @@ func main() {
 		r.With(authMW, groupRate("groups:members:list", 60)).Get("/{group_id}/members", handlers.NewListGroupMembersHandler(groupsDeps))
 		r.With(authMW, groupRate("groups:members:add", 30)).Post("/{group_id}/members", handlers.NewAddGroupMemberHandler(groupsDeps))
 		r.With(authMW, groupRate("groups:members:remove", 30)).Delete("/{group_id}/members/{uin}", handlers.NewRemoveGroupMemberHandler(groupsDeps))
+		r.With(authMW, groupRate("groups:sender-keys:put", 120)).Post("/{group_id}/sender-key-distributions", handlers.NewPutSenderKeyDistributionHandler(groupsDeps))
+		r.With(authMW, groupRate("groups:sender-keys:get", 60)).Get("/{group_id}/sender-key-distributions", handlers.NewGetSenderKeyDistributionsHandler(groupsDeps))
 		r.With(authMW, groupRate("groups:delete", 10)).Delete("/{group_id}", handlers.NewDeleteGroupHandler(groupsDeps))
 	})
 

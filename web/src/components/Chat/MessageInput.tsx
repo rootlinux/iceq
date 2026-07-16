@@ -22,7 +22,7 @@ import { cryptoRandomId } from "../../hooks/useWebSocket";
 import type { Message } from "../../types/models";
 import type { GroupMessagePayload, MessagePayload } from "../../types/envelope";
 import type { Envelope } from "../../types/envelope";
-import { getGroupMembersWithEpoch } from "../../api/groups";
+import { getGroupMembersWithEpoch, putSenderKeyDistribution } from "../../api/groups";
 import { ensureGroupSender, sealGroupContent, encodeGroupCiphertext, GROUP_CONTENT_KIND } from "../../lib/groupCrypto";
 
 interface MessageInputProps {
@@ -109,8 +109,9 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
     try {
       if (isGroup) {
         const roster = await getGroupMembersWithEpoch(groupId);
-        const sender = await ensureGroupSender(groupId, roster.crypto_epoch, selfUin, roster.members.map((m) => m.uin), async (uin, plaintext) => {
+        const sender = await ensureGroupSender(groupId, roster.crypto_epoch, selfUin, roster.members.map((m) => m.uin), async (uin, plaintext, distribution) => {
           const sealedDistribution = await encryptMessage(uin, plaintext);
+          await putSenderKeyDistribution(groupId,{recipient_uin:uin,epoch:roster.crypto_epoch,distribution_id:distribution.distribution_id,ciphertext:sealedDistribution.ciphertext,msg_type:sealedDistribution.msgType});
           const directPayload: MessagePayload = { conversation_id: conversationIdForPair(selfUin,uin), sender_uin:selfUin, to_uin:uin, receiver_uin:uin, content:"", content_type:"text", client_id:cryptoRandomId(), ciphertext:sealedDistribution.ciphertext, msg_type:sealedDistribution.msgType };
           if (!send({type:"message",id:cryptoRandomId(),ts:Date.now(),payload:directPayload})) throw new Error("sender-key distribution transport is unavailable");
         });
@@ -197,7 +198,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         const roster=await getGroupMembersWithEpoch(groupId); const recipients=roster.members.map(m=>m.uin).filter(u=>u!==selfUin);
         groupGrantCleanup={objectKey:uploaded.object_key,recipients:[]};
         for(const recipient of recipients){await grantFileAccess(uploaded.object_key,recipient);groupGrantCleanup.recipients.push(recipient);}
-        const sender=await ensureGroupSender(groupId,roster.crypto_epoch,selfUin,roster.members.map(m=>m.uin),async(uin,plaintext)=>{const sealedDistribution=await encryptMessage(uin,plaintext);const directPayload:MessagePayload={conversation_id:conversationIdForPair(selfUin,uin),sender_uin:selfUin,to_uin:uin,receiver_uin:uin,content:"",content_type:"text",client_id:cryptoRandomId(),ciphertext:sealedDistribution.ciphertext,msg_type:sealedDistribution.msgType};if(!send({type:"message",id:cryptoRandomId(),ts:Date.now(),payload:directPayload}))throw new Error("sender-key distribution transport is unavailable");});
+        const sender=await ensureGroupSender(groupId,roster.crypto_epoch,selfUin,roster.members.map(m=>m.uin),async(uin,plaintext,distribution)=>{const sealedDistribution=await encryptMessage(uin,plaintext);await putSenderKeyDistribution(groupId,{recipient_uin:uin,epoch:roster.crypto_epoch,distribution_id:distribution.distribution_id,ciphertext:sealedDistribution.ciphertext,msg_type:sealedDistribution.msgType});const directPayload:MessagePayload={conversation_id:conversationIdForPair(selfUin,uin),sender_uin:selfUin,to_uin:uin,receiver_uin:uin,content:"",content_type:"text",client_id:cryptoRandomId(),ciphertext:sealedDistribution.ciphertext,msg_type:sealedDistribution.msgType};if(!send({type:"message",id:cryptoRandomId(),ts:Date.now(),payload:directPayload}))throw new Error("sender-key distribution transport is unavailable");});
         const attachment={kind:"iceq.attachment.v1",object_key:uploaded.object_key,manifest:uploaded.manifest};
         const sealed=await sealGroupContent(sender,{kind:GROUP_CONTENT_KIND,content_type:"file",attachment});
         addMessage(convId,{id:clientId,conversation_id:convId,sender_uin:selfUin,receiver_uin:0,plaintext:"",content_type:"file",file_object_key:uploaded.object_key,attachment:{object_key:uploaded.object_key,manifest:uploaded.manifest,name:uploaded.manifest.name??file.name,mime_type:uploaded.manifest.mime_type,size:uploaded.manifest.size},created_at:new Date().toISOString(),state:"sending",is_outgoing:true});
