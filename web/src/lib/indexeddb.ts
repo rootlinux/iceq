@@ -404,25 +404,26 @@ function openDB(): Promise<IDBDatabase> {
   });
 }
 
-interface TransportSeenRecord { status: "processing" | "seen"; claimedAt: number; leaseUntil?: number; expiresAt?: number }
+interface TransportSeenRecord { status: "processing" | "seen"; ownerToken?: string; claimedAt: number; leaseUntil?: number; expiresAt?: number }
 
 /** Atomically claims a stable transport id across tabs and page reloads. */
-export async function claimTransportEnvelopeID(id: string, expiresAt?: number): Promise<boolean> {
-  if (!id) return false;
+export async function claimTransportEnvelopeID(id: string, expiresAt?: number): Promise<string | null> {
+  if (!id) return null;
+	const ownerToken = crypto.randomUUID();
   const db = await openDB();
   try {
-    return await new Promise<boolean>((resolve, reject) => {
+    return await new Promise<string | null>((resolve, reject) => {
       const tx = db.transaction(STORE_TRANSPORT_SEEN, "readwrite");
       const store = tx.objectStore(STORE_TRANSPORT_SEEN);
       const get = store.get(id);
-      let claimed = false;
+	  let claimed: string | null = null;
       get.onsuccess = () => {
         const current = get.result as TransportSeenRecord | undefined;
         const now = Date.now();
         const currentValid = current && (current.expiresAt === undefined || current.expiresAt > now);
         if (currentValid && (current.status === "seen" || (current.leaseUntil ?? 0) > now)) return;
-        store.put({ status: "processing", claimedAt: now, leaseUntil: now + 60_000, ...(expiresAt !== undefined ? { expiresAt } : {}) } satisfies TransportSeenRecord, id);
-        claimed = true;
+		store.put({ status: "processing", ownerToken, claimedAt: now, leaseUntil: now + 60_000, ...(expiresAt !== undefined ? { expiresAt } : {}) } satisfies TransportSeenRecord, id);
+		claimed = ownerToken;
       };
       tx.oncomplete = () => resolve(claimed);
       tx.onerror = () => reject(tx.error ?? new Error("transport seen claim failed"));
@@ -432,18 +433,22 @@ export async function claimTransportEnvelopeID(id: string, expiresAt?: number): 
 }
 
 /** Commits a previously claimed id only after dispatch completed. */
-export async function commitTransportEnvelopeID(id: string): Promise<void> {
+export async function commitTransportEnvelopeID(id: string, ownerToken: string): Promise<boolean> {
   const db = await openDB();
   try {
-    await new Promise<void>((resolve, reject) => {
+	return await new Promise<boolean>((resolve, reject) => {
       const tx = db.transaction(STORE_TRANSPORT_SEEN, "readwrite");
       const store = tx.objectStore(STORE_TRANSPORT_SEEN);
       const get = store.get(id);
-      get.onsuccess = () => {
+	  let committed = false;
+	  get.onsuccess = () => {
         const current = get.result as TransportSeenRecord | undefined;
-        if (current?.status === "processing") store.put({ ...current, status: "seen", leaseUntil: undefined } satisfies TransportSeenRecord, id);
+		if (current?.status === "processing" && current.ownerToken === ownerToken) {
+		  store.put({ ...current, status: "seen", ownerToken: undefined, leaseUntil: undefined } satisfies TransportSeenRecord, id);
+		  committed = true;
+		}
       };
-      tx.oncomplete = () => resolve();
+	  tx.oncomplete = () => resolve(committed);
       tx.onerror = () => reject(tx.error ?? new Error("transport seen commit failed"));
     });
   } finally { db.close(); }
@@ -458,9 +463,22 @@ export async function isTransportEnvelopeCommitted(id: string): Promise<boolean>
   } finally { db.close(); }
 }
 
-export async function releaseTransportEnvelopeID(id: string): Promise<void> {
+export async function releaseTransportEnvelopeID(id: string, ownerToken: string): Promise<boolean> {
   const db = await openDB();
-  try { await idbDelete(db, STORE_TRANSPORT_SEEN, id); } finally { db.close(); }
+	try {
+	  return await new Promise<boolean>((resolve, reject) => {
+		const tx = db.transaction(STORE_TRANSPORT_SEEN, "readwrite");
+		const store = tx.objectStore(STORE_TRANSPORT_SEEN);
+		const get = store.get(id);
+		let released = false;
+		get.onsuccess = () => {
+		  const current = get.result as TransportSeenRecord | undefined;
+		  if (current?.status === "processing" && current.ownerToken === ownerToken) { store.delete(id); released = true; }
+		};
+		tx.oncomplete = () => resolve(released);
+		tx.onerror = () => reject(tx.error ?? new Error("transport seen release failed"));
+	  });
+	} finally { db.close(); }
 }
 
 function idbPut(db: IDBDatabase, store: string, value: unknown, key: IDBValidKey): Promise<void> {

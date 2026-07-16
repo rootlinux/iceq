@@ -3,7 +3,8 @@ import test from "node:test";
 import "fake-indexeddb/auto";
 
 import { MessageTransportCoordinator, TransportInbox, markEnvelopeRetryable } from "../src/hooks/useMessageTransport.ts";
-import { claimTransportEnvelopeID, commitTransportEnvelopeID, isTransportEnvelopeCommitted } from "../src/lib/indexeddb.ts";
+import { persistTransportEnvelope } from "../src/hooks/useWebSocket.ts";
+import { claimTransportEnvelopeID, commitTransportEnvelopeID, isTransportEnvelopeCommitted, releaseTransportEnvelopeID } from "../src/lib/indexeddb.ts";
 import { ApiError, ApiNetworkError } from "../src/api/client.ts";
 
 const raw = (id: string) => JSON.stringify({ type: "message", id, ts: 1, payload: { ciphertext: "opaque" } });
@@ -47,9 +48,10 @@ test("lost advanced poll response resets an invalid cursor and recovers cursorle
   coordinator = new MessageTransportCoordinator({
     poll: poll as never, httpSend: async()=>page1, wsSend:()=>false,
 	consume: async (env) => { if (env.id === page2.id) coordinator.setConnected(true);
-	  if (!await claimTransportEnvelopeID(env.id)) return isTransportEnvelopeCommitted(env.id);
+	  const owner = await claimTransportEnvelopeID(env.id);
+	  if (!owner) return isTransportEnvelopeCommitted(env.id);
 	  delivered.push(env.id);
-	  await commitTransportEnvelopeID(env.id);
+	  await commitTransportEnvelopeID(env.id, owner);
 	  return true; },
     onSendFailure:()=>{}, retryDelayMs:0,
   });
@@ -128,23 +130,54 @@ test("dedupe memory is bounded and evicts oldest IDs", () => {
 
 test("persistent transport seen survives a browser inbox reload", async () => {
   const id = `reload-${Date.now()}-${Math.random()}`;
-  assert.equal(await claimTransportEnvelopeID(id), true);
-  await commitTransportEnvelopeID(id);
+  const owner = await claimTransportEnvelopeID(id);
+	assert.ok(owner);
+	await commitTransportEnvelopeID(id, owner);
 	assert.equal(await isTransportEnvelopeCommitted(id), true);
   // A newly-created receive boundary uses the same IndexedDB claim.
-  assert.equal(await claimTransportEnvelopeID(id), false);
+	assert.equal(await claimTransportEnvelopeID(id), null);
 });
 
 test("concurrent WS and poll claims dispatch one stable message id", async () => {
   const id = `race-${Date.now()}-${Math.random()}`;
   const claims = await Promise.all([claimTransportEnvelopeID(id), claimTransportEnvelopeID(id)]);
-  assert.equal(claims.filter(Boolean).length, 1);
+	assert.equal(claims.filter(Boolean).length, 1);
 });
 
 test("expired persistent seen records are reclaimed", async () => {
   const id = `expires-${Date.now()}-${Math.random()}`;
-  assert.equal(await claimTransportEnvelopeID(id, Date.now() + 5), true);
-  await commitTransportEnvelopeID(id);
+	const firstOwner = await claimTransportEnvelopeID(id, Date.now() + 5);
+	assert.ok(firstOwner);
+	await commitTransportEnvelopeID(id, firstOwner);
   await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(await claimTransportEnvelopeID(id, Date.now() + 1000), true);
+	assert.ok(await claimTransportEnvelopeID(id, Date.now() + 1000));
+});
+
+test("failed real durable dispatch releases claim and remains retryable without seen commit", async () => {
+	const id = `dispatch-failure-${Date.now()}-${Math.random()}`;
+	let acknowledgements = 0;
+	await assert.rejects(() => persistTransportEnvelope(id, undefined, async () => { throw new Error("temporary session unavailable"); }, () => { acknowledgements += 1; }));
+	assert.equal(await isTransportEnvelopeCommitted(id), false);
+	assert.equal(acknowledgements, 0, "WS transport_ack must follow successful durable processing");
+	const owner = await claimTransportEnvelopeID(id);
+	assert.ok(owner, "failed poll/WS dispatch must remain claimable for retry");
+});
+
+test("lease takeover rejects stale owner commit and release without corrupting new owner", async () => {
+	const id = `lease-takeover-${Date.now()}-${Math.random()}`;
+	const realNow = Date.now;
+	let now = realNow();
+	Date.now = () => now;
+	try {
+	  const staleOwner = await claimTransportEnvelopeID(id);
+	  assert.ok(staleOwner);
+	  now += 60_001;
+	  const newOwner = await claimTransportEnvelopeID(id);
+	  assert.ok(newOwner);
+	  assert.notEqual(newOwner, staleOwner);
+	  assert.equal(await commitTransportEnvelopeID(id, staleOwner), false);
+	  assert.equal(await releaseTransportEnvelopeID(id, staleOwner), false);
+	  assert.equal(await commitTransportEnvelopeID(id, newOwner), true);
+	  assert.equal(await isTransportEnvelopeCommitted(id), true);
+	} finally { Date.now = realNow; }
 });

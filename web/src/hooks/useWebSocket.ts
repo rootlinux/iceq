@@ -78,6 +78,25 @@ export interface UseWebSocketResult {
   consumeExternal: (envelope: Envelope) => Promise<boolean>;
 }
 
+/** Shared durable boundary for both WebSocket and poll delivery. */
+export async function persistTransportEnvelope(id: string, expiresAt: number | undefined, dispatchEnvelope: () => Promise<void>, acknowledge?: () => void): Promise<boolean> {
+  const ownerToken = await claimTransportEnvelopeID(id, expiresAt);
+  if (!ownerToken) {
+    const committed = await isTransportEnvelopeCommitted(id);
+    if (committed) acknowledge?.();
+    return committed;
+  }
+  try {
+    await dispatchEnvelope();
+    if (!await commitTransportEnvelopeID(id, ownerToken)) throw new Error("transport claim ownership lost before commit");
+    acknowledge?.();
+    return true;
+  } catch (error) {
+    await releaseTransportEnvelopeID(id, ownerToken);
+    throw error;
+  }
+}
+
 // ----------------------------------------------------------------------------
 // Hook.
 // ----------------------------------------------------------------------------
@@ -351,7 +370,7 @@ export function useWebSocket(): UseWebSocketResult {
         const isGroupMessage = env.type === "group_msg";
         if (!isGroupMessage && (!p.ciphertext || !p.msg_type)) {
           if (__DEV__) console.warn("[ws] message missing ciphertext", p);
-          return;
+		  throw new Error("message missing encrypted payload");
         }
         const senderUin = p.sender_uin;
         try {
@@ -408,10 +427,9 @@ export function useWebSocket(): UseWebSocketResult {
           }
         } catch (e) {
           if (__DEV__) console.error("[ws] decrypt failed:", e);
-          if (env.type === "group_msg") {
-            const gp=p as GroupMessagePayload; const conversationId=`group:${gp.group_id}`;
-            useChatStore.getState().addMessage(conversationId,{id:env.id,conversation_id:conversationId,sender_uin:gp.sender_uin,receiver_uin:0,plaintext:"Security warning: this encrypted group message could not be verified or decrypted.",content_type:"text",created_at:new Date(env.ts).toISOString(),state:"failed",is_outgoing:false});
-          }
+		  // Crypto/session/roster/epoch failures are retryable transport
+		  // failures. Do not commit seen state or ACK/delete the ciphertext.
+		  throw e;
         }
         return;
       }
@@ -457,29 +475,11 @@ export function useWebSocket(): UseWebSocketResult {
       const seconds = Number((env.payload as { expires_in_seconds?: number } | null)?.expires_in_seconds ?? 0);
       const expiresAt = Number.isFinite(seconds) && seconds > 0 ? env.ts + seconds * 1000 : undefined;
       try {
-        const claimed = await claimTransportEnvelopeID(env.id, expiresAt);
-		if (!claimed) {
-		  // A committed duplicate means a prior transport ACK may have been
-		  // lost. Re-ACK it, but never ACK another tab's active processing lease.
-		  const committed = await isTransportEnvelopeCommitted(env.id);
-		  if (ws && committed) {
-			safeSend(ws, {type: "transport_ack", id: crypto.randomUUID(), ts: Date.now(), payload: {message_ids: [env.id]}});
-		  }
-		  return committed;
-		}
-        try {
+		const committed = await persistTransportEnvelope(env.id, expiresAt, async () => {
           setLastEnvelope(env);
           await dispatchRef.current(env, ws);
-          await commitTransportEnvelopeID(env.id);
-		  if (ws) {
-			safeSend(ws, {type: "transport_ack", id: crypto.randomUUID(), ts: Date.now(), payload: {message_ids: [env.id]}});
-		  }
-		  return true;
-        } catch (error) {
-          await releaseTransportEnvelopeID(env.id);
-          if (__DEV__) console.error("[ws] persistent dispatch failed", error);
-		  throw error;
-        }
+		}, ws ? () => { safeSend(ws, {type: "transport_ack", id: crypto.randomUUID(), ts: Date.now(), payload: {message_ids: [env.id]}}); } : undefined);
+		return committed;
       } finally {
         inflightPersistentIDsRef.current.delete(env.id);
       }
