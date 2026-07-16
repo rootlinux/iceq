@@ -547,9 +547,6 @@ func handleGroupMessage(_ *natsclient.Client, ms *store.MessageStore, pg *pgxpoo
 	if pg == nil || authorizeGroupMessageEpoch(ctxAuth, pg, groupIDStr, p.SenderUIN, p.CryptoEpoch) != nil {
 		return
 	}
-	ciphertext := p.Ciphertext
-	msgType := p.MsgType
-
 	id, err := gocql.ParseUUID(env.ID)
 	if err != nil {
 		id = gocql.UUIDFromTime(time.Now().UTC())
@@ -567,15 +564,20 @@ func handleGroupMessage(_ *natsclient.Client, ms *store.MessageStore, pg *pgxpoo
 	// bytes). The privacy contract is that these bytes
 	// never appear in a log line — see
 	// store/messagestore.go.
-	if err := ms.SaveGroupMessage(ctx, store.SaveGroupRequest{
-		GroupID:    groupID,
-		ID:         id,
-		SenderUIN:  p.SenderUIN,
-		Ciphertext: ciphertext,
-		MsgType:    msgType,
-		CreatedAt:  createdAt,
-	}); err != nil {
+	if err := ms.SaveGroupMessage(ctx, newSaveGroupRequest(groupID, id, p, createdAt)); err != nil {
 		log.Printf("[message-service] save group message: %v", err)
+	}
+}
+
+func newSaveGroupRequest(groupID, id gocql.UUID, p models.GroupMessagePayload, createdAt time.Time) store.SaveGroupRequest {
+	return store.SaveGroupRequest{
+		GroupID:     groupID,
+		ID:          id,
+		SenderUIN:   p.SenderUIN,
+		CryptoEpoch: p.CryptoEpoch,
+		Ciphertext:  p.Ciphertext,
+		MsgType:     p.MsgType,
+		CreatedAt:   createdAt,
 	}
 }
 

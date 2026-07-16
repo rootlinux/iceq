@@ -100,12 +100,13 @@ type SaveRequest struct {
 // is a gocql.UUID; the wire form (in JSON envelopes) is a
 // canonical 36-char string and we convert at the boundary.
 type SaveGroupRequest struct {
-	GroupID    gocql.UUID
-	ID         gocql.UUID
-	SenderUIN  int64
-	Ciphertext []byte
-	MsgType    string
-	CreatedAt  time.Time
+	GroupID     gocql.UUID
+	ID          gocql.UUID
+	SenderUIN   int64
+	CryptoEpoch int64
+	Ciphertext  []byte
+	MsgType     string
+	CreatedAt   time.Time
 }
 
 // HistoryRequest is the input to GetHistory. The Before
@@ -151,12 +152,13 @@ type MessageRow struct {
 // recipient list is implicit (every group member at the
 // moment of delivery).
 type GroupMessageRow struct {
-	GroupID    gocql.UUID
-	CreatedAt  time.Time
-	ID         gocql.UUID
-	SenderUIN  int64
-	Ciphertext []byte
-	MsgType    string
+	GroupID     gocql.UUID
+	CreatedAt   time.Time
+	ID          gocql.UUID
+	SenderUIN   int64
+	CryptoEpoch int64
+	Ciphertext  []byte
+	MsgType     string
 }
 
 // ----------------------------------------------------------------------------
@@ -294,14 +296,15 @@ func (m *MessageStore) SaveGroupMessage(ctx context.Context, req SaveGroupReques
 	batch.SetConsistency(gocql.Quorum)
 	if m.ttl > 0 {
 		const q = `INSERT INTO iceq.group_messages
-		  (group_id, created_at, id, sender_uin, ciphertext, msg_type)
-		  VALUES (?, ?, ?, ?, ?, ?)
+		  (group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type)
+		  VALUES (?, ?, ?, ?, ?, ?, ?)
 		  USING TTL ?`
 		batch.Query(q,
 			req.GroupID,
 			req.CreatedAt,
 			req.ID,
 			req.SenderUIN,
+			req.CryptoEpoch,
 			req.Ciphertext,
 			req.MsgType,
 			int(m.ttl.Seconds()),
@@ -310,13 +313,14 @@ func (m *MessageStore) SaveGroupMessage(ctx context.Context, req SaveGroupReques
 		return m.session.ExecuteBatch(batch)
 	}
 	const q = `INSERT INTO iceq.group_messages
-	  (group_id, created_at, id, sender_uin, ciphertext, msg_type)
-	  VALUES (?, ?, ?, ?, ?, ?)`
+	  (group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type)
+	  VALUES (?, ?, ?, ?, ?, ?, ?)`
 	batch.Query(q,
 		req.GroupID,
 		req.CreatedAt,
 		req.ID,
 		req.SenderUIN,
+		req.CryptoEpoch,
 		req.Ciphertext,
 		req.MsgType,
 	)
@@ -415,7 +419,7 @@ func (m *MessageStore) GetGroupHistory(ctx context.Context, req GroupHistoryRequ
 		before = time.Now().Add(time.Second)
 	}
 
-	const q = `SELECT group_id, created_at, id, sender_uin, ciphertext, msg_type
+	const q = `SELECT group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type
 	  FROM iceq.group_messages
 	  WHERE group_id = ? AND created_at < ?
 	  ORDER BY created_at DESC
@@ -435,6 +439,7 @@ func (m *MessageStore) GetGroupHistory(ctx context.Context, req GroupHistoryRequ
 			&row.CreatedAt,
 			&row.ID,
 			&row.SenderUIN,
+			&row.CryptoEpoch,
 			&row.Ciphertext,
 			&row.MsgType,
 		) {

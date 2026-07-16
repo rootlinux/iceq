@@ -86,6 +86,7 @@ type historyMessage struct {
 	GroupID        string    `json:"group_id,omitempty"`
 	SenderUIN      int64     `json:"sender_uin"`
 	ReceiverUIN    int64     `json:"receiver_uin,omitempty"`
+	CryptoEpoch    *int64    `json:"crypto_epoch,omitempty"`
 	ContentType    string    `json:"content_type"`
 	Ciphertext     string    `json:"ciphertext"`
 	MsgType        string    `json:"msg_type"`
@@ -304,10 +305,12 @@ func dmRowToMessage(convID, groupID string, row any) historyMessage {
 // receiver_uin or status field.
 func groupRowToMessage(convID, groupID string, row any) historyMessage {
 	r := row.(store.GroupMessageRow)
+	cryptoEpoch := r.CryptoEpoch
 	return historyMessage{
 		ID:          r.ID.String(),
 		GroupID:     groupID,
 		SenderUIN:   r.SenderUIN,
+		CryptoEpoch: &cryptoEpoch,
 		ContentType: "text",
 		Ciphertext:  base64.RawURLEncoding.EncodeToString(r.Ciphertext),
 		MsgType:     r.MsgType,

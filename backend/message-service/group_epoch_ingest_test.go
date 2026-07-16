@@ -5,11 +5,28 @@ import (
 	"errors"
 	"github.com/jackc/pgx/v5"
 	"testing"
+	"time"
+
+	"github.com/gocql/gocql"
+	"github.com/iceq/iceq/shared/models"
 )
 
 type epochDB struct {
 	row  pgx.Row
 	args []any
+}
+
+func TestGroupMessagePersistenceRequestCarriesAuthenticatedEpoch(t *testing.T) {
+	groupID := gocql.TimeUUID()
+	messageID := gocql.TimeUUID()
+	createdAt := time.Now().UTC()
+	payload := models.GroupMessagePayload{
+		SenderUIN: 42, CryptoEpoch: 9, Ciphertext: []byte("opaque"), MsgType: "group_ciphertext",
+	}
+	req := newSaveGroupRequest(groupID, messageID, payload, createdAt)
+	if req.CryptoEpoch != 9 || req.SenderUIN != 42 || string(req.Ciphertext) != "opaque" {
+		t.Fatalf("persistence request lost authenticated payload fields: %#v", req)
+	}
 }
 
 func (d *epochDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {

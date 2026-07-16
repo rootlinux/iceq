@@ -41,6 +41,7 @@ CREATE TABLE iceq.group_messages (
   created_at       TIMESTAMP,
   id               UUID,
   sender_uin       BIGINT,
+  crypto_epoch     BIGINT,
   content          TEXT,
   content_type     TEXT,
   file_url         TEXT,
