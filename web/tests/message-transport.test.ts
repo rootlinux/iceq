@@ -3,7 +3,7 @@ import test from "node:test";
 import "fake-indexeddb/auto";
 
 import { MessageTransportCoordinator, TransportInbox, markEnvelopeRetryable } from "../src/hooks/useMessageTransport.ts";
-import { persistTransportEnvelope } from "../src/hooks/useWebSocket.ts";
+import { persistTransportEnvelope, processEncryptedEnvelopeForDispatch, type EncryptedDispatchDeps } from "../src/hooks/useWebSocket.ts";
 import { claimTransportEnvelopeID, commitTransportEnvelopeID, isTransportEnvelopeCommitted, releaseTransportEnvelopeID } from "../src/lib/indexeddb.ts";
 import { ApiError, ApiNetworkError } from "../src/api/client.ts";
 
@@ -180,4 +180,34 @@ test("lease takeover rejects stale owner commit and release without corrupting n
 	  assert.equal(await commitTransportEnvelopeID(id, newOwner), true);
 	  assert.equal(await isTransportEnvelopeCommitted(id), true);
 	} finally { Date.now = realNow; }
+});
+
+test("production encrypted dispatch failures stay retryable for WS and poll", async () => {
+	const direct = (id: string) => ({type:"message",id,ts:1,payload:{sender_uin:7,receiver_uin:42,ciphertext:"opaque",msg_type:"signal_message",content_type:"text"}} as never);
+	const group = (id: string, epoch=3) => ({type:"group_msg",id,ts:1,payload:{group_id:"g1",sender_uin:7,ciphertext:"opaque",msg_type:"sender_key_message",content_type:"text",crypto_epoch:epoch}} as never);
+	const baseline = (): EncryptedDispatchDeps => ({
+	  decryptDirect: async()=>new TextEncoder().encode("ok"), processDirectControl:async()=>false,
+	  groupRouting:()=>({cryptoEpoch:3,members:[7,42]}), decryptGroup:async()=>({plaintext:"ok",contentType:"text"}), skipOutgoingGroup:()=>false,
+	});
+	const cases: Array<{name:string; envelope:any; deps:EncryptedDispatchDeps}> = [
+	  {name:"direct decrypt rejection", envelope:direct("direct-reject"), deps:{...baseline(),decryptDirect:async()=>{throw new Error("authentication failed");}}},
+	  {name:"missing direct session", envelope:direct("missing-session"), deps:{...baseline(),decryptDirect:async()=>{throw new Error("no signal session");}}},
+	  {name:"group roster missing", envelope:group("missing-roster"), deps:{...baseline(),groupRouting:()=>({cryptoEpoch:3,members:[]})}},
+	  {name:"group epoch mismatch", envelope:group("epoch-mismatch",4), deps:baseline()},
+	];
+	for (const tc of cases) {
+	  const id = `${tc.envelope.id}-${Date.now()}-${Math.random()}`;
+	  tc.envelope.id = id;
+	  let acknowledgements = 0;
+	  const pollConsume = async (): Promise<boolean> => {
+		try {
+		  await persistTransportEnvelope(id, undefined, async()=>{ await processEncryptedEnvelopeForDispatch(tc.envelope,tc.deps); },()=>{acknowledgements+=1;});
+		  return true;
+		} catch { return false; }
+	  };
+	  assert.equal(await pollConsume(), false, `${tc.name}: poll must retain predecessor cursor`);
+	  assert.equal(await isTransportEnvelopeCommitted(id), false, `${tc.name}: seen must remain false`);
+	  assert.equal(acknowledgements, 0, `${tc.name}: WS ACK must not be sent`);
+	  assert.ok(await claimTransportEnvelopeID(id), `${tc.name}: envelope must remain retryable`);
+	}
 });

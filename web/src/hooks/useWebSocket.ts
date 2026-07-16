@@ -78,6 +78,43 @@ export interface UseWebSocketResult {
   consumeExternal: (envelope: Envelope) => Promise<boolean>;
 }
 
+export interface EncryptedDispatchDeps {
+  decryptDirect: (senderUin: number, ciphertext: string, msgType: "prekey_message" | "signal_message") => Promise<Uint8Array>;
+  processDirectControl: (senderUin: number, plaintext: Uint8Array) => Promise<boolean>;
+  groupRouting: (groupID: string) => { cryptoEpoch: number; members: number[] } | null;
+  decryptGroup: (payload: GroupMessagePayload, routing: { cryptoEpoch: number; members: number[] }) => Promise<{ plaintext: string; contentType: "text" | "image" | "file" }>;
+  skipOutgoingGroup: (payload: GroupMessagePayload) => boolean;
+}
+
+export interface EncryptedDispatchResult {
+  plaintext: string;
+  contentType: "text" | "image" | "file";
+  senderUin: number;
+  conversationID: string;
+  payload: MessagePayload | GroupMessagePayload;
+}
+
+/** Testable production decrypt/routing decision used by both WS and poll. */
+export async function processEncryptedEnvelopeForDispatch(env: Envelope, deps: EncryptedDispatchDeps): Promise<EncryptedDispatchResult | null> {
+  if (env.type !== "message" && env.type !== "group_msg") throw new Error("encrypted dispatch requires a message envelope");
+  const payload = env.payload as MessagePayload | GroupMessagePayload;
+  const senderUin = payload.sender_uin;
+  if (env.type === "message") {
+    const direct = payload as MessagePayload;
+    if (!direct.ciphertext || !direct.msg_type) throw new Error("message missing encrypted payload");
+    const bytes = await deps.decryptDirect(senderUin, direct.ciphertext, direct.msg_type as "prekey_message" | "signal_message");
+    if (await deps.processDirectControl(senderUin, bytes)) return null;
+    return { plaintext: new TextDecoder().decode(bytes), contentType: direct.content_type, senderUin, conversationID: conversationIdForPair(senderUin, direct.receiver_uin), payload: direct };
+  }
+  const groupPayload = payload as GroupMessagePayload;
+  if (deps.skipOutgoingGroup(groupPayload)) return null;
+  const routing = deps.groupRouting(groupPayload.group_id);
+  if (!routing || routing.members.length === 0) throw new Error("group routing roster is unavailable");
+  if (groupPayload.crypto_epoch !== routing.cryptoEpoch) throw new Error("group routing epoch mismatch");
+  const opened = await deps.decryptGroup(groupPayload, routing);
+  return { plaintext: opened.plaintext, contentType: opened.contentType, senderUin, conversationID: `group:${groupPayload.group_id}`, payload: groupPayload };
+}
+
 /** Shared durable boundary for both WebSocket and poll delivery. */
 export async function persistTransportEnvelope(id: string, expiresAt: number | undefined, dispatchEnvelope: () => Promise<void>, acknowledge?: () => void): Promise<boolean> {
   const ownerToken = await claimTransportEnvelopeID(id, expiresAt);
@@ -361,56 +398,42 @@ export function useWebSocket(): UseWebSocketResult {
       }
       case "message":
       case "group_msg": {
-        const p = env.payload as MessagePayload | GroupMessagePayload;
-        // We must decrypt the ciphertext to populate
-        // `plaintext`. If the user doesn't have a Signal
-        // session yet (e.g. they were wiped mid-stream),
-        // the decrypt throws and the message is dropped
-        // with a console error.
-        const isGroupMessage = env.type === "group_msg";
-        if (!isGroupMessage && (!p.ciphertext || !p.msg_type)) {
-          if (__DEV__) console.warn("[ws] message missing ciphertext", p);
-		  throw new Error("message missing encrypted payload");
-        }
-        const senderUin = p.sender_uin;
         try {
-          const decoder = new TextDecoder();
-          let plaintext:string;
-          let authenticatedContentType=p.content_type;
-          if (isGroupMessage) {
-            const gp=p as GroupMessagePayload;
-            if(selfUin!==null&&senderUin===selfUin&&gp.client_id&&useChatStore.getState().messagesByConversation[`group:${gp.group_id}`]?.some(m=>m.id===gp.client_id)) return;
-            const group=useGroupStore.getState().groups.find(g=>g.group_id===gp.group_id);
-            const members=(useGroupStore.getState().members[gp.group_id]??[]).map(m=>m.uin);
-            if(!group)throw new Error("group routing state is unavailable");
-            if(gp.crypto_epoch!==group.crypto_epoch)throw new Error("group routing epoch mismatch");
-            const content=await openGroupContent(decodeGroupCiphertext(gp.ciphertext??""),group.crypto_epoch,members,false,Date.now(),{group_id:gp.group_id,sender_uin:senderUin,epoch:gp.crypto_epoch});
-            ({plaintext,content_type:authenticatedContentType}=authenticatedGroupMessageFields(content,p.content_type));
-          } else {
-            const bytes=await decryptMessage(senderUin,p.ciphertext??"",p.msg_type as "prekey_message"|"signal_message");
-            plaintext=decoder.decode(bytes);
-            if(await processDirectControlMessage(senderUin,bytes,async(gid)=>{
+		  const processed = await processEncryptedEnvelopeForDispatch(env, {
+			decryptDirect: decryptMessage,
+			processDirectControl: (senderUin, bytes) => processDirectControlMessage(senderUin, bytes, async(gid)=>{
                 let group=useGroupStore.getState().groups.find(g=>g.group_id===gid);
                 const roster=await getGroupMembersWithEpoch(gid);
                 useGroupStore.getState().setMembers(gid,roster.members);
                 if(group){group={...group,crypto_epoch:roster.crypto_epoch};useGroupStore.setState(s=>({groups:s.groups.map(g=>g.group_id===gid?group!:g)}));}
                 return {epoch:roster.crypto_epoch,members:roster.members.map(m=>m.uin)};
-            }))return;
-          }
-          const conversationId = env.type === "message"
-            ? conversationIdForPair(senderUin, (p as MessagePayload).receiver_uin)
-            : `group:${(p as GroupMessagePayload).group_id}`;
+			}),
+			groupRouting: (groupID) => {
+			  const group=useGroupStore.getState().groups.find(g=>g.group_id===groupID);
+			  if (!group) return null;
+			  return {cryptoEpoch: group.crypto_epoch, members:(useGroupStore.getState().members[groupID]??[]).map(m=>m.uin)};
+			},
+			decryptGroup: async (gp, routing) => {
+			  const p=gp;
+			  const content=await openGroupContent(decodeGroupCiphertext(gp.ciphertext??""),routing.cryptoEpoch,routing.members,false,Date.now(),{group_id:gp.group_id,sender_uin:gp.sender_uin,epoch:gp.crypto_epoch});
+			  const fields=authenticatedGroupMessageFields(content,p.content_type);
+			  return {plaintext:fields.plaintext,contentType:fields.content_type};
+			},
+			skipOutgoingGroup: (gp) => selfUin!==null&&gp.sender_uin===selfUin&&Boolean(gp.client_id)&&Boolean(useChatStore.getState().messagesByConversation[`group:${gp.group_id}`]?.some(m=>m.id===gp.client_id)),
+		  });
+		  if (!processed) return;
+		  const authenticatedContentType=processed.contentType;
           const message: Message = {
-            id: selfUin !== null && senderUin === selfUin && p.client_id ? p.client_id : env.id,
-            conversation_id: conversationId,
-            sender_uin: senderUin,
-            receiver_uin: env.type === "message" ? (p as MessagePayload).receiver_uin : 0,
-            plaintext,
-            content_type: authenticatedContentType,
-            ...(p.file_url ? { file_url: p.file_url } : {}),
+			id: selfUin !== null && processed.senderUin === selfUin && processed.payload.client_id ? processed.payload.client_id : env.id,
+			conversation_id: processed.conversationID,
+			sender_uin: processed.senderUin,
+			receiver_uin: env.type === "message" ? (processed.payload as MessagePayload).receiver_uin : 0,
+			plaintext: processed.plaintext,
+			content_type: authenticatedContentType,
+			...(processed.payload.file_url ? { file_url: processed.payload.file_url } : {}),
             created_at: new Date(env.ts).toISOString(),
             state: "delivered",
-            is_outgoing: selfUin !== null && senderUin === selfUin,
+            is_outgoing: selfUin !== null && processed.senderUin === selfUin,
           };
           const chatState = useChatStore.getState();
           chatState.addMessage(message.conversation_id, message);
