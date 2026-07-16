@@ -13,6 +13,8 @@ export class LocalCleanupError extends Error {
 const memoryResetters = new Set<() => void>();
 const objectUrls = new Set<string>();
 const ICEQ_CACHE_PREFIX = "iceq-static-";
+export const ICEQ_LOGGED_OUT_MARKER_KEY = "iceq_logged_out";
+const LEGACY_ICEQ_DATABASES = ["iceq-signal", "iceq-messages", "iceq-keys"] as const;
 
 export function registerMemoryReset(reset: () => void): () => void {
   memoryResetters.add(reset);
@@ -27,20 +29,31 @@ function isIceQStorageKey(key: string): boolean {
   return key.startsWith("iceq_") || key.startsWith("iceq:") || key.startsWith("iceq-");
 }
 
-function clearStorage(storage: Storage | undefined): void {
+function clearStorage(storage: Storage | undefined, preserved = new Set<string>()): void {
   if (!storage) return;
   for (let index = storage.length - 1; index >= 0; index -= 1) {
     const key = storage.key(index);
-    if (key && isIceQStorageKey(key)) storage.removeItem(key);
+    if (key && isIceQStorageKey(key) && !preserved.has(key)) storage.removeItem(key);
   }
 }
 
-async function deleteIceQDatabase(): Promise<void> {
+async function iceQDatabaseNames(): Promise<string[]> {
+  const fallback = [ICEQ_INDEXEDDB_NAME, ...LEGACY_ICEQ_DATABASES];
+  if (typeof indexedDB === "undefined" || !indexedDB.databases) return fallback;
+  try {
+    const databases = await indexedDB.databases();
+    return [...new Set([ICEQ_INDEXEDDB_NAME, ...databases.flatMap((db) => db.name && (db.name === ICEQ_INDEXEDDB_NAME || db.name.startsWith("iceq-")) ? [db.name] : [])])];
+  } catch {
+    return fallback;
+  }
+}
+
+async function deleteIceQDatabase(name: string): Promise<void> {
   if (typeof indexedDB === "undefined") return;
   await new Promise<void>((resolve, reject) => {
     let request: IDBOpenDBRequest;
     try {
-      request = indexedDB.deleteDatabase(ICEQ_INDEXEDDB_NAME);
+      request = indexedDB.deleteDatabase(name);
     } catch (error) {
       reject(error);
       return;
@@ -62,7 +75,7 @@ export async function clearAllIceQLocalData(_reason: CleanupReason): Promise<voi
     for (const url of objectUrls) await capture("object-urls", () => URL.revokeObjectURL(url));
     objectUrls.clear();
   }
-  await capture("local-storage", () => clearStorage(typeof localStorage === "undefined" ? undefined : localStorage));
+  await capture("local-storage", () => clearStorage(typeof localStorage === "undefined" ? undefined : localStorage, new Set([ICEQ_LOGGED_OUT_MARKER_KEY])));
   await capture("session-storage", () => clearStorage(typeof sessionStorage === "undefined" ? undefined : sessionStorage));
   await capture("service-worker", async () => {
     if (typeof navigator === "undefined" || !navigator.serviceWorker?.getRegistrations) return;
@@ -81,7 +94,10 @@ export async function clearAllIceQLocalData(_reason: CleanupReason): Promise<voi
       if (!await caches.delete(name)) throw new Error(`Cache deletion failed: ${name}`);
     }));
   });
-  await capture("indexeddb", deleteIceQDatabase);
+  if (typeof indexedDB !== "undefined") {
+    const databaseNames = await iceQDatabaseNames();
+    for (const name of databaseNames) await capture("indexeddb", () => deleteIceQDatabase(name));
+  }
 
   if (failures.length > 0) throw new LocalCleanupError(failures);
 }

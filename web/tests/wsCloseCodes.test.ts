@@ -48,6 +48,6 @@ test("clearLocalState removes IceQ localStorage keys and deletes the real IceQ I
   await Promise.resolve(clearLocalState());
 
   assert.deepEqual(removedKeys.sort(), ["iceq_access_token", "iceq_ios_hint_shown"]);
-  assert.deepEqual(deletedDatabases, [ICEQ_INDEXEDDB_NAME]);
+  assert.deepEqual(deletedDatabases, [ICEQ_INDEXEDDB_NAME, "iceq-signal", "iceq-messages", "iceq-keys"]);
   assert.equal(storage.has("other_app"), true);
 });

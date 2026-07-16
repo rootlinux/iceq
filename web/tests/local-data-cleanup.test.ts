@@ -25,7 +25,7 @@ function storage(values: Record<string, string>) {
 }
 
 test("clears every IceQ-owned browser and registered in-memory state without touching other apps", async () => {
-  const local = storage({ iceq_access_token: "secret", iceq_privacy_settings: "{}", other_app: "keep" });
+  const local = storage({ iceq_access_token: "secret", iceq_privacy_settings: "{}", iceq_logged_out: "1", other_app: "keep" });
   const session = storage({ "iceq:transport": "secret", unrelated: "keep" });
   const deletedDatabases: string[] = [];
   const deletedCaches: string[] = [];
@@ -37,6 +37,7 @@ test("clears every IceQ-owned browser and registered in-memory state without tou
     localStorage: { configurable: true, value: local.api },
     sessionStorage: { configurable: true, value: session.api },
     indexedDB: { configurable: true, value: {
+      async databases() { return [{ name: ICEQ_INDEXEDDB_NAME }, { name: "iceq-signal" }, { name: "other-db" }]; },
       deleteDatabase(name: string) {
         deletedDatabases.push(name);
         const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null };
@@ -63,12 +64,12 @@ test("clears every IceQ-owned browser and registered in-memory state without tou
   await clearAllIceQLocalData("logout");
   unregister();
 
-  assert.deepEqual(deletedDatabases, [ICEQ_INDEXEDDB_NAME, ICEQ_INDEXEDDB_NAME]);
+  assert.deepEqual(deletedDatabases, [ICEQ_INDEXEDDB_NAME, "iceq-signal", ICEQ_INDEXEDDB_NAME, "iceq-signal"]);
   assert.deepEqual(deletedCaches, ["iceq-static-v3", "iceq-static-v2", "iceq-static-v3", "iceq-static-v2"]);
   assert.deepEqual(revokedUrls, ["blob:iceq-secret"]);
   assert.deepEqual(unregisteredWorkers, ["https://iceq.test/sw.js", "https://iceq.test/sw.js"]);
   assert.equal(resets, 2);
-  assert.deepEqual([...local.entries], [["other_app", "keep"]]);
+  assert.deepEqual([...local.entries], [["iceq_logged_out", "1"], ["other_app", "keep"]]);
   assert.deepEqual([...session.entries], [["unrelated", "keep"]]);
 });
 
@@ -86,7 +87,7 @@ test("rejects a typed aggregate error when mandatory IndexedDB deletion fails", 
 
   await assert.rejects(
     clearAllIceQLocalData("panic-wipe"),
-    (error: unknown) => error instanceof LocalCleanupError && error.failures.some((failure) => failure.area === "indexeddb"),
+    (error: unknown) => error instanceof LocalCleanupError && error.failures.filter((failure) => failure.area === "indexeddb").length === 4,
   );
 });
 

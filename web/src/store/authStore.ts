@@ -15,7 +15,7 @@ import { tokenStore } from "../api/client";
 import * as authApi from "../api/auth";
 import type { UserPublic } from "../api/auth";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
-import { clearAllIceQLocalData, registerMemoryReset, type CleanupReason } from "../lib/localDataCleanup";
+import { clearAllIceQLocalData, ICEQ_LOGGED_OUT_MARKER_KEY, registerMemoryReset, type CleanupReason } from "../lib/localDataCleanup";
 
 const ACCOUNT_UIN_KEY = "iceq_account_uin";
 
@@ -92,6 +92,8 @@ export const useAuthStore = create<AuthState>((set) => ({
           // will have already routed us back to /login if
           // appropriate. Nothing more to do here.
         });
+		} else if (localStorage.getItem(ICEQ_LOGGED_OUT_MARKER_KEY) === "1") {
+			set({ hydrated: true });
 		} else {
 			void authApi
 				.refresh()
@@ -122,6 +124,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
 		if (previousUin !== null && previousUin !== resp.user.uin) await cleanSession("account-change");
 		tokenStore.set(resp.tokens.access_token, resp.tokens.refresh_token);
+		localStorage.removeItem(ICEQ_LOGGED_OUT_MARKER_KEY);
 		rememberAccountUin(resp.user.uin);
 		set({
 			uin: resp.user.uin,
@@ -141,6 +144,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
 		if (previousUin !== null && previousUin !== resp.user.uin) await cleanSession("account-change");
 		tokenStore.set(resp.tokens.access_token, resp.tokens.refresh_token);
+		localStorage.removeItem(ICEQ_LOGGED_OUT_MARKER_KEY);
 		rememberAccountUin(resp.user.uin);
 		set({
 			uin: resp.user.uin,
@@ -164,19 +168,26 @@ export const useAuthStore = create<AuthState>((set) => ({
 			await attachmentGrantLifecycle.revokeAll();
 			try { await cleanSession("logout", false); } finally {
 				set(EMPTY_AUTH);
+				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
 			}
 		}
 	},
 
 	panicWipe: async () => {
 		try { await authApi.panicWipe(); } finally {
-			try { await cleanSession("panic-wipe"); } finally { set(EMPTY_AUTH); }
+			try { await cleanSession("panic-wipe"); } finally {
+				set(EMPTY_AUTH);
+				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
+			}
 		}
 	},
 
 	expireSession: async () => {
 		try { await authApi.logout(); } catch { /* best-effort revocation */ } finally {
-			try { await cleanSession("auth-expired"); } finally { set(EMPTY_AUTH); }
+			try { await cleanSession("auth-expired"); } finally {
+				set(EMPTY_AUTH);
+				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
+			}
 		}
 	},
 
@@ -184,6 +195,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
 		if (previousUin !== null && previousUin !== user.uin) await cleanSession("account-change");
 		tokenStore.set(access, refresh);
+		localStorage.removeItem(ICEQ_LOGGED_OUT_MARKER_KEY);
 		rememberAccountUin(user.uin);
     set({
 			uin: user.uin,

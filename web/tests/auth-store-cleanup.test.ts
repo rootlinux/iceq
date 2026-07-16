@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 test("logout attempts server revocation before clearing every local account state", async () => {
-  const values = new Map<string, string>([["iceq_access_token", "token"], ["iceq_privacy_settings", "secret"]]);
+  const values = new Map<string, string>([["iceq_access_token", "token"], ["iceq_privacy_settings", "secret"], ["iceq_account_uin", "7"]]);
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
     get length() { return values.size; }, key(index: number) { return [...values.keys()][index] ?? null; },
     getItem(key: string) { return values.get(key) ?? null; }, setItem(key: string, value: string) { values.set(key, value); },
@@ -11,14 +11,19 @@ test("logout attempts server revocation before clearing every local account stat
   Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: { length: 0, key: () => null, removeItem() {} } });
   Object.defineProperty(globalThis, "caches", { configurable: true, value: undefined });
   let deleteCount = 0;
-  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: { deleteDatabase() {
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: { async databases() { return [{ name: "iceq" }]; }, deleteDatabase() {
     const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null };
     queueMicrotask(() => { deleteCount += 1; request.onsuccess?.(); });
     return request;
   } } });
   let serverSawLocalState = false;
-  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async () => {
+  let fetchCount = 0;
+  let failPanicWipe = false;
+  let panicDeleteCountAtCall = -1;
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
+    fetchCount += 1;
     serverSawLocalState = values.has("iceq_privacy_settings") && deleteCount === 0;
+    if (failPanicWipe && String(input).includes("panic-wipe")) { panicDeleteCountAtCall = deleteCount; return new Response("failed", { status: 500 }); }
     return new Response(null, { status: 204 });
   } });
 
@@ -29,11 +34,24 @@ test("logout attempts server revocation before clearing every local account stat
   assert.equal(serverSawLocalState, true);
   assert.equal(deleteCount, 1);
   assert.equal(values.has("iceq_privacy_settings"), false);
+  assert.equal(values.get("iceq_logged_out"), "1");
+  assert.equal(values.has("iceq_account_uin"), false);
   assert.equal(useAuthStore.getState().isAuthenticated, false);
+  const countBeforeHydrate = fetchCount;
+  useAuthStore.getState().hydrate();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(fetchCount, countBeforeHydrate);
 
   await useAuthStore.getState().setSession({ uin: 7, username: "alice" }, "first", "");
   useAuthStore.setState({ uin: null }); // simulate a reload with only the durable owner marker
   await useAuthStore.getState().setSession({ uin: 8, username: "bob" }, "second", "");
   assert.equal(deleteCount, 2);
   assert.equal(useAuthStore.getState().uin, 8);
+
+  failPanicWipe = true;
+  const countBeforePanic = deleteCount;
+  await assert.rejects(useAuthStore.getState().panicWipe());
+  assert.equal(panicDeleteCountAtCall, countBeforePanic);
+  assert.equal(deleteCount, countBeforePanic + 1);
+  assert.equal(values.get("iceq_logged_out"), "1");
 });

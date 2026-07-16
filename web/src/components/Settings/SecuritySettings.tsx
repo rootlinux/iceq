@@ -17,6 +17,9 @@ type FingerprintStatus =
 export function SecuritySettings(): JSX.Element {
   const i18n = useI18n();
   const selfUin = useAuthStore((state) => state.uin);
+  const panicWipe = useAuthStore((state) => state.panicWipe);
+  const [panicBusy, setPanicBusy] = useState(false);
+  const [panicError, setPanicError] = useState(false);
   const [fingerprintStatus, setFingerprintStatus] = useState<FingerprintStatus>({
     kind: "loading",
   });
@@ -87,6 +90,19 @@ export function SecuritySettings(): JSX.Element {
               {peerSafety.verified && <div role="status">{i18n.t("security.verified")}</div>}
             </div>
           )}
+        </div>
+      </div>
+
+      <div className="iceq-settings-row">
+        <div className="iceq-settings-status">
+          <strong>{i18n.t("security.panicWipeTitle")}</strong>
+          <p>{i18n.t("security.panicWipeWarning")}</p>
+          <button type="button" disabled={panicBusy} onClick={() => {
+            if (!window.confirm(i18n.t("security.panicWipeConfirm"))) return;
+            setPanicBusy(true); setPanicError(false);
+            void panicWipe().catch(() => setPanicError(true)).finally(() => setPanicBusy(false));
+          }}>{i18n.t("security.panicWipeAction")}</button>
+          {panicError && <div role="alert">{i18n.t("security.panicWipeFailed")}</div>}
         </div>
       </div>
 

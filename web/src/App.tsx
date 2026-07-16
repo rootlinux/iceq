@@ -13,7 +13,7 @@
 // useWebSocket on a 4403 close; the auth store clears state
 // and we redirect to /login.
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { useAuthStore } from "./store/authStore";
 import { LoginForm } from "./components/Auth/LoginForm";
@@ -21,12 +21,14 @@ import { RegisterForm } from "./components/Auth/RegisterForm";
 import { MainLayout } from "./components/Layout/MainLayout";
 import { ChatShell } from "./components/Chat/ChatShell";
 import { useI18n } from "./i18n";
+import { clearAllIceQLocalData } from "./lib/localDataCleanup";
 
 export default function App(): JSX.Element {
   const isAuthed = useAuthStore((s) => s.isAuthenticated);
   const hydrated = useAuthStore((s) => s.hydrated);
   const navigate = useNavigate();
   const i18n = useI18n();
+  const [cleanupFailed, setCleanupFailed] = useState(false);
 
   // The auth-expired event is fired by the api/client when a
   // refresh fails. We bounce to /login and clear state.
@@ -43,11 +45,14 @@ export default function App(): JSX.Element {
       // we just navigate.
       navigate("/login", { replace: true });
     }
+    function onCleanupFailed(): void { setCleanupFailed(true); }
     window.addEventListener("iceq:auth-expired", onExpired);
     window.addEventListener("iceq:wiped", onWiped);
+    window.addEventListener("iceq:local-cleanup-failed", onCleanupFailed);
     return () => {
       window.removeEventListener("iceq:auth-expired", onExpired);
       window.removeEventListener("iceq:wiped", onWiped);
+      window.removeEventListener("iceq:local-cleanup-failed", onCleanupFailed);
     };
   }, [navigate]);
 
@@ -63,6 +68,11 @@ export default function App(): JSX.Element {
   }
 
   return (
+    <>
+    {cleanupFailed && <div role="alert" className="fixed inset-x-0 top-0 z-50 bg-danger p-3 text-white">
+      <span>{i18n.t("cleanup.failed")}</span>{" "}
+      <button type="button" onClick={() => void clearAllIceQLocalData("logout").then(() => setCleanupFailed(false)).catch(() => setCleanupFailed(true))}>{i18n.t("cleanup.retry")}</button>
+    </div>}
     <Routes>
       <Route path="/login" element={isAuthed ? <Navigate to="/app" replace /> : <LoginForm />} />
       <Route path="/register" element={isAuthed ? <Navigate to="/app" replace /> : <RegisterForm />} />
@@ -71,6 +81,6 @@ export default function App(): JSX.Element {
         element={isAuthed ? <MainLayout><ChatShell /></MainLayout> : <Navigate to="/login" replace />}
       />
       <Route path="*" element={<Navigate to={isAuthed ? "/app" : "/login"} replace />} />
-    </Routes>
+    </Routes></>
   );
 }
