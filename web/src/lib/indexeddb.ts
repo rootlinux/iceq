@@ -212,6 +212,39 @@ export async function resetPeerSignalState(peerUin: number): Promise<void> {
   db.close();
 }
 
+async function persistInboundIdentityChange(identifier: string, oldKey: ArrayBuffer, newKey: ArrayBuffer): Promise<void> {
+  const match = /^(\d+)\.\d+$/.exec(identifier);
+  if (!match) return;
+  const peerUin = Number(match[1]);
+  if (!Number.isSafeInteger(peerUin) || peerUin <= 0) return;
+  const db = await openDB();
+  const existing = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, peerUin);
+  const now = Date.now();
+  const record: StoredPeerTrust = existing ?? {
+    version: 1,
+    peerUin,
+    fingerprint: signalIdentityToWire(oldKey),
+    verified: false,
+    firstSeenAt: now,
+    updatedAt: now,
+  };
+  await idbPut(db, STORE_PEER_TRUST, {
+    ...record,
+    pendingFingerprint: signalIdentityToWire(newKey),
+    updatedAt: now,
+  } satisfies StoredPeerTrust, peerUin);
+  db.close();
+}
+
+function signalIdentityToWire(key: ArrayBuffer): string {
+  const bytes = new Uint8Array(key);
+  const raw = bytes.length === 33 && bytes[0] === SIGNAL_PUBLIC_KEY_PREFIX ? bytes.slice(1) : bytes;
+  if (raw.length !== RAW_X25519_PUBLIC_KEY_LENGTH) throw new Error("invalid peer identity key");
+  let binary = "";
+  for (const byte of raw) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 // ----------------------------------------------------------------------------
 // Decrypted message cache. Used by the chat window to re-render
 // the last few messages on page reload while the history API
@@ -450,7 +483,9 @@ export class IndexedDBSignalProtocolStore implements StorageType {
     const existing = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, identifier);
     db.close();
     if (!existing) return true; // first sighting — accept and let saveIdentity pin it
-    return arrayBufferEquals(existing.publicKey, identityKey);
+    if (arrayBufferEquals(existing.publicKey, identityKey)) return true;
+    await persistInboundIdentityChange(identifier, existing.publicKey, identityKey);
+    return false;
   }
 
   async saveIdentity(
@@ -464,6 +499,7 @@ export class IndexedDBSignalProtocolStore implements StorageType {
       // Identity changed — refuse to overwrite. The peer needs
       // to re-init the session from a fresh bundle.
       db.close();
+      await persistInboundIdentityChange(encodedAddress, existing.publicKey, publicKey);
       return false;
     }
     const rec: StoredPeerIdentity = { publicKey, firstSeenAt: Date.now() };

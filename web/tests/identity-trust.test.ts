@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import "fake-indexeddb/auto";
 
 import { clearAll } from "../src/lib/indexeddb.ts";
+import { getSignalStore } from "../src/lib/indexeddb.ts";
+import { encryptMessage, generateIdentityKeyPair, saveOwnIdentity as persistOwnIdentity } from "../src/lib/signal.ts";
 import {
   acceptPeerIdentity,
   assessPeerIdentity,
@@ -44,4 +46,18 @@ test("safety QR contains only version and canonical public fingerprint", () => {
   assert.deepEqual(parseSafetyQrPayload(raw), { version: 1, fingerprint: "1234567890" });
   assert.deepEqual(Object.keys(JSON.parse(raw)).sort(), ["fingerprint", "version"]);
   assert.throws(() => parseSafetyQrPayload('{"version":1,"fingerprint":"123","token":"secret"}'));
+});
+
+test("inbound libsignal identity rotation durably blocks subsequent encryption", async () => {
+  const own = await generateIdentityKeyPair();
+  await persistOwnIdentity(own, 7);
+  const store = getSignalStore();
+  const oldKey = new Uint8Array(33); oldKey[0] = 5;
+  const newKey = new Uint8Array(33); newKey[0] = 5; newKey[1] = 9;
+  await store.saveIdentity("42.1", oldKey.buffer);
+  await assessPeerIdentity(42, first);
+
+  assert.equal(await store.isTrustedIdentity("42.1", newKey.buffer, 1), false);
+  assert.equal(await isPeerSendAllowed(42), false);
+  await assert.rejects(() => encryptMessage(42, new TextEncoder().encode("blocked")), /identity changed/i);
 });
