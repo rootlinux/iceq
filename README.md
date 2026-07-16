@@ -87,7 +87,7 @@ Direct-message safety numbers are computed client-side from the two users' UINs 
 - WebSocket and message-history routes are excluded from Caddy access logs with `log_skip`
 - Pre-signed file URLs: the file-service mints a URL and never sees the bytes
 - Bearer tokens are bound to a Redis blocklist; logout is cryptographically enforced
-- Panic-wipe feature: a duress password triggers irreversible deletion of all user data
+- Panic wipe destructively removes the current account and managed server-side keys, contacts, memberships, sessions, and indexed ciphertext paths; it cannot erase peer devices, offline browser caches, backups/exports, or legacy ciphertext without deletion indexes
 - Caddy does not forward the real client IP to backend services after edge hardening
 - Optional Scylla TTL can expire encrypted message rows after a configured retention window
 - `read_only` container filesystems prevent runtime tampering
@@ -181,26 +181,9 @@ The local `hostname` file proves only key/address generation. It does not prove 
 
 Your `.onion` address is derived from a private key stored in the `tor_keys` Docker volume. **If this volume is deleted, your address is lost forever and cannot be recovered** — Tor has no recovery mechanism for v3 keys.
 
-**Backup:**
+**Backup:** use the production backup system to stream the read-only `iceq_tor_keys` volume directly into an authenticated, encrypted offline sink. Do not create an intermediate archive under the repository or another unencrypted filesystem. Keep the encryption credential in the backup system's protected secret input, never in a command argument, environment dump, terminal transcript, or log. Record only a non-secret backup identifier and integrity result.
 
-```bash
-mkdir -p backup
-docker run --rm \
-  -v iceq_tor_keys:/source:ro \
-  -v $(pwd)/backup:/backup \
-  alpine tar czf /backup/tor_keys_backup.tar.gz -C /source .
-```
-
-Store `backup/tor_keys_backup.tar.gz` offline (USB drive, encrypted disk, paper backup of the hash for integrity). Do not commit it to git.
-
-**Restore:**
-
-```bash
-docker run --rm \
-  -v iceq_tor_keys:/target \
-  -v $(pwd)/backup:/backup \
-  alpine tar xzf /backup/tor_keys_backup.tar.gz -C /target
-```
+**Restore:** stream the authenticated decryption result from the protected offline backup system directly into an empty `iceq_tor_keys` volume. Do not print, inspect, or log archive members or private-key contents. The exact command is intentionally operator/platform-specific because a generic shell example would either expose a passphrase or create plaintext key material. Perform the restore in an isolated environment first.
 
 After a restore, restart the Tor container to pick up the keypair:
 
@@ -229,7 +212,7 @@ The default Caddy loads no Tor-only `:80` listener. Enabling the `tor` profile s
 
 ### Security note
 
-Tor provides **transport-layer anonymity** for clients reaching your instance. The Signal Protocol still provides **end-to-end message encryption** — the server cannot read message content regardless of transport, even if the Tor layer is compromised or the operator is compelled to log.
+Tor can provide transport-layer anonymity for clients reaching an accepted and externally verified onion service. Message encryption protects plaintext from passive storage/transport observers and honest operator logs that receive ciphertext only. It does not protect against a malicious or compelled operator who changes the served web application: the browser is the E2EE trust boundary, and hostile JavaScript can capture keys and plaintext. Tor also does not remove application timing, size, membership, or routing metadata.
 
 ## Development
 

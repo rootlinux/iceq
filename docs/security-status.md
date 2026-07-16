@@ -10,7 +10,22 @@ Last reviewed: 2026-07-16. “Complete” means the scoped repository implementa
 | 3. Backend hardening | Complete for scoped repository controls; operator storage work remains | Argon2id and bcrypt upgrade; refresh rotation/reuse handling; CSRF; durable wipe marker/session checks; authorization and per-action rate limits; durable ingest/outbox; Caddy headers/log filtering; container restrictions. Evidence is in backend tests, `docs/security-route-audit.md`, and migrations `001`-`013`. | At-rest volume/snapshot encryption, credential custody, monitoring, migration execution, and restore tests are operator responsibilities. Some route-audit rows remain source-review evidence rather than deployed penetration tests. Legacy pre-index ciphertext requires retention/offline handling. |
 | 4. Anonymity/privacy | Partial | No email/phone requirement, no third-party analytics, minimized Caddy fields, sensitive route `log_skip`, privacy controls, disappearing-message server expiry, panic wipe, and no-JS help/install/security pages. | No complete metadata anonymity, padding, cover traffic, mix routing, or messaging without JavaScript. Backend/infrastructure log minimization needs live operator checks. Tor runtime is deferred. |
 | 5. Frontend | Complete for scoped product phase | EN/TR typed catalogs, accessibility/source policies, safety QR, identity warnings, privacy/disappearing controls, PWA cache restrictions, WS plus polling fallback, group Sender Keys, and encrypted DM/group files are covered by `web/tests`. | Production browser/device acceptance remains outstanding; no-JS pages intentionally do not provide E2EE messaging. Push notifications are not implemented. |
-| 6. Delivery/release | Partial | Security CI covers Go test/vet/govulncheck, web test/typecheck/build/audit, Compose config, and secret scanning. `docs/operator-runbook.md` covers release, backups, incidents, and rollback. | Production deploy and real-user clearnet acceptance are explicitly outstanding. Docker-backed smoke is a separate runtime gate. Tor follows only after acceptance. |
+| 6. Delivery/release | Partial | The committed Security CI definition covers Go test/vet/govulncheck, web test/typecheck/build/audit, Compose config, and secret scanning. `docs/operator-runbook.md` covers release, backups, incidents, and rollback. Local results are recorded separately below and do not imply that CI or runtime gates ran. | Production deploy and real-user clearnet acceptance are explicitly outstanding. Docker-backed smoke is a separate runtime gate. Tor follows only after acceptance. |
+
+## Local verification evidence — 2026-07-16
+
+| Gate | Exact result |
+|---|---|
+| `(cd backend && go test ./...)` | Exit 0. All discovered Go packages passed or reported no test files. |
+| `(cd backend && go vet ./...)` | Exit 0. |
+| `govulncheck ./...` | Not run: `govulncheck` was unavailable on `PATH`, and no local installation was authorized. The CI workflow installs pinned `v1.1.4`; that is workflow coverage, not local evidence. |
+| `(cd web && npm test)` | Exit 0: 142 tests passed, 0 failed/skipped/cancelled. |
+| `(cd web && npm run typecheck)` | Exit 0. |
+| `(cd web && npm run build)` | Exit 0. Vite still reported curveasm/CommonJS/browser-externalization, ineffective dynamic-import, and over-500 kB chunk warnings. |
+| `(cd web && npm audit --audit-level=high)` | Exit 0 at the High threshold, but reported one Moderate vulnerability: `protobufjs <=7.6.2`, `GHSA-f38q-mgvj-vph7`; npm reports a fix is available via `npm audit fix`. This is not a clean zero-finding audit. |
+| `docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml config --quiet` | Exit 0. Configuration/interpolation validation only; no containers started. |
+| `./deploy/scripts/check-clearnet-compose.sh` | Exit 0: `STATIC PASS` for the default clearnet-only/Tor-isolation/Caddy-policy source structure; runtime `SKIP` because `iceq/caddy:dev` was unavailable. This is not runtime Caddy proof. |
+| Docker runtime and Caddy/Docker-backed smokes | Not run. Docker CLI was present, but `docker info` could not connect to the Docker daemon socket; the daemon was unavailable. |
 
 ## Required local gates
 
