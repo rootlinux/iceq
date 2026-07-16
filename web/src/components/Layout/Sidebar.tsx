@@ -7,11 +7,13 @@
 // slides in from the left when the user opens it. The
 // hamburger button lives in MainLayout's top bar.
 
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useAuthStore } from "../../store/authStore";
 import { ContactList } from "../Contacts/ContactList";
 import { GroupList } from "../Groups/GroupList";
 import { SecuritySettings } from "../Settings/SecuritySettings";
+import { useDialogFocus } from "../../hooks/useDialogFocus";
+import { useI18n } from "../../i18n";
 
 interface SidebarProps {
   open: boolean;
@@ -23,6 +25,10 @@ export function Sidebar({ open, onClose }: SidebarProps): JSX.Element {
   const uin = useAuthStore((s) => s.uin);
   const logout = useAuthStore((s) => s.logout);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const i18n = useI18n();
+  const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
+  const settingsDialogRef = useDialogFocus(settingsOpen, closeSettings, settingsTriggerRef);
 
   return (
     <aside
@@ -41,7 +47,7 @@ export function Sidebar({ open, onClose }: SidebarProps): JSX.Element {
             </div>
             <button
               type="button"
-              aria-label="Close menu"
+              aria-label={i18n.t("nav.closeMenu")}
               className="md:hidden iceq-btn-secondary"
               onClick={onClose}
             >
@@ -58,19 +64,20 @@ export function Sidebar({ open, onClose }: SidebarProps): JSX.Element {
         <div className="border-t border-border p-3">
           <button
             type="button"
+            ref={settingsTriggerRef}
             className="iceq-btn-secondary w-full"
             onClick={() => setSettingsOpen(true)}
             aria-expanded={settingsOpen}
             aria-controls="sidebar-settings-modal"
           >
-            Settings
+            {i18n.t("nav.settings")}
           </button>
           <button
             type="button"
             className="iceq-btn-secondary mt-2 w-full"
             onClick={() => void logout()}
           >
-            Sign out
+            {i18n.t("nav.signOut")}
           </button>
         </div>
       </div>
@@ -81,27 +88,29 @@ export function Sidebar({ open, onClose }: SidebarProps): JSX.Element {
           role="dialog"
           aria-modal="true"
           aria-labelledby="sidebar-settings-title"
-          onClick={() => setSettingsOpen(false)}
+          onClick={closeSettings}
+          onKeyDown={(event) => { if (event.key === "Escape") closeSettings(); }}
         >
           <div
             id="sidebar-settings-modal"
+            ref={settingsDialogRef}
             className="iceq-modal"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-4 flex items-start justify-between gap-4">
               <div>
                 <h2 id="sidebar-settings-title" className="text-lg font-semibold text-text">
-                  Settings
+                  {i18n.t("nav.settings")}
                 </h2>
                 <p className="mt-1 text-sm text-text-2">
-                  Review your device security and panic-wipe preferences.
+                  {i18n.t("settings.description")}
                 </p>
               </div>
               <button
                 type="button"
                 className="iceq-btn-secondary"
-                aria-label="Close settings"
-                onClick={() => setSettingsOpen(false)}
+                aria-label={i18n.t("settings.close")}
+                onClick={closeSettings}
               >
                 ✕
               </button>

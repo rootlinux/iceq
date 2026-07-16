@@ -24,10 +24,12 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuthStore } from "../../store/authStore";
 import { uploadBundle, type OneTimePreKeyUpload, type SignedPreKeyUpload } from "../../api/keys";
+import { useI18n } from "../../i18n";
 
 const ONETIMEPREKEY_COUNT = 20;
 
 export function RegisterForm(): JSX.Element {
+  const i18n = useI18n();
   const navigate = useNavigate();
   const register = useAuthStore((s) => s.register);
   const setSignalReady = useSignalStoreReady();
@@ -121,7 +123,7 @@ export function RegisterForm(): JSX.Element {
         onSubmit={onSubmit}
         className="w-full max-w-sm space-y-4 rounded-lg border border-border bg-surface-2 p-6"
       >
-        <h1 className="text-2xl font-semibold text-text">Create your IceQ account</h1>
+        <h1 className="text-2xl font-semibold text-text">{i18n.t("auth.createTitle")}</h1>
         <p className="text-sm text-text-2">
           We will generate an encryption key on this device. Your messages are
           end-to-end encrypted; we can't read them and we can't recover them if

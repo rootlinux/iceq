@@ -29,7 +29,7 @@
 // would imply otherwise. The user enables the feature first,
 // then picks the threshold.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DEFAULT_THRESHOLD,
   MAX_THRESHOLD,
@@ -45,7 +45,8 @@ import { computeSafetyNumber } from "../../lib/safetyFingerprint";
 import { acceptPeerIdentity, assessPeerIdentity, verifyPeerIdentity } from "../../lib/identityTrust";
 import { useAuthStore } from "../../store/authStore";
 import { verifySignedPreKeyBundle } from "../../lib/signal";
-import { loadDisappearingSeconds, loadPrivacySettings, saveDisappearingSeconds, savePrivacySettings, type PrivacySettings } from "../../lib/privacySettings";
+import { PrivacySettings } from "./PrivacySettings";
+import { useDialogFocus } from "../../hooks/useDialogFocus";
 
 type Status =
   | { kind: "loading" }
@@ -77,13 +78,7 @@ export function SecuritySettings(): JSX.Element {
   const [peerUin, setPeerUin] = useState("");
   const [peerSafety, setPeerSafety] = useState<{ uin: number; identityKey: string; number: string; changed: boolean; verified: boolean } | null>(null);
   const [peerError, setPeerError] = useState<string | null>(null);
-  const [privacy, setPrivacy] = useState<PrivacySettings>(() => loadPrivacySettings());
-  const [disappearing, setDisappearing] = useState(() => loadDisappearingSeconds());
-
-  const togglePrivacy = (key: keyof PrivacySettings): void => {
-    const next = { ...privacy, [key]: !privacy[key] };
-    setPrivacy(next); savePrivacySettings(next);
-  };
+  const autoWipeTriggerRef = useRef<HTMLInputElement>(null);
 
   const inspectPeer = async (): Promise<void> => {
     const parsed = Number(peerUin);
@@ -170,6 +165,7 @@ export function SecuritySettings(): JSX.Element {
   const onCancelConfirm = useCallback(() => {
     setConfirm({ kind: "none" });
   }, []);
+  const confirmDialogRef = useDialogFocus(confirm.kind === "enable", onCancelConfirm, autoWipeTriggerRef);
 
   const saveSettings = useCallback(
     async (enabled: boolean, threshold: number, _isFirstEnable: boolean) => {
@@ -218,6 +214,7 @@ export function SecuritySettings(): JSX.Element {
       <div className="iceq-settings-row">
         <label className="iceq-toggle">
           <input
+            ref={autoWipeTriggerRef}
             type="checkbox"
             checked={isEnabled}
             disabled={saving}
@@ -227,25 +224,7 @@ export function SecuritySettings(): JSX.Element {
         </label>
       </div>
 
-      <div className="iceq-settings-row">
-        <div className="iceq-settings-status">
-          <strong>Privacy signals</strong>
-          {(["presence", "typing", "deliveryReceipts", "readReceipts"] as const).map((key) => (
-            <label key={key} className="flex items-center gap-2">
-              <input type="checkbox" checked={privacy[key]} onChange={() => togglePrivacy(key)} />
-              {key === "deliveryReceipts" ? "Delivery receipts" : key === "readReceipts" ? "Read receipts" : key[0]?.toUpperCase() + key.slice(1)}
-            </label>
-          ))}
-        </div>
-      </div>
-
-      <div className="iceq-settings-row">
-        <label htmlFor="disappearing-duration">Disappearing messages</label>
-        <select id="disappearing-duration" value={disappearing} onChange={(event) => { const next = Number(event.target.value); setDisappearing(next); saveDisappearingSeconds(next); }}>
-          <option value={0}>Off</option><option value={3600}>1 hour</option><option value={86400}>1 day</option><option value={604800}>7 days</option><option value={2592000}>30 days</option>
-        </select>
-        <p>Ciphertext expires on the server. IceQ cannot remotely erase copies already saved by recipient devices or backups.</p>
-      </div>
+      <PrivacySettings />
       {fingerprintStatus.kind === "ready" && fingerprintStatus.fingerprint && (
         <SafetyQr fingerprint={fingerprintStatus.fingerprint} />
       )}
@@ -325,9 +304,9 @@ export function SecuritySettings(): JSX.Element {
       </div>
 
       {confirm.kind === "enable" && (
-        <div className="iceq-modal-backdrop" role="dialog" aria-modal="true">
-          <div className="iceq-modal">
-            <h4>Enable auto-wipe?</h4>
+        <div className="iceq-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="auto-wipe-confirm-title">
+          <div className="iceq-modal" ref={confirmDialogRef}>
+            <h4 id="auto-wipe-confirm-title">Enable auto-wipe?</h4>
             <p>
               If enabled, after {confirm.threshold} failed login attempts all your
               messages, contacts, and keys will be permanently deleted and

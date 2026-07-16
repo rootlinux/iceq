@@ -15,10 +15,18 @@ import { useState } from "react";
 import { downloadEncryptedFile } from "../../api/files";
 import { assertSafeDownloadMetadata, isEncryptedFileManifest, withObjectUrl } from "../../lib/fileCrypto";
 import type { Message, MessageAttachment } from "../../types/models";
+import { useI18n } from "../../i18n";
 
 interface MessageItemProps {
   message: Message;
 }
+
+const messageStateKeys = {
+  sending: "message.state.sending",
+  delivered: "message.state.delivered",
+  read: "message.state.read",
+  failed: "message.state.failed",
+} as const;
 
 function formatTime(iso: string): string {
   const d = new Date(iso);
@@ -60,6 +68,7 @@ function parseAttachment(message: Message): MessageAttachment | null {
 }
 
 export function MessageItem({ message }: MessageItemProps): JSX.Element {
+  const i18n = useI18n();
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const outgoing = message.is_outgoing;
@@ -135,10 +144,13 @@ export function MessageItem({ message }: MessageItemProps): JSX.Element {
         >
           <span>{formatTime(message.created_at)}</span>
           {outgoing && (
-            <span aria-label={`State: ${message.state}`}>
-              {message.state === "sending" ? "…" : message.state === "failed" ? "✕" : "✓"}
-              {message.state === "read" && "✓"}
-            </span>
+            <>
+              <span aria-hidden="true">
+                {message.state === "sending" ? "…" : message.state === "failed" ? "✕" : "✓"}
+                {message.state === "read" && "✓"}
+              </span>
+              <span className="message-state-text">{i18n.t(messageStateKeys[message.state])}</span>
+            </>
           )}
         </div>
       </div>

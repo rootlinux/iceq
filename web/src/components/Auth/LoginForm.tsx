@@ -16,8 +16,10 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuthStore } from "../../store/authStore";
+import { useI18n } from "../../i18n";
 
 export function LoginForm(): JSX.Element {
+  const i18n = useI18n();
   const navigate = useNavigate();
   const login = useAuthStore((s) => s.login);
   const [username, setUsername] = useState("");
@@ -45,7 +47,7 @@ export function LoginForm(): JSX.Element {
         onSubmit={onSubmit}
         className="w-full max-w-sm space-y-4 rounded-lg border border-border bg-surface-2 p-6"
       >
-        <h1 className="text-2xl font-semibold text-text">Sign in to IceQ</h1>
+        <h1 className="text-2xl font-semibold text-text">{i18n.t("auth.signInTitle")}</h1>
 
         <div className="space-y-1">
           <label htmlFor="login-username" className="text-sm text-text-2">

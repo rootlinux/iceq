@@ -11,6 +11,7 @@ import { useOnlineStatus } from "../../hooks/useOnlineStatus";
 import { useAuthStore } from "../../store/authStore";
 import { useSignalStore } from "../../store/signalStore";
 import { ensureSignalProvisioning } from "../../lib/signalBootstrap";
+import { useI18n } from "../../i18n";
 
 interface MainLayoutProps {
   children: React.ReactNode;
@@ -29,6 +30,7 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
   const setSignalError = useSignalStore((s) => s.setError);
   const refreshPrekeyCount = useSignalStore((s) => s.refreshPrekeyCount);
   const signalError = useSignalStore((s) => s.lastError);
+  const i18n = useI18n();
 
   // Close the sidebar on viewport widening so it doesn't
   // stay slid in when the user rotates their phone.
@@ -66,6 +68,8 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
     <div className="flex h-full w-full flex-col bg-bg">
       {!isOnline && (
         <div
+          role="status"
+          aria-live="polite"
           style={{
             background: "#eab308",
             color: "#0a0a0a",
@@ -79,11 +83,13 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
             flexShrink: 0,
           }}
         >
-          You're offline — messages will send when reconnected
+          {i18n.t("connection.offline")}
         </div>
       )}
       {signalError && (
         <div
+          role="alert"
+          aria-live="assertive"
           style={{
             background: "#7f1d1d",
             color: "#fef2f2",
@@ -109,19 +115,20 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
               type="button"
               className="iceq-btn-secondary md:hidden"
               onClick={() => setSidebarOpen((s) => !s)}
-              aria-label="Toggle menu"
+              aria-label={i18n.t("nav.toggleMenu")}
             >
               ☰
             </button>
             <div className="ml-auto flex items-center gap-2 text-xs text-text-2">
               <span
+                aria-hidden="true"
                 data-connected={connected ? "true" : "false"}
                 className={
                   "inline-block h-2 w-2 rounded-full " +
                   (connected ? "bg-presence-online" : "bg-presence-offline")
                 }
               />
-              {connected ? "Connected" : "Reconnecting…"}
+              <span>{connected ? i18n.t("connection.connected") : i18n.t("connection.reconnecting")}</span>
             </div>
           </header>
           <div className="flex-1 overflow-hidden">

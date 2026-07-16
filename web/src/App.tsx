@@ -20,11 +20,13 @@ import { LoginForm } from "./components/Auth/LoginForm";
 import { RegisterForm } from "./components/Auth/RegisterForm";
 import { MainLayout } from "./components/Layout/MainLayout";
 import { ChatShell } from "./components/Chat/ChatShell";
+import { useI18n } from "./i18n";
 
 export default function App(): JSX.Element {
   const isAuthed = useAuthStore((s) => s.isAuthenticated);
   const hydrated = useAuthStore((s) => s.hydrated);
   const navigate = useNavigate();
+  const i18n = useI18n();
 
   // The auth-expired event is fired by the api/client when a
   // refresh fails. We bounce to /login and clear state.
@@ -53,7 +55,7 @@ export default function App(): JSX.Element {
   if (!hydrated) {
     return (
       <div className="flex h-full items-center justify-center bg-bg text-text-2">
-        Loading…
+        {i18n.t("app.loading")}
       </div>
     );
   }

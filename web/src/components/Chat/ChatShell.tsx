@@ -12,17 +12,19 @@
 
 import { ChatWindow } from "./ChatWindow";
 import { useChatStore } from "../../store/chatStore";
+import { useI18n } from "../../i18n";
 import { GroupChatWindow } from "../Groups/GroupChatWindow";
 
 export function ChatShell(): JSX.Element {
+  const i18n = useI18n();
   const active = useChatStore((s) => s.activeConversation);
 
   if (!active) {
     return (
       <div className="flex h-full items-center justify-center p-8 text-center text-text-2">
         <div>
-          <div className="mb-2 text-lg text-text">Welcome to IceQ</div>
-          <div className="text-sm">Select a contact from the sidebar to start chatting.</div>
+          <div className="mb-2 text-lg text-text">{i18n.t("chat.welcome")}</div>
+          <div className="text-sm">{i18n.t("chat.selectContact")}</div>
         </div>
       </div>
     );
