@@ -65,7 +65,7 @@ if docker image inspect iceq/caddy:dev >/dev/null 2>&1; then
   docker run --rm \
     -e ICEQ_ONION_LOCATION= \
     -v "$caddyfile:/etc/caddy/Caddyfile:ro" \
-    iceq/caddy:dev caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
+    iceq/caddy:dev validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
     fail "Caddy failed to validate the clearnet configuration"
   printf 'PASS: Caddy runtime syntax validation completed with iceq/caddy:dev.\n'
 else
