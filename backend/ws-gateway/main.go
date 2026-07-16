@@ -179,7 +179,6 @@ func main() {
 		FrameRateLimiter: middleware.NewAuthenticatedRateLimiter(middleware.AuthenticatedRateLimitConfig{
 			Redis: rdb, Action: "ws:frame", Limit: 30, Window: time.Minute, Timeout: 200 * time.Millisecond,
 		}),
-		MessageDeduper: router.NewRedisMessageDeduper(rdb),
 	}
 
 	// --- NATS subscribers. These run for the lifetime of the process
@@ -212,7 +211,7 @@ func main() {
 		Redis: rdb, Action: "transport:send", Limit: 30, Window: time.Minute, Timeout: 200 * time.Millisecond,
 	})
 	r.With(authMW, sendRate, chimw.Timeout(10*time.Second)).Post("/api/transport/send", router.NewSendHandler(router.SendDeps{
-		Publisher: nc, Deduper: deps.MessageDeduper, Groups: router.NewPGGroupSendAuthorizer(pgPool),
+		Ingester: nc, Groups: router.NewPGGroupSendAuthorizer(pgPool),
 	}).ServeHTTP)
 	// /health: standard 30 s timeout (short-lived probe).
 	r.With(chimw.Timeout(30*time.Second)).Get("/health", newHealthHandler(pgPool, rdb, nc, VERSION))

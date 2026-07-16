@@ -6,28 +6,23 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/iceq/iceq/shared/middleware"
 	"github.com/iceq/iceq/shared/models"
-	"github.com/iceq/iceq/ws-gateway/client"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type EnvelopePublisher interface{ Publish(string, []byte) error }
 type GroupSendAuthorizer interface {
 	IsCurrentMember(context.Context, string, int64, int64) (bool, error)
 }
 type SendDeps struct {
-	Publisher EnvelopePublisher
-	Deduper   client.MessageDeduper
-	Groups    GroupSendAuthorizer
+	Ingester DurableIngestRequester
+	Groups   GroupSendAuthorizer
 }
 
 func NewSendHandler(deps SendDeps) http.Handler {
-	if deps.Publisher == nil || deps.Deduper == nil {
+	if deps.Ingester == nil {
 		panic("send dependencies are incomplete")
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -70,10 +65,6 @@ func NewSendHandler(deps SendDeps) http.Handler {
 var errSendUnavailable = errors.New("send unavailable")
 
 func processHTTPSend(ctx context.Context, actor int64, env models.Envelope, deps SendDeps) (models.Envelope, error) {
-	serverID := uuid.NewString()
-	ts := time.Now().UTC().Truncate(time.Minute).UnixMilli()
-	var clientID, subject string
-	var recipient int64
 	var payload any
 	switch env.Type {
 	case models.EnvelopeTypeDirect:
@@ -81,9 +72,6 @@ func processHTTPSend(ctx context.Context, actor int64, env models.Envelope, deps
 		if err != nil {
 			return models.Envelope{}, err
 		}
-		clientID = p.ClientID
-		recipient = p.ReceiverUIN
-		subject = "msg.direct." + itoa(recipient)
 		payload = forwardDirectPayload(p, actor)
 	case models.EnvelopeTypeGroup:
 		p, err := parseGroupPayload(env.Payload)
@@ -104,34 +92,12 @@ func processHTTPSend(ctx context.Context, actor int64, env models.Envelope, deps
 			return models.Envelope{}, errors.New("sender is not a current group member")
 		}
 		p.SenderUIN = actor
-		clientID = p.ClientID
-		subject = "msg.group." + p.GroupID
 		payload = p
 	default:
 		return models.Envelope{}, errors.New("unsupported envelope type")
 	}
-	prior, duplicate, err := reserveMessageID(ctx, deps.Deduper, actor, clientID, serverID)
-	if err != nil {
-		return models.Envelope{}, errSendUnavailable
-	}
-	if duplicate {
-		serverID = prior
-	} else {
-		out := models.Envelope{Type: env.Type, ID: serverID, TS: ts, Payload: mustMarshalRaw(payload)}
-		data, err := json.Marshal(out)
-		if err != nil {
-			_ = deps.Deduper.Release(ctx, actor, clientID, serverID)
-			return models.Envelope{}, errSendUnavailable
-		}
-		if err := deps.Publisher.Publish(subject, data); err != nil {
-			_ = deps.Deduper.Release(ctx, actor, clientID, serverID)
-			return models.Envelope{}, errSendUnavailable
-		}
-		if err := deps.Deduper.Commit(ctx, actor, clientID, serverID); err != nil {
-			return models.Envelope{}, errSendUnavailable
-		}
-	}
-	return models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{MessageID: ackMessageID(serverID, clientID), State: models.AckStatePersisted, RecipientUIN: recipient})
+	out := models.Envelope{Type: env.Type, Payload: mustMarshalRaw(payload)}
+	return requestDurableIngest(ctx, deps.Ingester, out)
 }
 
 type PGGroupSendAuthorizer struct{ pg *pgxpool.Pool }

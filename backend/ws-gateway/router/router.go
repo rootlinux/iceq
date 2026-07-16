@@ -115,85 +115,14 @@ func handleDirect(c *client.Client, deps client.Deps, env models.Envelope) {
 	// user, NEVER the client-claimed sender_uin. A tampered
 	// client cannot impersonate another user.
 
-	// Truncate timestamp to the minute. The spec mandates
-	// this; it (a) makes timing-correlation attacks against
-	// the log harder and (b) is the right granularity for
-	// the chat's per-minute sort key.
-	ts := time.Now().UTC().Truncate(time.Minute).UnixMilli()
-
-	// Mint a server-side message ID. We use a UUID v4; the
-	// spec asks for a UUID.
-	msgID := uuid.NewString()
-	idemCtx, idemCancel := context.WithTimeout(context.Background(), time.Second)
-	reservedID, duplicate, err := reserveMessageID(idemCtx, deps.MessageDeduper, c.UIN(), p.ClientID, msgID)
-	idemCancel()
+	out := models.Envelope{Type: models.EnvelopeTypeDirect, Payload: mustMarshalRaw(forwardDirectPayload(p, c.UIN()))}
+	ingestCtx, ingestCancel := context.WithTimeout(context.Background(), 9*time.Second)
+	ack, err := requestDurableIngest(ingestCtx, deps.NATS, out)
+	ingestCancel()
 	if err != nil {
-		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "message idempotency check failed")
+		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "durable message ingest failed")
 		return
 	}
-	if duplicate {
-		ack, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{MessageID: ackMessageID(reservedID, p.ClientID), State: models.AckStatePersisted, RecipientUIN: p.ReceiverUIN})
-		c.TrySend(mustMarshal(ack))
-		return
-	}
-
-	// Build the on-wire envelope. The router includes the
-	// message_id so the recipient's message-service can
-	// dedupe on retried publishes.
-	out := models.Envelope{
-		Type:    models.EnvelopeTypeDirect,
-		ID:      msgID,
-		TS:      ts,
-		Payload: mustMarshalRaw(forwardDirectPayload(p, c.UIN())),
-	}
-	data, err := json.Marshal(out)
-	if err != nil {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_ = deps.MessageDeduper.Release(releaseCtx, c.UIN(), p.ClientID, msgID)
-		cancel()
-		log.Printf("[ws-gateway] marshal direct: %v", err)
-		return
-	}
-
-	// Publish on the per-receiver subject. The Hub's
-	// NATS subscriber (in main.go) listens on
-	// msg.direct.* and routes to the recipient's local
-	// connections. Subjects are uin-as-string; using a
-	// wildcard here would defeat the gateway's per-
-	// receiver fan-out.
-	if err := deps.NATS.Publish(
-		"msg.direct."+itoa(p.ReceiverUIN),
-		data,
-	); err != nil {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_ = deps.MessageDeduper.Release(releaseCtx, c.UIN(), p.ClientID, msgID)
-		cancel()
-		// The publish failed (NATS down, server closing,
-		// etc.). The send ACKs we are about to emit would
-		// be misleading because the recipient won't see
-		// the message. We log and skip the ACK; the
-		// client will retry.
-		log.Printf("[ws-gateway] publish direct: %v", err)
-		return
-	}
-	commitCtx, commitCancel := context.WithTimeout(context.Background(), time.Second)
-	if err := deps.MessageDeduper.Commit(commitCtx, c.UIN(), p.ClientID, msgID); err != nil {
-		commitCancel()
-		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "message commit failed")
-		return
-	}
-	commitCancel()
-
-	// ACK the sender. The AckPayload.State is "persisted"
-	// from the gateway's perspective: we have accepted
-	// the message and handed it to the bus. The
-	// message-service will publish a follow-up ACK with
-	// State="delivered" once it has written to Scylla.
-	ack, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{
-		MessageID:    ackMessageID(msgID, p.ClientID),
-		State:        models.AckStatePersisted,
-		RecipientUIN: p.ReceiverUIN,
-	})
 	c.TrySend(mustMarshal(ack))
 }
 
@@ -389,25 +318,8 @@ func handleGroup(c *client.Client, deps client.Deps, env models.Envelope) {
 		return
 	}
 
-	ts := time.Now().UTC().Truncate(time.Minute).UnixMilli()
-	msgID := uuid.NewString()
-	idemCtx, idemCancel := context.WithTimeout(context.Background(), time.Second)
-	reservedID, duplicate, err := reserveMessageID(idemCtx, deps.MessageDeduper, c.UIN(), p.ClientID, msgID)
-	idemCancel()
-	if err != nil {
-		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "message idempotency check failed")
-		return
-	}
-	if duplicate {
-		ack, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{MessageID: ackMessageID(reservedID, p.ClientID), State: models.AckStatePersisted})
-		c.TrySend(mustMarshal(ack))
-		return
-	}
-
 	out := models.Envelope{
 		Type: models.EnvelopeTypeGroup,
-		ID:   msgID,
-		TS:   ts,
 		Payload: mustMarshalRaw(models.GroupMessagePayload{
 			GroupID:          p.GroupID,
 			SenderUIN:        p.SenderUIN,
@@ -422,40 +334,13 @@ func handleGroup(c *client.Client, deps client.Deps, env models.Envelope) {
 			ExpiresInSeconds: p.ExpiresInSeconds,
 		}),
 	}
-	data, err := json.Marshal(out)
+	ingestCtx, ingestCancel := context.WithTimeout(context.Background(), 9*time.Second)
+	ack, err := requestDurableIngest(ingestCtx, deps.NATS, out)
+	ingestCancel()
 	if err != nil {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_ = deps.MessageDeduper.Release(releaseCtx, c.UIN(), p.ClientID, msgID)
-		cancel()
-		log.Printf("[ws-gateway] marshal group: %v", err)
+		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "durable group ingest failed")
 		return
 	}
-	if err := deps.NATS.Publish(
-		"msg.group."+p.GroupID,
-		data,
-	); err != nil {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_ = deps.MessageDeduper.Release(releaseCtx, c.UIN(), p.ClientID, msgID)
-		cancel()
-		log.Printf("[ws-gateway] publish group: %v", err)
-		return
-	}
-	commitCtx, commitCancel := context.WithTimeout(context.Background(), time.Second)
-	if err := deps.MessageDeduper.Commit(commitCtx, c.UIN(), p.ClientID, msgID); err != nil {
-		commitCancel()
-		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "message commit failed")
-		return
-	}
-	commitCancel()
-	ack, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{
-		MessageID: ackMessageID(msgID, p.ClientID),
-		State:     models.AckStatePersisted,
-		// RecipientUIN is the GROUP, encoded as 0 for
-		// "group ack". Recipients are the individual
-		// members; the message-service will fan out
-		// per-member ACKs as they are delivered.
-		RecipientUIN: 0,
-	})
 	c.TrySend(mustMarshal(ack))
 }
 

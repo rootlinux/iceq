@@ -170,6 +170,7 @@ services:
       - ./init/migrations/004_panic_wipe_message_indexes.cql:/init/004-panic-wipe-message-indexes.cql:ro
       - ./init/migrations/010_group_message_crypto_epoch.cql:/init/010-group-message-crypto-epoch.cql:ro
       - ./init/migrations/011_disappearing_messages.cql:/init/011-disappearing-messages.cql:ro
+      - ./init/migrations/012_durable_message_ingest.cql:/init/012-durable-message-ingest.cql:ro
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -198,6 +199,7 @@ services:
         cqlsh scylla 9042 -f /init/004-panic-wipe-message-indexes.cql
         cqlsh scylla 9042 -f /init/010-group-message-crypto-epoch.cql
         cqlsh scylla 9042 -f /init/011-disappearing-messages.cql
+        cqlsh scylla 9042 -f /init/012-durable-message-ingest.cql
         echo "[scylla-init] schema applied successfully"
     logging: *default-logging
 

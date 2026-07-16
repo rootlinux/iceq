@@ -1,23 +1,23 @@
 // Package natsclient is a thin, opinionated wrapper around the official
 // github.com/nats-io/nats.go client. It is opinionated in three places:
 //
-//   1. Connection options are baked in: exponential-backoff reconnect
-//      capped at 30 seconds, unlimited total reconnect attempts, and
-//      Pedantic protocol checking disabled (IceQ uses standard subjects
-//      and doesn't need to pay the per-message validation cost).
+//  1. Connection options are baked in: exponential-backoff reconnect
+//     capped at 30 seconds, unlimited total reconnect attempts, and
+//     Pedantic protocol checking disabled (IceQ uses standard subjects
+//     and doesn't need to pay the per-message validation cost).
 //
-//   2. NewClient fails fast. The underlying nats.Connect retries on its
-//      own for a bounded window; if NATS is still unreachable we return
-//      an error so the caller (typically main()) can decide whether to
-//      crash, fall back, or alert. Silently returning a broken
-//      connection would let the rest of the service think it has a bus
-//      when it doesn't.
+//  2. NewClient fails fast. The underlying nats.Connect retries on its
+//     own for a bounded window; if NATS is still unreachable we return
+//     an error so the caller (typically main()) can decide whether to
+//     crash, fall back, or alert. Silently returning a broken
+//     connection would let the rest of the service think it has a bus
+//     when it doesn't.
 //
-//   3. Drain() is the canonical shutdown path. It is preferred over
-//      Close() because Drain() lets in-flight message handlers finish
-//      before tearing down the connection — important during a rolling
-//      deploy where a kill -TERM must not abandon a half-written
-//      message.
+//  3. Drain() is the canonical shutdown path. It is preferred over
+//     Close() because Drain() lets in-flight message handlers finish
+//     before tearing down the connection — important during a rolling
+//     deploy where a kill -TERM must not abandon a half-written
+//     message.
 //
 // The wrapper does not attempt to abstract Publish / Subscribe semantics;
 // callers can fall back to the embedded *nats.Conn via Conn() if they
@@ -155,6 +155,22 @@ func (c *Client) Publish(subject string, data []byte) error {
 		return errors.New("natsclient: subject is empty")
 	}
 	return c.conn.Publish(subject, data)
+}
+
+// Request performs a bounded request/reply exchange. Message ingestion uses
+// this instead of treating an accepted Core NATS publish as durable storage.
+func (c *Client) Request(subject string, data []byte, timeout time.Duration) ([]byte, error) {
+	if c == nil || c.conn == nil {
+		return nil, errors.New("natsclient: client is nil")
+	}
+	if subject == "" {
+		return nil, errors.New("natsclient: subject is empty")
+	}
+	msg, err := c.conn.Request(subject, data, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return msg.Data, nil
 }
 
 // ----------------------------------------------------------------------------

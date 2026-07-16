@@ -128,7 +128,9 @@ Remaining:
 
 Tradeoff:
 - The app remains JavaScript-first because Signal Protocol and IndexedDB key storage require client-side crypto. A no-JS fallback can only support limited account/help flows, not true E2EE messaging.
-- Transport idempotency records are retained for 30 days, matching the maximum disappearing-message duration. Clients must not automatically retry older `off` messages indefinitely; doing so would require indefinite server-side correlation metadata. Expiry removes server ciphertext and indexes but cannot erase copies already delivered to recipient devices or backups.
+- Authenticated `(sender_uin, client_id)` receipts and an opaque outbox are durable in Scylla. Disappearing messages apply one expiry to the receipt, message, indexes, and outbox; explicit `off` receipts have no arbitrary TTL. The gateway returns `persisted` only after message-service confirms the deterministic message row and outbox batch at quorum.
+- Recipient fan-out uses a file-backed JetStream stream, deterministic `Nats-Msg-Id`, and PubAck before the outbox is marked delivered. Core NATS cannot provide mathematically physical exactly-once delivery across a Scylla/JetStream crash boundary: JetStream suppresses a repeated publish inside its configured 24-hour duplicate window, and recipient clients also deduplicate by stable message ID. A crash whose recovery is delayed beyond that window can cause a repeated physical bus publish, but not a second message row; clients must continue treating message IDs as idempotency keys. Expiry removes server ciphertext and indexes but cannot erase copies already delivered to recipient devices or backups.
+- `docs/durable-delivery-runbook.md` documents rollout gates, recovery, and the crash-window boundary.
 
 ## 6. Delivery
 
@@ -158,7 +160,7 @@ docker compose -f deploy/docker-compose.yml config --quiet
 
 ## Existing-volume rollout prerequisite
 
-Docker initdb mounts execute only for fresh volumes. Existing deployments must apply and verify Scylla migrations `004_panic_wipe_message_indexes.cql` and `011_disappearing_messages.cql` before starting the updated message-service, because its writes require the deletion-index tables and expiry columns. Separately, apply and verify PostgreSQL migration `005_wiped_accounts.sql` before starting the updated auth-service or ws-gateway. The README section “Existing database volumes: required security migrations” provides exact idempotent apply commands plus PostgreSQL and Scylla checks; the Scylla check exits non-zero if either required table is missing. Until `wiped_accounts` exists, authenticated REST and WebSocket checks deliberately fail closed rather than accepting a token whose durable wipe status cannot be established.
+Docker initdb mounts execute only for fresh volumes. Existing deployments must apply and verify Scylla migrations `004_panic_wipe_message_indexes.cql`, `011_disappearing_messages.cql`, and `012_durable_message_ingest.cql` before starting the updated message-service. Migration 012 creates the durable authenticated receipt and outbox required before any `persisted` ACK can be returned. Separately, apply and verify PostgreSQL migration `005_wiped_accounts.sql` before starting the updated auth-service or ws-gateway. The README section “Existing database volumes: required security migrations” provides exact idempotent apply commands plus PostgreSQL and Scylla checks. Until required durable revocation or ingest tables exist, the affected authenticated path deliberately fails closed.
 
 ## Highest Priority Next Work
 

@@ -115,6 +115,9 @@ docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T
 
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
   cqlsh < deploy/init/migrations/011_disappearing_messages.cql
+
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
+  cqlsh < deploy/init/migrations/012_durable_message_ingest.cql
 ```
 
 Credentials expand only inside the containers and passwords are not printed. Both commands are safe to retry because the migrations use `CREATE TABLE IF NOT EXISTS`. Verify PostgreSQL before restarting authenticated services:
@@ -124,16 +127,16 @@ docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T
   sh -c 'psql --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --command "SELECT to_regclass('"'"'public.wiped_accounts'"'"');"'
 ```
 
-Verify both deletion-index tables and both expiry columns. This command exits non-zero if any required object is missing:
+Verify the deletion indexes, expiry columns, durable ingest receipt, and outbox tables. This command exits non-zero if any required object is missing:
 
 ```bash
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
-  sh -ec 'tables="$(cqlsh --no-color -e "SELECT table_name FROM system_schema.tables WHERE keyspace_name = '\''iceq'\'' AND table_name IN ('\''message_deletion_index'\'', '\''group_message_deletion_index'\'');")"; columns="$(cqlsh --no-color -e "SELECT table_name, column_name FROM system_schema.columns WHERE keyspace_name = '\''iceq'\'' AND column_name = '\''expires_at'\'';")"; printf "%s\n" "$tables" | grep -qw message_deletion_index; printf "%s\n" "$tables" | grep -qw group_message_deletion_index; printf "%s\n" "$columns" | grep -E '\''messages[[:space:]]*\\|[[:space:]]*expires_at'\''; printf "%s\n" "$columns" | grep -E '\''group_messages[[:space:]]*\\|[[:space:]]*expires_at'\'''
+  sh -ec 'tables="$(cqlsh --no-color -e "SELECT table_name FROM system_schema.tables WHERE keyspace_name = '\''iceq'\'';")"; columns="$(cqlsh --no-color -e "SELECT table_name, column_name FROM system_schema.columns WHERE keyspace_name = '\''iceq'\'' AND column_name = '\''expires_at'\'';")"; for table in message_deletion_index group_message_deletion_index message_ingest message_outbox group_message_outbox; do printf "%s\n" "$tables" | grep -qw "$table"; done; printf "%s\n" "$columns" | grep -E '\''messages[[:space:]]*\\|[[:space:]]*expires_at'\''; printf "%s\n" "$columns" | grep -E '\''group_messages[[:space:]]*\\|[[:space:]]*expires_at'\'''
 ```
 
 Rollout ordering is service-specific:
 
-1. Apply and verify migrations `004_panic_wipe_message_indexes.cql` and `011_disappearing_messages.cql` **before starting the updated message-service**; otherwise new messages cannot create deletion-index rows or store expiry metadata.
+1. Apply and verify migrations `004_panic_wipe_message_indexes.cql`, `011_disappearing_messages.cql`, and `012_durable_message_ingest.cql` **before starting the updated message-service**; otherwise it fails closed because durable receipts/outbox or required message metadata are unavailable.
 2. Apply and verify migration `005_wiped_accounts.sql` **before starting the updated auth-service or ws-gateway**. Until 005 exists, JWT validation cannot prove durable revocation and fails closed, so authenticated REST requests and WebSocket authentication/message checks are rejected.
 
 ## Optional Tor Hidden Service

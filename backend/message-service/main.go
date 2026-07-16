@@ -9,8 +9,8 @@
 //
 // The web client encrypts every chat message with the Signal
 // Protocol (X3DH + Double Ratchet) BEFORE the bytes leave
-// the device. The gateway forwards those bytes to us on the
-// msg.direct.* and msg.group.* NATS subjects. We persist
+// the device. The gateway forwards those bytes through authenticated
+// request/reply ingestion. We persist
 // them to ScyllaDB as-is and never:
 //
 //   - log them (no fmt.Printf / log.Printf that includes
@@ -30,8 +30,7 @@
 //	       └─ GET  /api/messages/group-history     (auth) → group history
 //
 //	NATS subscribers
-//	  ├─ msg.direct.*        → store 1:1 message, publish ack.stored
-//	  ├─ msg.group.*         → store group message
+//	  ├─ ingest.message      → durable LWT receipt + message/outbox batch
 //	  └─ ack.{sender_uin}    → mark row as read
 //
 // On SIGINT / SIGTERM the process runs a 10-second graceful
@@ -192,14 +191,25 @@ func main() {
 		log.Fatalf("nats: %v", err)
 	}
 	log.Printf("[message-service] nats: connected to %s", cfg.NATSURL)
+	js, err := bus.Conn().JetStream()
+	if err != nil {
+		log.Fatalf("[message-service] jetstream context: %v", err)
+	}
+	if err := ensureDeliveryStream(js); err != nil {
+		log.Fatalf("[message-service] delivery stream: %v", err)
+	}
+	durableWriter := store.NewScyllaDurableDirectWriter(scyllaSession)
+	durableStore := store.NewDurableIngestStoreWithGroup(store.NewScyllaIngestBackend(scyllaSession), durableWriter, durableWriter, time.Now, 10*time.Second)
 
-	// Register the three NATS subscribers. Errors at
+	// Register durable ingest and receipt subscribers. Errors at
 	// subscribe-time are fatal: a service that thinks it
 	// has listeners but actually has none is worse than
 	// a service that crashes and restarts.
-	if err := startNATSSubscribers(bus, msgStore, pgPool); err != nil {
+	if err := startNATSSubscribers(bus, msgStore, pgPool, durableStore, jetStreamDeliveryPublisher{js: js}); err != nil {
 		log.Fatalf("nats subscribe: %v", err)
 	}
+	outboxCtx, stopOutbox := context.WithCancel(context.Background())
+	go runOutboxWorker(outboxCtx, durableWriter, durableStore, jetStreamDeliveryPublisher{js: js})
 
 	// --- HTTP router ---------------------------------------------------
 	r := chi.NewRouter()
@@ -258,7 +268,7 @@ func main() {
 
 	// /health is unauthenticated. Caddy / k8s liveness
 	// probes don't carry credentials.
-	r.Get("/health", newHealthHandler(pgPool, rdb, scyllaSession, bus, VERSION))
+	r.Get("/health", newHealthHandler(pgPool, rdb, scyllaSession, bus, js, VERSION))
 
 	// --- HTTP server + graceful shutdown -------------------------------
 	srv := &http.Server{
@@ -300,6 +310,7 @@ func main() {
 	// pools via the deferred Close() calls.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
+	stopOutbox()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("[message-service] graceful shutdown failed: %v", err)
 	} else {
@@ -321,26 +332,21 @@ func main() {
 //   3. ack.{sender_uin} — read-receipt ingest
 // ----------------------------------------------------------------------------
 
-// startNATSSubscribers wires the three subscriptions.
+// startNATSSubscribers wires durable request/reply ingest and read receipts.
 // Errors at subscribe-time are fatal.
-func startNATSSubscribers(bus *natsclient.Client, ms *store.MessageStore, pg *pgxpool.Pool) error {
-	// 1. msg.direct.* — the gateway publishes here for
-	//    every 1:1 chat message it forwards. The
-	//    subject suffix is the receiver_uin; the
-	//    envelope's payload carries the full
-	//    DirectMessagePayload (sender, E2EE bytes,
-	//    msg_type, etc.).
-	if _, err := bus.Subscribe("msg.direct.*", func(m *nats.Msg) {
-		handleDirectMessage(bus, ms, m.Subject, m.Data)
-	}); err != nil {
-		return err
-	}
-
-	// 2. msg.group.* — the gateway publishes here for
-	//    every group chat message. The subject suffix
-	//    is the group_id (UUID string).
-	if _, err := bus.Subscribe("msg.group.*", func(m *nats.Msg) {
-		handleGroupMessage(bus, ms, pg, m.Subject, m.Data)
+func startNATSSubscribers(bus *natsclient.Client, ms *store.MessageStore, pg *pgxpool.Pool, durable *store.DurableIngestStore, delivery deliveryPublisher) error {
+	if _, err := bus.QueueSubscribe(durableIngestSubject, "message-ingest", func(m *nats.Msg) {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		ack, ingestErr := processDurableIngest(ctx, durable, delivery, pg, m.Data)
+		cancel()
+		if ingestErr != nil {
+			errEnv, _ := models.NewEnvelope(models.EnvelopeTypeError, models.ErrorPayload{Code: "INGEST_UNAVAILABLE", Message: "durable message ingest failed"})
+			body, _ := json.Marshal(errEnv)
+			_ = m.Respond(body)
+			return
+		}
+		body, _ := json.Marshal(ack)
+		_ = m.Respond(body)
 	}); err != nil {
 		return err
 	}
@@ -685,7 +691,7 @@ func canonicalConversationID(a, b int64) string {
 // a 2-second deadline and reports per-dep status. 200
 // means all four are reachable; 503 means at least one
 // is degraded.
-func newHealthHandler(pg *pgxpool.Pool, rdb *redis.Client, scylla *gocql.Session, bus *natsclient.Client, version string) http.HandlerFunc {
+func newHealthHandler(pg *pgxpool.Pool, rdb *redis.Client, scylla *gocql.Session, bus *natsclient.Client, js nats.JetStreamContext, version string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -726,6 +732,15 @@ func newHealthHandler(pg *pgxpool.Pool, rdb *redis.Client, scylla *gocql.Session
 			allOK = false
 		} else {
 			deps["nats"] = "ok"
+		}
+		if js == nil {
+			deps["jetstream_delivery"] = "degraded"
+			allOK = false
+		} else if _, err := js.StreamInfo(deliveryStreamName, nats.Context(ctx)); err != nil {
+			deps["jetstream_delivery"] = "degraded"
+			allOK = false
+		} else {
+			deps["jetstream_delivery"] = "ok"
 		}
 
 		if !allOK {
