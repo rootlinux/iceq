@@ -21,7 +21,7 @@ self.addEventListener("fetch", (event) => {
     url.origin !== self.location.origin ||
     request.destination === "document" ||
     request.mode === "navigate" ||
-    request.credentials === "include" ||
+    request.credentials !== "omit" ||
     request.headers.has("authorization") ||
     SENSITIVE_PREFIXES.some((prefix) => url.pathname === prefix || url.pathname.startsWith(`${prefix}/`)) ||
     url.search !== "" ||
@@ -31,7 +31,14 @@ self.addEventListener("fetch", (event) => {
     const cached = await cache.match(request);
     if (cached) return cached;
     const response = await fetch(request);
-    if (response.ok) await cache.put(request, response.clone());
+    const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+    const expectedType = url.pathname.endsWith(".css") ? "text/css" : "javascript";
+    const typeMatches = expectedType === "text/css"
+      ? contentType === "text/css"
+      : contentType === "text/javascript" || contentType === "application/javascript";
+    if (response.ok && !response.redirected && (response.type === "basic" || response.type === "cors") && typeMatches) {
+      await cache.put(request, response.clone());
+    }
     return response;
   }));
 });

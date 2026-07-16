@@ -15,7 +15,9 @@ export function resolveLocale(stored: string | null, browserLanguages: readonly 
 
 export function createI18n(options: { storage?: StorageLike; browserLanguages?: readonly string[] } = {}) {
   const storage = options.storage;
-  let locale = resolveLocale(storage?.getItem(localeStorageKey) ?? null, options.browserLanguages ?? []);
+  let storedLocale: string | null = null;
+  try { storedLocale = storage?.getItem(localeStorageKey) ?? null; } catch { /* restricted storage: use browser locale */ }
+  let locale = resolveLocale(storedLocale, options.browserLanguages ?? []);
   const listeners = new Set<() => void>();
   return {
     get locale(): Locale { return locale; },
@@ -25,7 +27,7 @@ export function createI18n(options: { storage?: StorageLike; browserLanguages?: 
     setLocale(next: Locale): void {
       if (next === locale) return;
       locale = next;
-      storage?.setItem(localeStorageKey, next);
+      try { storage?.setItem(localeStorageKey, next); } catch { /* best-effort persistence */ }
       if (typeof document !== "undefined") document.documentElement.lang = next;
       listeners.forEach((listener) => listener());
     },

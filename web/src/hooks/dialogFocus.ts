@@ -1,5 +1,22 @@
 export interface FocusTarget { focus(): void }
 
+export interface DialogStack {
+  push(): symbol;
+  remove(token: symbol): void;
+  isTop(token: symbol): boolean;
+}
+
+export function createDialogStack(): DialogStack {
+  const entries: symbol[] = [];
+  return {
+    push(): symbol { const token = Symbol("dialog"); entries.push(token); return token; },
+    remove(token: symbol): void { const index = entries.lastIndexOf(token); if (index >= 0) entries.splice(index, 1); },
+    isTop(token: symbol): boolean { return entries.length > 0 && entries[entries.length - 1] === token; },
+  };
+}
+
+export const dialogStack = createDialogStack();
+
 export function focusInitialTarget(preferred: FocusTarget | null, fallback: FocusTarget | null): void {
   (preferred ?? fallback)?.focus();
 }

@@ -3,7 +3,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cycleDialogFocus, focusInitialTarget, handleDialogEscape, restoreDialogFocus } from "../src/hooks/dialogFocus.ts";
+import { createDialogStack, cycleDialogFocus, focusInitialTarget, handleDialogEscape, restoreDialogFocus } from "../src/hooks/dialogFocus.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(root, path), "utf8");
@@ -42,6 +42,20 @@ test("dialog behavior focuses the preferred control, closes on Escape, and resto
   assert.equal(closes, 1);
   restoreDialogFocus(fallback);
   assert.equal(fallback.focusCalls, 1);
+});
+
+test("nested dialog stack lets only the topmost trap and close, then restores the parent", () => {
+  const stack = createDialogStack();
+  const parent = stack.push();
+  const inner = stack.push();
+  assert.equal(stack.isTop(parent), false);
+  assert.equal(stack.isTop(inner), true);
+  stack.remove(inner);
+  assert.equal(stack.isTop(parent), true);
+  stack.remove(inner);
+  assert.equal(stack.isTop(parent), true, "duplicate StrictMode cleanup is harmless");
+  stack.remove(parent);
+  assert.equal(stack.isTop(parent), false);
 });
 
 test("connection errors are announced and message state has visible text", () => {
