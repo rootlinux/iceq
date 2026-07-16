@@ -34,7 +34,7 @@
         Permissions-Policy        "camera=(), microphone=(), geolocation=()"
         Content-Security-Policy   "default-src 'self'; script-src 'self'; connect-src 'self' wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests"
         -Server
-        -X-Powered-By   
+        -X-Powered-By
     }
 }
 
@@ -42,18 +42,26 @@
 (reverse_proxy_common) {
     header_up Host      {host}
     # Do not forward the client's real IP address to backend services.
-    # Edge rate limiting still sees {remote_host}; backend rate limiting
-    # must move to an anonymous/session-scoped key before relying on this
-    # value for per-client decisions.
+    # Edge rate limiting sees {remote_host}; application abuse controls only
+    # receive the edge signer's opaque rotating HMAC identity.
     header_up X-Real-IP "iceq-edge"
     header_up X-Forwarded-For "iceq-edge"
 	header_up User-Agent ""
-	# Used transiently by auth-service to derive a rotating HMAC bucket.
-	# The service never persists this raw value and Caddy's filtered logs
-	# delete request headers. Do not reuse it as an application identity.
-	header_up X-IceQ-RateLimit-Identity {remote_host}
+	header_up -X-IceQ-Edge-Client-IP
     header_up X-Forwarded-Host {host}
     header_up X-Forwarded-Proto {scheme}
+}
+
+(edge_identity) {
+    # The private signer is the only upstream allowed to receive remote_host.
+    # Its 204 response replaces any client-supplied identity with an opaque,
+    # daily rotating HMAC. forward_auth failures stop the protected request.
+    forward_auth edge-identity:8090 {
+        uri /identity
+        header_up X-IceQ-Edge-Client-IP {remote_host}
+        header_up -X-IceQ-RateLimit-Identity
+        copy_headers X-IceQ-RateLimit-Identity
+    }
 }
 
 (reverse_proxy_ws) {
@@ -80,6 +88,10 @@
 (iceq_routes) {
     encode gzip
     import security_headers
+
+    # Strip spoofable trust-boundary headers before any route is evaluated.
+    request_header -X-IceQ-RateLimit-Identity
+    request_header -X-IceQ-Edge-Client-IP
 
     # Structured JSON access log. Caddy version field names have changed
     # across releases, so we delete all known client-IP spellings plus
@@ -127,6 +139,7 @@
     # ── Auth endpoints — tighter rate limits ──────────────────────────
     # Login: 5 req/min per IP
     handle /api/auth/login {
+		import edge_identity
         rate_limit {
             zone auth_login {
                 key    {remote_host}
@@ -142,6 +155,7 @@
 
     # Register: 3 req/min per IP
     handle /api/auth/register {
+		import edge_identity
         rate_limit {
             zone auth_register {
                 key    {remote_host}
@@ -186,6 +200,7 @@
     }
 
     handle /api/keys/* {
+		import edge_identity
         rate_limit {
             zone keys {
                 key    {remote_host}

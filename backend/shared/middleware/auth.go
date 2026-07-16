@@ -10,6 +10,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,16 @@ func AnonymousRateLimitBucket(secret []byte, edgeIdentity, action string, now ti
 	action = strings.TrimSpace(action)
 	if edgeIdentity == "" || action == "" {
 		return "", errors.New("rate-limit identity and action are required")
+	}
+	parts := strings.Split(edgeIdentity, ".")
+	if len(parts) != 3 || parts[0] != "v1" || len(parts[1]) != 12 || len(parts[2]) != 43 {
+		return "", errors.New("rate-limit identity has invalid edge signature format")
+	}
+	if _, err := hex.DecodeString(parts[1]); err != nil {
+		return "", errors.New("rate-limit identity has invalid edge key id")
+	}
+	if digest, err := base64.RawURLEncoding.DecodeString(parts[2]); err != nil || len(digest) != sha256.Size {
+		return "", errors.New("rate-limit identity has invalid edge digest")
 	}
 	day := now.UTC().Format("2006-01-02")
 	rotation := hmac.New(sha256.New, secret)

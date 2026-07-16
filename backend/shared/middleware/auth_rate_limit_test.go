@@ -1,13 +1,18 @@
 package middleware
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
 )
 
+func validEdgeIdentity() string {
+	return "v1.0123456789ab." + base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+}
+
 func TestAnonymousRateLimitBucketNeverContainsRawIdentity(t *testing.T) {
-	identity := "198.51.100.23|Mozilla/5.0 secret-agent"
+	identity := validEdgeIdentity()
 	got, err := AnonymousRateLimitBucket([]byte("01234567890123456789012345678901"), identity, "login", time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
@@ -22,8 +27,8 @@ func TestAnonymousRateLimitBucketNeverContainsRawIdentity(t *testing.T) {
 
 func TestAnonymousRateLimitBucketRotatesDaily(t *testing.T) {
 	secret := []byte("01234567890123456789012345678901")
-	a, _ := AnonymousRateLimitBucket(secret, "edge-token", "register", time.Date(2026, 7, 16, 23, 59, 0, 0, time.UTC))
-	b, _ := AnonymousRateLimitBucket(secret, "edge-token", "register", time.Date(2026, 7, 17, 0, 1, 0, 0, time.UTC))
+	a, _ := AnonymousRateLimitBucket(secret, validEdgeIdentity(), "register", time.Date(2026, 7, 16, 23, 59, 0, 0, time.UTC))
+	b, _ := AnonymousRateLimitBucket(secret, validEdgeIdentity(), "register", time.Date(2026, 7, 17, 0, 1, 0, 0, time.UTC))
 	if a == b {
 		t.Fatal("bucket did not rotate across UTC day")
 	}
@@ -45,6 +50,9 @@ func TestRateLimitKeysRejectMissingInputs(t *testing.T) {
 	}
 	if _, err := AnonymousRateLimitBucket([]byte("short"), "", "login", time.Now()); err == nil {
 		t.Fatal("accepted empty identity")
+	}
+	if _, err := AnonymousRateLimitBucket([]byte("01234567890123456789012345678901"), "client-spoof", "login", time.Now()); err == nil {
+		t.Fatal("accepted unsigned edge identity")
 	}
 	if _, err := AuthenticatedRateLimitKey(0, "files"); err == nil {
 		t.Fatal("accepted invalid uin")

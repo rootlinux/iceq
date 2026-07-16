@@ -61,6 +61,31 @@ x-resources-app: &resources-app
 
 services:
 
+  # Private raw-IP trust boundary. It has no published port, persistent
+  # storage, or access logs; only Caddy sends it remote_host and only an
+  # opaque rotating HMAC identity leaves it.
+  edge-identity:
+    <<: [*default-security, *resources-app]
+    build:
+      context: ..
+      dockerfile: backend/edge-identity/Dockerfile
+    container_name: iceq-edge-identity
+    restart: unless-stopped
+    networks: [iceq-net]
+    env_file:
+      - ${ICEQ_ENV_FILE:-.env.local}
+    environment:
+      ICEQ_EDGE_IDENTITY_HMAC_SECRET: ${ICEQ_EDGE_IDENTITY_HMAC_SECRET:?set ICEQ_EDGE_IDENTITY_HMAC_SECRET}
+      ICEQ_EDGE_IDENTITY_HMAC_PREVIOUS_SECRET: ${ICEQ_EDGE_IDENTITY_HMAC_PREVIOUS_SECRET:-}
+    healthcheck:
+      test: ["CMD", "/edge-identity", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    logging:
+      driver: "none"
+
   # ==========================================================================
   # PostgreSQL 16
   # ==========================================================================
@@ -381,6 +406,8 @@ services:
       retries: 5
       start_period: 30s
     depends_on:
+      edge-identity:
+        condition: service_healthy
       auth-service:
         condition: service_healthy
       key-service:

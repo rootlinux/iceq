@@ -32,7 +32,7 @@ func bundleRequest(t *testing.T, deps BundleDeps) *httptest.ResponseRecorder {
 	r := chi.NewRouter()
 	r.Get("/api/keys/bundle/{uin}", NewGetBundleHandler(deps))
 	req := httptest.NewRequest(http.MethodGet, "/api/keys/bundle/42", nil)
-	req.Header.Set("X-IceQ-RateLimit-Identity", "203.0.113.9")
+	req.Header.Set("X-IceQ-RateLimit-Identity", "v1.0123456789ab.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
 	req.Header.Set("User-Agent", "private-browser-fingerprint")
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
