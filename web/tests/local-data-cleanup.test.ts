@@ -6,6 +6,7 @@ import {
   clearAllIceQLocalData,
   registerMemoryReset,
   trackObjectURL,
+  untrackObjectURL,
 } from "../src/lib/localDataCleanup.ts";
 import { ICEQ_INDEXEDDB_NAME } from "../src/lib/indexeddb.ts";
 
@@ -71,6 +72,40 @@ test("clears every IceQ-owned browser and registered in-memory state without tou
   assert.equal(resets, 2);
   assert.deepEqual([...local.entries], [["iceq_logged_out", "1"], ["other_app", "keep"]]);
   assert.deepEqual([...session.entries], [["unrelated", "keep"]]);
+});
+
+test("concurrent cleanup callers share one IndexedDB deletion flight", async () => {
+  let deletes = 0;
+  let finish: (() => void) | undefined;
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: {
+    async databases() { return [{ name: ICEQ_INDEXEDDB_NAME }]; },
+    deleteDatabase() { deletes += 1; const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null }; finish = () => request.onsuccess?.(); return request; },
+  } });
+  const first = clearAllIceQLocalData("logout");
+  const second = clearAllIceQLocalData("auth-expired");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(deletes, 1);
+  finish?.();
+  await Promise.all([first, second]);
+});
+
+test("a blocked delete that later succeeds remains one request", async () => {
+  let deletes = 0;
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: {
+    async databases() { return [{ name: ICEQ_INDEXEDDB_NAME }]; },
+    deleteDatabase() { deletes += 1; const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null }; queueMicrotask(() => { request.onblocked?.(); queueMicrotask(() => request.onsuccess?.()); }); return request; },
+  } });
+  await Promise.all([clearAllIceQLocalData("panic-wipe"), clearAllIceQLocalData("logout")]);
+  assert.equal(deletes, 1);
+});
+
+test("untracked object URLs are not revoked by later cleanup", async () => {
+  const revoked: string[] = [];
+  Object.defineProperty(globalThis.URL, "revokeObjectURL", { configurable: true, value: (url: string) => revoked.push(url) });
+  trackObjectURL("blob:finished");
+  untrackObjectURL("blob:finished");
+  await clearAllIceQLocalData("logout");
+  assert.deepEqual(revoked, []);
 });
 
 test("rejects a typed aggregate error when mandatory IndexedDB deletion fails", async () => {

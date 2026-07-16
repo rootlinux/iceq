@@ -52,6 +52,15 @@ test("logout attempts server revocation before clearing every local account stat
   const countBeforePanic = deleteCount;
   await assert.rejects(useAuthStore.getState().panicWipe());
   assert.equal(panicDeleteCountAtCall, countBeforePanic);
-  assert.equal(deleteCount, countBeforePanic + 1);
-  assert.equal(values.get("iceq_logged_out"), "1");
+  assert.equal(deleteCount, countBeforePanic);
+  assert.equal(useAuthStore.getState().isAuthenticated, true);
+
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: () => new Promise<Response>(() => undefined) });
+  useAuthStore.setState({ uin: 8, username: "bob", accessToken: "second", isAuthenticated: true });
+  const expiry = useAuthStore.getState().expireSession();
+  assert.equal(useAuthStore.getState().isAuthenticated, false);
+  assert.equal(useAuthStore.getState().accessToken, null);
+  const expiryStarted = Date.now();
+  await expiry;
+  assert.ok(Date.now() - expiryStarted < 1_500);
 });

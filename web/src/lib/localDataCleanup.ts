@@ -15,6 +15,8 @@ const objectUrls = new Set<string>();
 const ICEQ_CACHE_PREFIX = "iceq-static-";
 export const ICEQ_LOGGED_OUT_MARKER_KEY = "iceq_logged_out";
 const LEGACY_ICEQ_DATABASES = ["iceq-signal", "iceq-messages", "iceq-keys"] as const;
+let cleanupFlight: Promise<void> | null = null;
+const outstandingBlockedDatabases = new Set<string>();
 
 export function registerMemoryReset(reset: () => void): () => void {
   memoryResetters.add(reset);
@@ -23,6 +25,16 @@ export function registerMemoryReset(reset: () => void): () => void {
 
 export function trackObjectURL(url: string): void {
   objectUrls.add(url);
+}
+
+export function untrackObjectURL(url: string): void {
+  objectUrls.delete(url);
+}
+
+export function resetIceQMemory(): void {
+  for (const reset of memoryResetters) {
+    try { reset(); } catch { /* durable cleanup reports reset failures on its pass */ }
+  }
 }
 
 function isIceQStorageKey(key: string): boolean {
@@ -50,6 +62,7 @@ async function iceQDatabaseNames(): Promise<string[]> {
 
 async function deleteIceQDatabase(name: string): Promise<void> {
   if (typeof indexedDB === "undefined") return;
+  if (outstandingBlockedDatabases.has(name)) throw new Error(`IndexedDB deletion is still outstanding: ${name}`);
   await new Promise<void>((resolve, reject) => {
     let request: IDBOpenDBRequest;
     try {
@@ -58,13 +71,22 @@ async function deleteIceQDatabase(name: string): Promise<void> {
       reject(error);
       return;
     }
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB deletion failed"));
-    request.onblocked = () => reject(new Error("IndexedDB deletion was blocked"));
+    const timeout = setTimeout(() => { outstandingBlockedDatabases.add(name); reject(new Error("IndexedDB deletion remained blocked")); }, 1_000);
+    request.onsuccess = () => { clearTimeout(timeout); outstandingBlockedDatabases.delete(name); resolve(); };
+    request.onerror = () => { clearTimeout(timeout); outstandingBlockedDatabases.delete(name); reject(request.error ?? new Error("IndexedDB deletion failed")); };
+    request.onblocked = () => { /* keep this single request alive for a bounded grace period */ };
   });
 }
 
-export async function clearAllIceQLocalData(_reason: CleanupReason): Promise<void> {
+export function clearAllIceQLocalData(reason: CleanupReason): Promise<void> {
+  // A later reason joins the active cleanup. Every reason has the same durable
+  // deletion contract, so overlapping deleteDatabase requests add risk only.
+  if (cleanupFlight) return cleanupFlight;
+  cleanupFlight = performCleanup(reason).finally(() => { cleanupFlight = null; });
+  return cleanupFlight;
+}
+
+async function performCleanup(_reason: CleanupReason): Promise<void> {
   const failures: CleanupFailure[] = [];
   const capture = async (area: string, operation: () => void | Promise<void>): Promise<void> => {
     try { await operation(); } catch (cause) { failures.push({ area, cause }); }

@@ -8,6 +8,7 @@ import { useAuthStore } from "../../store/authStore";
 import { verifySignedPreKeyBundle } from "../../lib/signal";
 import { PrivacySettings } from "./PrivacySettings";
 import { useI18n } from "../../i18n";
+import { runConfirmedPanicWipe } from "../../lib/panicWipeAction";
 
 type FingerprintStatus =
   | { kind: "loading" }
@@ -98,9 +99,9 @@ export function SecuritySettings(): JSX.Element {
           <strong>{i18n.t("security.panicWipeTitle")}</strong>
           <p>{i18n.t("security.panicWipeWarning")}</p>
           <button type="button" disabled={panicBusy} onClick={() => {
-            if (!window.confirm(i18n.t("security.panicWipeConfirm"))) return;
             setPanicBusy(true); setPanicError(false);
-            void panicWipe().catch(() => setPanicError(true)).finally(() => setPanicBusy(false));
+            void runConfirmedPanicWipe(() => window.confirm(i18n.t("security.panicWipeConfirm")), panicWipe)
+              .catch(() => setPanicError(true)).finally(() => setPanicBusy(false));
           }}>{i18n.t("security.panicWipeAction")}</button>
           {panicError && <div role="alert">{i18n.t("security.panicWipeFailed")}</div>}
         </div>

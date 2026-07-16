@@ -15,7 +15,7 @@ import { tokenStore } from "../api/client";
 import * as authApi from "../api/auth";
 import type { UserPublic } from "../api/auth";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
-import { clearAllIceQLocalData, ICEQ_LOGGED_OUT_MARKER_KEY, registerMemoryReset, type CleanupReason } from "../lib/localDataCleanup";
+import { clearAllIceQLocalData, ICEQ_LOGGED_OUT_MARKER_KEY, registerMemoryReset, resetIceQMemory, type CleanupReason } from "../lib/localDataCleanup";
 
 const ACCOUNT_UIN_KEY = "iceq_account_uin";
 
@@ -56,6 +56,16 @@ function priorAccountUin(): number | null {
 
 function rememberAccountUin(uin: number): void {
   localStorage.setItem(ACCOUNT_UIN_KEY, String(uin));
+}
+
+async function observeLogoutBounded(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, 1_000);
+    void authApi.logout().catch(() => undefined).finally(() => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
@@ -174,21 +184,24 @@ export const useAuthStore = create<AuthState>((set) => ({
 	},
 
 	panicWipe: async () => {
-		try { await authApi.panicWipe(); } finally {
-			try { await cleanSession("panic-wipe"); } finally {
-				set(EMPTY_AUTH);
-				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
-			}
+		await authApi.panicWipe();
+		try { await cleanSession("panic-wipe"); } finally {
+			set(EMPTY_AUTH);
+			localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
 		}
 	},
 
-	expireSession: async () => {
-		try { await authApi.logout(); } catch { /* best-effort revocation */ } finally {
+	expireSession: () => {
+		tokenStore.clear();
+		resetIceQMemory();
+		set(EMPTY_AUTH);
+		return (async () => {
+			await observeLogoutBounded();
 			try { await cleanSession("auth-expired"); } finally {
 				set(EMPTY_AUTH);
 				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
 			}
-		}
+		})();
 	},
 
 	setSession: async (user, access, refresh) => {
