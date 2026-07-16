@@ -23,7 +23,7 @@ Last reviewed: 2026-07-16. “Complete” means the scoped repository implementa
 | `(cd web && npm test)` | Exit 0: 142 tests passed, 0 failed/skipped/cancelled. |
 | `(cd web && npm run typecheck)` | Exit 0. |
 | `(cd web && npm run build)` | Exit 0. Vite still reported curveasm/CommonJS/browser-externalization, ineffective dynamic-import, and over-500 kB chunk warnings. |
-| `(cd web && npm audit --audit-level=high)` | Exit 0 at the High threshold, but reported one Moderate vulnerability: `protobufjs <=7.6.2`, `GHSA-f38q-mgvj-vph7`; npm reports a fix is available via `npm audit fix`. This is not a clean zero-finding audit. |
+| `(cd web && npm audit --audit-level=moderate)` and `(cd web && npm audit --audit-level=moderate --omit=dev)` | Exit 0 for both commands after `protobufjs` was pinned as an exact direct dependency at `7.6.5` in `f3968a9`; each audit reported `0 vulnerabilities`. The boundary test, all 142 web tests, typecheck, and production build also passed with the patched dependency. |
 | `./deploy/scripts/check-compose-config.sh` | Exit 0. The checker used a temporary non-secret env for interpolation and left the pre-existing `deploy/.env.local` unchanged. Configuration validation only; no containers started. |
 | `./deploy/scripts/check-edge-identity.test.sh` | Exit 0. Static contract confirms Caddy strips both client trust headers, only the signer receives `remote_host`, application upstreams receive distinct current/previous digests during rotation, and the signer has no published port. Consumers atomically increment both derived buckets and deny when either exceeds its limit; retire previous only after a full limiter window. |
 | `./deploy/scripts/check-clearnet-compose.sh` | Exit 0: `STATIC PASS` for the default clearnet-only/Tor-isolation/Caddy-policy source structure; runtime `SKIP` because `iceq/caddy:dev` was unavailable. This is not runtime Caddy proof. |
@@ -38,7 +38,8 @@ Last reviewed: 2026-07-16. “Complete” means the scoped repository implementa
 (cd web && npm test)
 (cd web && npm run typecheck)
 (cd web && npm run build)
-(cd web && npm audit --audit-level=high)
+(cd web && npm audit --audit-level=moderate)
+(cd web && npm audit --audit-level=moderate --omit=dev)
 ./deploy/scripts/check-compose-config.sh
 ```
 

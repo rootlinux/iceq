@@ -79,9 +79,12 @@ correct the executable-evidence contract.
 - Production bundle: `cd web && npm run build` PASS. Vite reports existing
   vendor `curveasm.js` compatibility warnings; the build exits zero and the
   regression suite verifies no broken `curveasm.wasm` placeholder/reference.
-- Dependency gate: `cd web && npm audit --audit-level=high` PASS at the requested
-  threshold; npm reports one **moderate** `protobufjs` advisory, so the tree is
-  not vulnerability-free.
+- Dependency gate: the earlier run reported one **moderate** `protobufjs`
+  advisory. It was resolved in `f3968a9` by pinning exact direct
+  `protobufjs@7.6.5`; fresh `npm audit --audit-level=moderate` and
+  `npm audit --audit-level=moderate --omit=dev` runs both PASS with
+  `0 vulnerabilities`. This preserves the historical finding without treating
+  it as a current open issue.
 - Compose: `docker compose -f deploy/docker-compose.yml config --quiet` PASS
   with the local example-derived environment. This validates rendering, not
   container startup or runtime health.
@@ -92,8 +95,9 @@ correct the executable-evidence contract.
    existing volumes before affected services start.
 2. Obtain live clearnet HTTPS/WSS, authorization, rate-limit, panic-wipe, and
    file-grant smoke evidence only after the separate deployment approval gate.
-3. Resolve or explicitly accept the moderate `protobufjs` advisory after
-   compatibility review; it does not fail the configured high-severity gate.
+3. Resolved at `f3968a9`: exact direct `protobufjs@7.6.5` passed the parser and
+   identity boundary tests, all 142 web tests, typecheck, production build, and
+   both moderate audit modes with `0 vulnerabilities`.
 4. Add server-side expiry/reconciliation for attachment grants to cover browser
    crashes before the in-memory lifecycle can revoke them.
 5. Retain the documented limitations: legacy pre-004 message cleanup, incomplete
