@@ -1,6 +1,6 @@
 # IceQ
 
-IceQ is a privacy-first, end-to-end encrypted messenger built on the Signal Protocol. The server is a blind relay — it stores and forwards opaque ciphertext but can never read message content, even under compulsion or breach.
+IceQ is a privacy-first encrypted messenger. Direct messages use Signal Protocol primitives and groups use client-side Sender Keys; servers relay ciphertext but still control availability, routing, membership metadata, and the web code delivered to browsers. The implementation has not yet received an independent cryptographic audit.
 
 ## Architecture
 
@@ -36,6 +36,8 @@ Infrastructure: PostgreSQL · ScyllaDB · Redis · NATS · MinIO · optional Tor
 ```
 
 ## Quick Start
+
+This is a local clearnet setup. Production operators should follow the [operator runbook](docs/operator-runbook.md); current guarantees and gaps are in [security status](docs/security-status.md) and the [threat model](docs/threat-model.md).
 
 ```bash
 # 1. Clone
@@ -73,7 +75,7 @@ open https://localhost        # accept the self-signed dev cert
 
 ## E2EE Design
 
-IceQ implements the Signal Protocol (X3DH key agreement + Double Ratchet message encryption) entirely on the client. Every message is encrypted before it leaves the device using the recipient's prekey bundle fetched from key-service. The server receives, stores, and forwards opaque byte blobs — it holds no decryption keys and cannot read message content. Keys never leave the originating device.
+IceQ encrypts direct messages in the browser with Signal Protocol primitives (X3DH key agreement and Double Ratchet) using the recipient's prekey bundle. Group messages use browser-side Sender Keys scoped to a membership epoch. The server receives ciphertext rather than message plaintext, but it remains trusted for key-bundle distribution, membership, routing, availability, metadata handling, and delivery of the web application. Users should compare safety fingerprints out of band; no independent cryptographic audit has yet validated these implementations.
 
 Direct-message safety numbers are computed client-side from the two users' UINs and identity public keys. The helper returns a stable 12-group decimal fingerprint that users can compare out of band; a mismatch means the peer identity key changed and the conversation should not be trusted until verified.
 
@@ -143,6 +145,8 @@ Rollout ordering is service-specific:
 2. Apply and verify migration `005_wiped_accounts.sql` **before starting the updated auth-service or ws-gateway**. Until 005 exists, JWT validation cannot prove durable revocation and fails closed, so authenticated REST requests and WebSocket authentication/message checks are rejected.
 
 ## Optional Tor Hidden Service
+
+> Current phase: deferred. Do not enable this profile or advertise an onion address until the clearnet deployment has passed real-user acceptance. The commands below document the retained opt-in scaffold for that later phase.
 
 The default Compose command starts only the clearnet stack. Tor remains available as an explicit profile for later testing; it is not part of the current `iceq.space` rollout. When enabled, the `.onion` address is auto-generated on first boot and stored in the `tor_keys` Docker volume. `Onion-Location` is emitted only after an operator sets a non-empty `ICEQ_ONION_LOCATION` in `deploy/.env.local`; leaving it absent keeps clearnet responses free of onion advertising.
 
@@ -289,14 +293,14 @@ cd backend && go run ./cmd_smoke_step10/
 
 The current implementation status for the requested Tor, E2EE, backend-hardening, anonymity, frontend, and delivery work is tracked in [`docs/security-status.md`](docs/security-status.md).
 
-GitHub Actions workflow [`security-ci.yml`](.github/workflows/security-ci.yml) runs backend tests, web source tests/build, high-severity `npm audit`, and Docker Compose config validation. These checks are deterministic and do not start the full live stack.
+GitHub Actions workflow [`security-ci.yml`](.github/workflows/security-ci.yml) runs Go tests/vet/govulncheck, web tests/typecheck/build/high-severity audit, secret scanning, and Docker Compose model validation. Compose validation does not start the stack or prove runtime behavior.
 
 ## Known Limitations
 
-- **Group attachments** — direct-message attachments are encrypted and wired in the chat UI; group attachment E2EE still waits on the group encryption design
-- **One-time prekey automation** — the key-service and frontend API support replenishment, but automatic low-watermark upload still needs a background client flow
 - **Batch read receipts** — read receipts are per-message; a bulk-ACK endpoint is not yet implemented
 - **Push notifications** — offline push (APNs/FCM) is not implemented; unread messages are delivered on next WebSocket reconnect
 - **Legacy bcrypt accounts** - new passwords use Argon2id; existing bcrypt hashes upgrade automatically after a successful login
 - **WebSocket bearer compatibility** - refresh tokens now use HttpOnly cookies, but WebSocket auth still needs the short-lived access token until ws-gateway supports cookie auth
 - **Metadata-reduced message storage** - optional message TTL is available, but conversation IDs and sender/receiver routing metadata still need a deeper minimization redesign
+- **Independent review and production acceptance** — repository tests do not replace a cryptographic audit, penetration test, backup/restore rehearsal, or clearnet real-user acceptance
+- **Tor runtime** — opt-in Compose assets exist, but boot, consensus publication, onion reachability, and DNS-leak testing are intentionally deferred until after clearnet acceptance

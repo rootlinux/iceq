@@ -11,61 +11,74 @@ permissions:
 
 jobs:
   backend:
-    name: Backend tests
+    name: Go test, vet, and vulnerability scan
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
-
       - name: Test backend
         working-directory: backend
         run: go test ./...
+      - name: Static analysis
+        working-directory: backend
+        run: go vet ./...
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      - name: Scan reachable Go vulnerabilities
+        working-directory: backend
+        run: govulncheck ./...
 
   web:
-    name: Web tests and audit
+    name: Web test, typecheck, build, and audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
-
       - name: Install dependencies
         working-directory: web
         run: npm ci
-
+      - name: Run web tests
+        working-directory: web
+        run: npm test
+      - name: Typecheck web
+        working-directory: web
+        run: npm run typecheck
+      - name: Build web
+        working-directory: web
+        run: npm run build
       - name: Audit high-risk dependencies
         working-directory: web
         run: npm audit --audit-level=high
 
-      - name: Run web source tests
-        working-directory: web
-        run: npm test
-
-      - name: Build web
-        working-directory: web
-        run: npm run build
-
-  compose:
-    name: Compose validation
+  configuration:
+    name: Compose and secret validation
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Prepare local env
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan repository for secrets
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare non-secret validation environment
         run: cp deploy/.env.example deploy/.env.local
-
-      - name: Validate compose config
-        run: docker compose -f deploy/docker-compose.yml config --quiet
+      - name: Validate Compose model
+        run: docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml config --quiet
