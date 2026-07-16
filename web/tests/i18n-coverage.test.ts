@@ -54,19 +54,11 @@ test("migrated components do not regress to raw catalog copy", () => {
 function inspectSource(path: string, source: string): string[] {
   const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const violations: string[] = [];
-  const bindings = new Map<string, ts.Expression>();
-  const functions = new Map<string, ts.FunctionDeclaration>();
-  const index = (node: ts.Node): void => {
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) bindings.set(node.name.text, node.initializer);
-    if (ts.isFunctionDeclaration(node) && node.name) functions.set(node.name.text, node);
-    ts.forEachChild(node, index);
-  };
-  index(file);
   const visit = (node: ts.Node): void => {
       if (ts.isJsxText(node) && /[A-Za-z]{2}/.test(node.text.trim()) && node.text.trim() !== "IceQ") violations.push(`${path}: JSX text ${node.text.trim()}`);
       if (ts.isJsxAttribute(node) && node.initializer && ts.isStringLiteralLike(node.initializer) && /^(aria-label|placeholder|title)$/.test(node.name.getText()) && /[A-Za-z]{2}/.test(node.initializer.text)) violations.push(`${path}: ${node.name.getText()}=${node.initializer.text}`);
-      if (ts.isJsxAttribute(node) && node.initializer && ts.isJsxExpression(node.initializer) && node.initializer.expression && /^(aria-label|placeholder|title)$/.test(node.name.getText())) collectRenderedCopy(node.initializer.expression, path, violations, bindings, functions);
-      if (ts.isJsxExpression(node) && !ts.isJsxAttribute(node.parent) && node.expression) collectRenderedCopy(node.expression, path, violations, bindings, functions);
+      if (ts.isJsxAttribute(node) && node.initializer && ts.isJsxExpression(node.initializer) && node.initializer.expression && /^(aria-label|placeholder|title)$/.test(node.name.getText())) collectRenderedCopy(node.initializer.expression, path, violations);
+      if (ts.isJsxExpression(node) && !ts.isJsxAttribute(node.parent) && node.expression) collectRenderedCopy(node.expression, path, violations);
       if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && /^set[A-Za-z]*(Error|Success)$/.test(node.expression.text)) {
         const value = node.arguments[0];
         if (value && (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) && /[A-Za-z]{2}/.test(value.text)) violations.push(`${path}: static UI state ${value.text}`);
@@ -90,36 +82,81 @@ test("raw-copy guard follows local dataflow instead of allowing indirection", ()
   for (const expected of ["Delete account", "Try again", "Remove device", "Danger zone"]) assert.ok(violations.some((value) => value.includes(expected)), expected);
 });
 
+test("raw-copy guard resolves nearest lexical binding without cross-function collisions", () => {
+  const fixtures = [
+    `function A(){ const label='Delete account'; return <button>{label}</button>; } function B(){ const label=t('safe.key'); return <button>{label}</button>; }`,
+    `function B(){ const label=t('safe.key'); return <button>{label}</button>; } function A(){ const label='Delete account'; return <button>{label}</button>; }`,
+    `function A(){ const label='Delete account'; { const label=t('safe.key'); void <button>{label}</button>; } return <button>{label}</button>; }`,
+    `const label=t('safe.key'); function A(){ const label='Delete account'; function B(){ const label=t('safe.key'); return <button>{label}</button>; } return <button>{label}</button>; }`,
+  ];
+  for (const [index, fixture] of fixtures.entries()) {
+    const violations = inspectSource(`scope-${index}.tsx`, fixture);
+    assert.equal(violations.filter((value) => value.includes("Delete account")).length, 1, JSON.stringify(violations));
+    assert.equal(violations.some((value) => value.includes("safe.key")), false, JSON.stringify(violations));
+  }
+});
+
 function allTsx(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? allTsx(resolve(dir, entry.name)) : entry.name.endsWith(".tsx") ? [resolve(dir, entry.name)] : []);
 }
 
-function collectRenderedCopy(node: ts.Expression, path: string, violations: string[], bindings: Map<string, ts.Expression>, functions: Map<string, ts.FunctionDeclaration>, seen = new Set<ts.Node>()): void {
+function collectRenderedCopy(node: ts.Expression, path: string, violations: string[], seen = new Set<ts.Node>()): void {
   if (seen.has(node)) return;
   seen.add(node);
   if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && /[A-Za-z]{2}/.test(node.text) && node.text !== "IceQ") violations.push(`${path}: rendered copy ${node.text}`);
   else if (ts.isTemplateExpression(node) && /[A-Za-z]{2}/.test(node.head.text + node.templateSpans.map((span) => span.literal.text).join(""))) violations.push(`${path}: rendered template copy`);
-  else if (ts.isConditionalExpression(node)) { collectRenderedCopy(node.whenTrue, path, violations, bindings, functions, seen); collectRenderedCopy(node.whenFalse, path, violations, bindings, functions, seen); }
-  else if (ts.isBinaryExpression(node) && [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.BarBarToken].includes(node.operatorToken.kind)) collectRenderedCopy(node.right, path, violations, bindings, functions, seen);
-  else if (ts.isParenthesizedExpression(node)) collectRenderedCopy(node.expression, path, violations, bindings, functions, seen);
-  else if (ts.isIdentifier(node)) { const value = bindings.get(node.text); if (value) collectRenderedCopy(value, path, violations, bindings, functions, seen); }
+  else if (ts.isConditionalExpression(node)) { collectRenderedCopy(node.whenTrue, path, violations, seen); collectRenderedCopy(node.whenFalse, path, violations, seen); }
+  else if (ts.isBinaryExpression(node) && [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.BarBarToken].includes(node.operatorToken.kind)) collectRenderedCopy(node.right, path, violations, seen);
+  else if (ts.isParenthesizedExpression(node)) collectRenderedCopy(node.expression, path, violations, seen);
+  else if (ts.isIdentifier(node)) {
+    const declaration = resolveLexicalDeclaration(node.text, node);
+    if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) collectRenderedCopy(declaration.initializer, path, violations, seen);
+  }
   else if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)) {
-    const object = bindings.get(node.expression.text);
+    const declaration = resolveLexicalDeclaration(node.expression.text, node);
+    const object = declaration && ts.isVariableDeclaration(declaration) ? declaration.initializer : undefined;
     if (object && ts.isObjectLiteralExpression(object)) {
       const property = object.properties.find((item): item is ts.PropertyAssignment => ts.isPropertyAssignment(item) && item.name.getText().replace(/["']/g, "") === node.name.text);
-      if (property) collectRenderedCopy(property.initializer, path, violations, bindings, functions, seen);
+      if (property) collectRenderedCopy(property.initializer, path, violations, seen);
     }
   } else if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) && node.argumentExpression && ts.isNumericLiteral(node.argumentExpression)) {
-    const array = bindings.get(node.expression.text);
+    const declaration = resolveLexicalDeclaration(node.expression.text, node);
+    const array = declaration && ts.isVariableDeclaration(declaration) ? declaration.initializer : undefined;
     const item = array && ts.isArrayLiteralExpression(array) ? array.elements[Number(node.argumentExpression.text)] : undefined;
-    if (item && ts.isExpression(item)) collectRenderedCopy(item, path, violations, bindings, functions, seen);
+    if (item && ts.isExpression(item)) collectRenderedCopy(item, path, violations, seen);
   } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.arguments.length === 0) {
-    const fn = functions.get(node.expression.text);
+    const declaration = resolveLexicalDeclaration(node.expression.text, node);
+    const fn = declaration && ts.isFunctionDeclaration(declaration) ? declaration : undefined;
     if (fn && fn.parameters.length === 0 && fn.body) {
       const returned = fn.body.statements.find(ts.isReturnStatement)?.expression;
-      if (returned) collectRenderedCopy(returned, path, violations, bindings, functions, seen);
+      if (returned) collectRenderedCopy(returned, path, violations, seen);
     }
-    const arrow = bindings.get(node.expression.text);
-    if (arrow && ts.isArrowFunction(arrow) && arrow.parameters.length === 0 && !ts.isBlock(arrow.body)) collectRenderedCopy(arrow.body, path, violations, bindings, functions, seen);
+    const arrow = declaration && ts.isVariableDeclaration(declaration) ? declaration.initializer : undefined;
+    if (arrow && ts.isArrowFunction(arrow) && arrow.parameters.length === 0 && !ts.isBlock(arrow.body)) collectRenderedCopy(arrow.body, path, violations, seen);
   }
+}
+
+type LexicalDeclaration = ts.VariableDeclaration | ts.FunctionDeclaration | ts.ParameterDeclaration;
+
+function resolveLexicalDeclaration(name: string, usage: ts.Node): LexicalDeclaration | undefined {
+  for (let scope: ts.Node | undefined = usage.parent; scope; scope = scope.parent) {
+    if (ts.isFunctionLike(scope)) {
+      const parameter = scope.parameters.find((item) => ts.isIdentifier(item.name) && item.name.text === name);
+      if (parameter) return parameter;
+    }
+    if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
+    let best: LexicalDeclaration | undefined;
+    for (const statement of scope.statements) {
+      if (statement.pos > usage.pos) break;
+      if (ts.isVariableStatement(statement)) {
+        for (const declaration of statement.declarationList.declarations) {
+          if (ts.isIdentifier(declaration.name) && declaration.name.text === name && declaration.pos <= usage.pos) best = declaration;
+        }
+      } else if (ts.isFunctionDeclaration(statement) && statement.name?.text === name) {
+        best = statement;
+      }
+    }
+    if (best) return best;
+  }
+  return undefined;
 }
