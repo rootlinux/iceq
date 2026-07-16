@@ -16,6 +16,7 @@ test("group chat components exist and reuse the shared chat message list/input",
   assert.match(groupChat, /<MessageInput groupId=\{group\.group_id\}/);
   assert.match(groupChat, /historyGroup\(groupId/);
   assert.ok(groupChat.indexOf("getSenderKeyDistributions(groupId)") < groupChat.indexOf("historyGroup(groupId"), "offline sender-key inbox must hydrate before group history");
+  assert.match(groupChat, /content_type: content\.content_type/);
 });
 
 test("group list opens active group conversations instead of static rows", () => {

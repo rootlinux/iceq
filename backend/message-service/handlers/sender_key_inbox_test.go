@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSenderKeyInboxPutBindsAuthenticatedSenderRecipientAndCurrentEpoch(t *testing.T) {
@@ -18,10 +19,13 @@ func TestSenderKeyInboxPutBindsAuthenticatedSenderRecipientAndCurrentEpoch(t *te
 	if !strings.Contains(q, "GROUP_MEMBERS") || !strings.Contains(q, "CRYPTO_EPOCH") || db.calls[0].args[1] != int64(100) || db.calls[0].args[2] != int64(200) {
 		t.Fatalf("query/args not fail-closed: %s %#v", q, db.calls[0].args)
 	}
+	if !strings.Contains(q, "DISTRIBUTION_ID) DO NOTHING") {
+		t.Fatal("same-epoch distribution ids are not independently retained")
+	}
 }
 
 func TestSenderKeyInboxGetRequiresCurrentRecipientMembershipAndEpoch(t *testing.T) {
-	db := &groupFakeDB{rowQueue: [][]any{{int64(4)}}, rowsQueue: [][][]any{{{int64(100), "b3BhcXVl", "signal_message", "d1"}}}}
+	db := &groupFakeDB{rowQueue: [][]any{{int64(4)}}, rowsQueue: [][][]any{{{int64(4), int64(100), "b3BhcXVl", "signal_message", "d1", (*time.Time)(nil)}}}}
 	rr := httptest.NewRecorder()
 	NewGetSenderKeyDistributionsHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodGet, "/api/groups/"+behaviorGroupID+"/sender-key-distributions", "", 200))
 	if rr.Code != 200 || !strings.Contains(rr.Body.String(), `"sender_uin":100`) {
@@ -29,5 +33,8 @@ func TestSenderKeyInboxGetRequiresCurrentRecipientMembershipAndEpoch(t *testing.
 	}
 	if db.calls[0].args[1] != int64(200) {
 		t.Fatalf("membership not bound to actor: %#v", db.calls[0].args)
+	}
+	if !strings.Contains(strings.ToUpper(db.calls[1].sql), "RETIRED_AT > NOW()-INTERVAL '24 HOURS'") {
+		t.Fatal("bounded decrypt-only grace missing")
 	}
 }

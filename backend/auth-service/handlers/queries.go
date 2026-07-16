@@ -151,7 +151,15 @@ const (
 	// they were a member of. Group ownership is NOT transferred
 	// here; an orphaned group is left in place (a separate
 	// cleanup pass in the future could prune empty groups).
-	qWipeGroupMemberships = `DELETE FROM group_members WHERE uin = $1`
+	qWipeGroupMemberships = `
+	 WITH affected AS (SELECT g.id,g.owner_uin FROM groups g JOIN group_members m ON m.group_id=g.id WHERE m.uin=$1 FOR UPDATE),
+	 removed AS (DELETE FROM group_members WHERE uin=$1 RETURNING group_id),
+	 survivors AS (SELECT a.id,(SELECT uin FROM group_members WHERE group_id=a.id AND uin<>$1 ORDER BY joined_at,uin LIMIT 1) successor FROM affected a),
+	 updated AS (UPDATE groups g SET crypto_epoch=crypto_epoch+1,
+	   owner_uin=CASE WHEN g.owner_uin=$1 THEN s.successor ELSE g.owner_uin END
+	   FROM survivors s WHERE g.id=s.id AND s.successor IS NOT NULL RETURNING g.id),
+	 retired AS (UPDATE sender_key_distributions d SET retired_at=COALESCE(retired_at,NOW()) WHERE d.group_id IN (SELECT id FROM affected) RETURNING 1)
+	 DELETE FROM groups g USING survivors s WHERE g.id=s.id AND s.successor IS NULL`
 
 	// qWipeContacts removes the user from everyone's contact
 	// list AND removes every contact from the user's own

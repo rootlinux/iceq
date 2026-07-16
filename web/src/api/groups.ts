@@ -121,7 +121,7 @@ export async function leaveOrRemoveMember(groupId: string, uin: number): Promise
   );
 }
 
-export interface SenderKeyInboxItem { sender_uin:number; ciphertext:string; msg_type:"prekey_message"|"signal_message"; distribution_id:string }
+export interface SenderKeyInboxItem { epoch:number; sender_uin:number; ciphertext:string; msg_type:"prekey_message"|"signal_message"; distribution_id:string; retired_at?:string }
 export async function putSenderKeyDistribution(groupId:string,body:{recipient_uin:number;epoch:number;distribution_id:string;ciphertext:string;msg_type:"prekey_message"|"signal_message"}):Promise<void>{
   await fetchJSON<void>(`/api/groups/${encodeURIComponent(groupId)}/sender-key-distributions`,{method:"POST",body});
 }

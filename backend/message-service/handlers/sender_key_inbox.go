@@ -17,10 +17,12 @@ type putSenderKeyDistributionRequest struct {
 	MsgType        string `json:"msg_type"`
 }
 type senderKeyDistributionItem struct {
-	SenderUIN      int64  `json:"sender_uin"`
-	Ciphertext     string `json:"ciphertext"`
-	MsgType        string `json:"msg_type"`
-	DistributionID string `json:"distribution_id"`
+	Epoch          int64      `json:"epoch"`
+	SenderUIN      int64      `json:"sender_uin"`
+	Ciphertext     string     `json:"ciphertext"`
+	MsgType        string     `json:"msg_type"`
+	DistributionID string     `json:"distribution_id"`
+	RetiredAt      *time.Time `json:"retired_at,omitempty"`
 }
 type senderKeyDistributionResponse struct {
 	Epoch         int64                       `json:"epoch"`
@@ -33,8 +35,7 @@ const qPutSenderKeyDistribution = `
  WHERE g.id=$1 AND g.crypto_epoch=$4
  AND EXISTS (SELECT 1 FROM group_members WHERE group_id=g.id AND uin=$2)
  AND EXISTS (SELECT 1 FROM group_members WHERE group_id=g.id AND uin=$3)
- ON CONFLICT (group_id,epoch,recipient_uin,sender_uin) DO UPDATE
- SET distribution_id=EXCLUDED.distribution_id,ciphertext=EXCLUDED.ciphertext,msg_type=EXCLUDED.msg_type,created_at=NOW()`
+	ON CONFLICT (group_id,epoch,recipient_uin,sender_uin,distribution_id) DO NOTHING`
 
 func NewPutSenderKeyDistributionHandler(deps GroupsDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -91,7 +92,7 @@ func NewGetSenderKeyDistributionsHandler(deps GroupsDeps) http.HandlerFunc {
 			writeError(w, 403, "NOT_A_MEMBER", "current group membership is required")
 			return
 		}
-		rows, err := deps.PG.Query(ctx, `SELECT sender_uin,ciphertext,msg_type,distribution_id FROM sender_key_distributions WHERE group_id=$1 AND epoch=$2 AND recipient_uin=$3 ORDER BY sender_uin`, gid, epoch, recipient)
+		rows, err := deps.PG.Query(ctx, `SELECT epoch,sender_uin,ciphertext,msg_type,distribution_id,retired_at FROM sender_key_distributions WHERE group_id=$1 AND recipient_uin=$2 AND (epoch=$3 OR retired_at > NOW()-INTERVAL '24 hours') ORDER BY epoch DESC,sender_uin,created_at DESC LIMIT 512`, gid, recipient, epoch)
 		if err != nil {
 			writeError(w, 500, "DB_ERROR", "could not read sender-key inbox")
 			return
@@ -100,7 +101,7 @@ func NewGetSenderKeyDistributionsHandler(deps GroupsDeps) http.HandlerFunc {
 		out := make([]senderKeyDistributionItem, 0)
 		for rows.Next() {
 			var item senderKeyDistributionItem
-			if rows.Scan(&item.SenderUIN, &item.Ciphertext, &item.MsgType, &item.DistributionID) != nil {
+			if rows.Scan(&item.Epoch, &item.SenderUIN, &item.Ciphertext, &item.MsgType, &item.DistributionID, &item.RetiredAt) != nil {
 				writeError(w, 500, "DB_ERROR", "could not read sender-key inbox")
 				return
 			}

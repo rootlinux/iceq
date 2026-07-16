@@ -94,6 +94,8 @@ services:
       - ./init/migrations/005_wiped_accounts.sql:/docker-entrypoint-initdb.d/05-wiped_accounts.sql:ro
       - ./init/migrations/006_file_object_owners.sql:/docker-entrypoint-initdb.d/06-file_object_owners.sql:ro
       - ./init/migrations/007_file_object_grants.sql:/docker-entrypoint-initdb.d/07-file_object_grants.sql:ro
+      - ./init/migrations/008_group_crypto_epoch.sql:/docker-entrypoint-initdb.d/08-group_crypto_epoch.sql:ro
+      - ./init/migrations/009_sender_key_distribution_inbox.sql:/docker-entrypoint-initdb.d/09-sender_key_distribution_inbox.sql:ro
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /run:size=16m,mode=0755

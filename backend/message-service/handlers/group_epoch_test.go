@@ -23,3 +23,12 @@ func TestGroupEpochMigrationUsesNextNonCollidingNumber(t *testing.T) {
 		t.Fatal("migration does not define crypto_epoch")
 	}
 }
+
+func TestOwnerLeaveIsOneLockedAtomicStatement(t *testing.T) {
+	q := strings.ToUpper(qRemoveGroupMemberAtomically)
+	for _, required := range []string{"FOR UPDATE", "DELETE FROM GROUP_MEMBERS", "CRYPTO_EPOCH=CRYPTO_EPOCH+1", "ORDER BY JOINED_AT,UIN", "DELETE FROM GROUPS"} {
+		if !strings.Contains(q, required) {
+			t.Fatalf("atomic removal missing %s", required)
+		}
+	}
+}

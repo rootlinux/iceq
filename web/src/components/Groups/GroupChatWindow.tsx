@@ -10,6 +10,7 @@ import type { Message } from "../../types/models";
 import { decodeGroupCiphertext, hydrateSenderKeyInbox, openGroupContent } from "../../lib/groupCrypto";
 import { useGroupStore } from "../../store/groupStore";
 import { decryptMessage } from "../../lib/signal";
+import { pruneObsoleteGroupEpochs } from "../../lib/groupCryptoStore";
 import { GroupDetail } from "./GroupDetail";
 
 interface GroupChatWindowProps {
@@ -24,6 +25,7 @@ function loadEncryptedGroupHistory(groupId: string, selfUin: number, conversatio
   const operation = (async () => {
     const roster = await getGroupMembersWithEpoch(groupId);
     const memberUins = roster.members.map((member) => member.uin);
+    await pruneObsoleteGroupEpochs(groupId, roster.crypto_epoch);
     useGroupStore.getState().setMembers(groupId, roster.members);
     useGroupStore.setState((state) => ({ groups: state.groups.map((item) => item.group_id === groupId ? { ...item, crypto_epoch: roster.crypto_epoch } : item) }));
     const inbox = await getSenderKeyDistributions(groupId);
@@ -35,7 +37,7 @@ function loadEncryptedGroupHistory(groupId: string, selfUin: number, conversatio
       try {
         if (row.msg_type !== "group_ciphertext") throw new Error("legacy insecure group row");
         const content = await openGroupContent(decodeGroupCiphertext(row.ciphertext), roster.crypto_epoch, memberUins, true);
-        out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: content.content_type === "file" ? JSON.stringify(content.attachment ?? null) : (content.text ?? ""), content_type: row.content_type, ...(row.file_url ? { file_url: row.file_url } : {}), created_at: row.created_at, state: "delivered", is_outgoing: row.sender_uin === selfUin });
+        out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: content.content_type === "file" ? JSON.stringify(content.attachment ?? null) : (content.text ?? ""), content_type: content.content_type, created_at: row.created_at, state: "delivered", is_outgoing: row.sender_uin === selfUin });
       } catch {
         out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: "Security warning: this historical group message could not be verified or decrypted.", content_type: "text", created_at: row.created_at, state: "failed", is_outgoing: row.sender_uin === selfUin });
       }

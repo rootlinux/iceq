@@ -103,6 +103,23 @@ const (
 		UPDATE groups SET crypto_epoch = crypto_epoch + 1
 		WHERE id = $1 AND EXISTS (SELECT 1 FROM removed)
 	`
+	qRemoveGroupMemberAtomically = `
+		WITH locked AS (SELECT owner_uin FROM groups WHERE id=$1 FOR UPDATE),
+		actor AS (SELECT role FROM group_members WHERE group_id=$1 AND uin=$2),
+		 removed AS (
+		 DELETE FROM group_members WHERE group_id=$1 AND uin=$3
+		 AND EXISTS(SELECT 1 FROM locked)
+		 AND ($2=$3 OR EXISTS (SELECT 1 FROM actor WHERE role='admin')) RETURNING uin
+		), remaining AS (SELECT COUNT(*)::BIGINT AS n FROM group_members WHERE group_id=$1 AND uin<>$3),
+		successor AS (SELECT uin FROM group_members WHERE group_id=$1 AND uin<>$3 ORDER BY joined_at,uin LIMIT 1),
+		updated AS (UPDATE groups SET crypto_epoch=crypto_epoch+1,
+		 owner_uin=CASE WHEN owner_uin=$3 THEN (SELECT uin FROM successor) ELSE owner_uin END
+		 WHERE id=$1 AND EXISTS(SELECT 1 FROM removed) AND (SELECT n FROM remaining)>0 RETURNING 1),
+		retired AS (UPDATE sender_key_distributions SET retired_at=COALESCE(retired_at,NOW())
+		 WHERE group_id=$1 AND EXISTS(SELECT 1 FROM removed) RETURNING 1),
+		deleted AS (DELETE FROM groups WHERE id=$1 AND EXISTS(SELECT 1 FROM removed) AND (SELECT n FROM remaining)=0 RETURNING 1)
+		SELECT EXISTS(SELECT 1 FROM removed), (SELECT n FROM remaining)
+	`
 
 	// qCountGroupMembers counts the current members of a
 	// group. Used after a DELETE to decide whether the
@@ -140,6 +157,6 @@ const (
 	// human-readable notification body ("you've been added
 	// to group X"). Avoids the handler re-querying the
 	// membership roster just to get the group's name.
-	qGetGroupName = `SELECT name FROM groups WHERE id = $1`
+	qGetGroupName  = `SELECT name FROM groups WHERE id = $1`
 	qGetGroupEpoch = `SELECT crypto_epoch FROM groups WHERE id = $1`
 )

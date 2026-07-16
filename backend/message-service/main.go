@@ -64,6 +64,7 @@ import (
 	"github.com/iceq/iceq/shared/middleware"
 	"github.com/iceq/iceq/shared/models"
 	"github.com/iceq/iceq/shared/natsclient"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
@@ -543,8 +544,7 @@ func handleGroupMessage(_ *natsclient.Client, ms *store.MessageStore, pg *pgxpoo
 	}
 	ctxAuth, cancelAuth := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelAuth()
-	var probe int
-	if pg == nil || pg.QueryRow(ctxAuth, `SELECT 1 FROM group_members m JOIN groups g ON g.id=m.group_id WHERE m.group_id=$1 AND m.uin=$2 AND g.crypto_epoch=$3`, groupIDStr, p.SenderUIN, p.CryptoEpoch).Scan(&probe) != nil {
+	if pg == nil || authorizeGroupMessageEpoch(ctxAuth, pg, groupIDStr, p.SenderUIN, p.CryptoEpoch) != nil {
 		return
 	}
 	ciphertext := p.Ciphertext
@@ -577,6 +577,15 @@ func handleGroupMessage(_ *natsclient.Client, ms *store.MessageStore, pg *pgxpoo
 	}); err != nil {
 		log.Printf("[message-service] save group message: %v", err)
 	}
+}
+
+type groupEpochQueryRower interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func authorizeGroupMessageEpoch(ctx context.Context, db groupEpochQueryRower, groupID string, sender, epoch int64) error {
+	var probe int
+	return db.QueryRow(ctx, `SELECT 1 FROM group_members m JOIN groups g ON g.id=m.group_id WHERE m.group_id=$1 AND m.uin=$2 AND g.crypto_epoch=$3`, groupID, sender, epoch).Scan(&probe)
 }
 
 // handleReadAck applies a read receipt. The subject

@@ -389,7 +389,7 @@ func NewAddGroupMemberHandler(deps GroupsDeps) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not add member")
 			return
 		}
-		_, _ = deps.PG.Exec(ctx, `DELETE FROM sender_key_distributions d WHERE d.group_id=$1 AND d.epoch <> (SELECT crypto_epoch FROM groups WHERE id=$1)`, groupID)
+		_, _ = deps.PG.Exec(ctx, `UPDATE sender_key_distributions d SET retired_at=COALESCE(retired_at,NOW()) WHERE d.group_id=$1 AND d.epoch <> (SELECT crypto_epoch FROM groups WHERE id=$1)`, groupID)
 
 		// Look up the group name for the notification body.
 		// Failure here is non-fatal: the membership row is
@@ -483,74 +483,16 @@ func NewRemoveGroupMemberHandler(deps GroupsDeps) http.HandlerFunc {
 		// regardless of leave vs. kick: DELETE the row, then
 		// count and decide.
 
-		// Look up the group's owner BEFORE deleting. We
-		// need it to decide whether to transfer ownership.
-		var ownerUIN int64
-		err = deps.PG.QueryRow(ctx, qGetGroupOwner, groupID).Scan(&ownerUIN)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				// Group doesn't exist (or was just
-				// deleted by a concurrent request).
-				// 404 is the right answer either way.
-				writeError(w, http.StatusNotFound, "GROUP_NOT_FOUND", "group does not exist")
-				return
-			}
-			log.Printf("[message-service] owner lookup: %v", err)
-			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not look up group")
-			return
-		}
-
-		// Delete the membership row.
-		tag, err := deps.PG.Exec(ctx, qDeleteGroupMember, groupID, targetUIN)
-		if err != nil {
-			log.Printf("[message-service] delete group member: %v", err)
+		var removed bool
+		var remaining int64
+		if err := deps.PG.QueryRow(ctx, qRemoveGroupMemberAtomically, groupID, actorUIN, targetUIN).Scan(&removed, &remaining); err != nil {
+			log.Printf("[message-service] atomic member removal: %v", err)
 			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not remove member")
 			return
 		}
-		if tag.RowsAffected() == 0 {
-			// Target wasn't a member. 404 is idempotent
-			// and matches the "nothing to do" semantics.
+		if !removed {
 			writeError(w, http.StatusNotFound, "NOT_A_MEMBER", "target user is not a member of this group")
 			return
-		}
-		_, _ = deps.PG.Exec(ctx, `DELETE FROM sender_key_distributions d WHERE d.group_id=$1 AND d.epoch <> (SELECT crypto_epoch FROM groups WHERE id=$1)`, groupID)
-
-		// Count remaining members. If zero, the group is
-		// empty → delete it (CASCADE would also work, but
-		// an explicit DELETE keeps the intent visible).
-		var remaining int
-		if err := deps.PG.QueryRow(ctx, qCountGroupMembers, groupID).Scan(&remaining); err != nil {
-			log.Printf("[message-service] count remaining: %v", err)
-			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not count remaining members")
-			return
-		}
-		if remaining == 0 {
-			if _, err := deps.PG.Exec(ctx, qDeleteGroup, groupID); err != nil {
-				log.Printf("[message-service] delete empty group: %v", err)
-				writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not delete empty group")
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		// If the leaver was the owner, transfer ownership
-		// to the oldest remaining member. We only run the
-		// transfer when targetUIN is the owner — i.e. the
-		// owner is leaving. A non-owner leaving does not
-		// trigger a transfer.
-		if targetUIN == ownerUIN {
-			var newOwner int64
-			if err := deps.PG.QueryRow(ctx, qOldestRemainingMember, groupID).Scan(&newOwner); err != nil {
-				log.Printf("[message-service] find successor: %v", err)
-				writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not transfer ownership")
-				return
-			}
-			if _, err := deps.PG.Exec(ctx, qUpdateGroupOwner, groupID, newOwner); err != nil {
-				log.Printf("[message-service] transfer ownership: %v", err)
-				writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not transfer ownership")
-				return
-			}
 		}
 
 		w.WriteHeader(http.StatusNoContent)

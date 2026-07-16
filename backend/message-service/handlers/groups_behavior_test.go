@@ -105,6 +105,10 @@ func groupAssign(dst, src []any) error {
 			*p = src[i].(string)
 		case *time.Time:
 			*p = src[i].(time.Time)
+		case **time.Time:
+			*p = src[i].(*time.Time)
+		case *bool:
+			*p = src[i].(bool)
 		default:
 			return errors.New("unsupported scan")
 		}
@@ -246,7 +250,7 @@ func TestOnlyAdminCanRemoveAnotherGroupMember(t *testing.T) {
 	}{{"member", 403}, {"admin", 204}} {
 		rows := [][]any{{tc.role}}
 		if tc.role == "admin" {
-			rows = append(rows, []any{int64(100)}, []any{2})
+			rows = append(rows, []any{true, int64(2)})
 		}
 		db := &groupFakeDB{rowQueue: rows}
 		rr := httptest.NewRecorder()
@@ -254,6 +258,17 @@ func TestOnlyAdminCanRemoveAnotherGroupMember(t *testing.T) {
 		if rr.Code != tc.status {
 			t.Fatalf("role=%s status=%d body=%s", tc.role, rr.Code, rr.Body.String())
 		}
+	}
+}
+func TestAtomicOwnerLeaveFailureCannotCommitPartialMembershipMutation(t *testing.T) {
+	db := &groupFakeDB{rowQueue: [][]any{{"admin"}, nil}}
+	rr := httptest.NewRecorder()
+	NewRemoveGroupMemberHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodDelete, "/api/groups/"+behaviorGroupID+"/members/200", "", 200))
+	if rr.Code != 500 {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(db.calls) != 2 || !strings.Contains(strings.ToUpper(db.calls[1].sql), "FOR UPDATE") {
+		t.Fatalf("removal was not isolated to one atomic statement: %#v", db.calls)
 	}
 }
 func TestGroupDeleteUsesOwnerPredicateAndUniformNotFoundShape(t *testing.T) {
