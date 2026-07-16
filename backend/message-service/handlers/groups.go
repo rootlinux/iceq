@@ -369,14 +369,13 @@ func NewAddGroupMemberHandler(deps GroupsDeps) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
-		// Authn: actor must be admin of the group.
-		role, err := getGroupRole(ctx, deps.PG, groupID, actorUIN)
-		if err != nil {
-			log.Printf("[message-service] group role check: %v", err)
-			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not check group role")
+		var authorized, inserted bool
+		if err := deps.PG.QueryRow(ctx, qInsertGroupMember, groupID, actorUIN, req.UIN).Scan(&authorized, &inserted); err != nil {
+			log.Printf("[message-service] atomic add group member: %v", err)
+			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not add member")
 			return
 		}
-		if role != "admin" {
+		if !authorized {
 			// Uniform 403 for "not a member" and "not an
 			// admin" — same code prevents probing for
 			// group existence.
@@ -384,21 +383,15 @@ func NewAddGroupMemberHandler(deps GroupsDeps) http.HandlerFunc {
 			return
 		}
 
-		if _, err := deps.PG.Exec(ctx, qInsertGroupMember, groupID, req.UIN); err != nil {
-			log.Printf("[message-service] insert group member: %v", err)
-			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not add member")
-			return
-		}
-		_, _ = deps.PG.Exec(ctx, `UPDATE sender_key_distributions d SET retired_at=COALESCE(retired_at,NOW()) WHERE d.group_id=$1 AND d.epoch <> (SELECT crypto_epoch FROM groups WHERE id=$1)`, groupID)
-
 		// Look up the group name for the notification body.
 		// Failure here is non-fatal: the membership row is
 		// already committed and the user will see the group
 		// in their list regardless.
-		var groupName string
-		_ = deps.PG.QueryRow(ctx, qGetGroupName, groupID).Scan(&groupName)
-
-		publishGroupInviteNotification(r.Context(), deps.Bus, req.UIN, groupID, groupName, actorUIN)
+		if inserted {
+			var groupName string
+			_ = deps.PG.QueryRow(ctx, qGetGroupName, groupID).Scan(&groupName)
+			publishGroupInviteNotification(r.Context(), deps.Bus, req.UIN, groupID, groupName, actorUIN)
+		}
 
 		w.WriteHeader(http.StatusCreated)
 	}

@@ -229,18 +229,37 @@ func TestGroupMemberListSucceedsForMember(t *testing.T) {
 }
 func TestOnlyAdminCanAddGroupMember(t *testing.T) {
 	for _, tc := range []struct {
-		role   string
-		status int
-	}{{"member", 403}, {"admin", 201}} {
-		db := &groupFakeDB{rowQueue: [][]any{{tc.role}, {"team"}}}
+		authorized bool
+		status     int
+	}{{false, 403}, {true, 201}} {
+		db := &groupFakeDB{rowQueue: [][]any{{tc.authorized, tc.authorized}, {"team"}}}
 		rr := httptest.NewRecorder()
 		NewAddGroupMemberHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodPost, "/api/groups/"+behaviorGroupID+"/members", `{"uin":300}`, 200))
 		if rr.Code != tc.status {
-			t.Fatalf("role=%s status=%d body=%s", tc.role, rr.Code, rr.Body.String())
+			t.Fatalf("authorized=%v status=%d body=%s", tc.authorized, rr.Code, rr.Body.String())
 		}
 		if db.calls[0].args[1] != int64(200) {
-			t.Fatalf("role predicate args=%v", db.calls[0].args)
+			t.Fatalf("actor predicate args=%v", db.calls[0].args)
 		}
+		q := strings.ToUpper(db.calls[0].sql)
+		if !strings.Contains(q, "FOR UPDATE") || !strings.Contains(q, "ROLE='ADMIN'") || !strings.Contains(q, "INSERT INTO GROUP_MEMBERS") {
+			t.Fatalf("authorization and mutation are not atomic: %s", q)
+		}
+		if !tc.authorized && len(db.calls) != 1 {
+			t.Fatalf("unauthorized add performed follow-up work: %#v", db.calls)
+		}
+	}
+}
+
+func TestAddMemberFailsClosedWhenAtomicMutationReturnsNoResult(t *testing.T) {
+	db := &groupFakeDB{rowQueue: [][]any{nil}}
+	rr := httptest.NewRecorder()
+	NewAddGroupMemberHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodPost, "/api/groups/"+behaviorGroupID+"/members", `{"uin":300}`, 200))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(db.calls) != 1 {
+		t.Fatalf("partial add-member flow executed: %#v", db.calls)
 	}
 }
 func TestOnlyAdminCanRemoveAnotherGroupMember(t *testing.T) {

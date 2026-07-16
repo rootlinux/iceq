@@ -84,12 +84,24 @@ const (
 	// re-adding an existing member a no-op (handler returns
 	// 201 because the intent is satisfied).
 	qInsertGroupMember = `
-		WITH inserted AS (
-		  INSERT INTO group_members (group_id, uin, role) VALUES ($1, $2, 'member')
-		  ON CONFLICT (group_id, uin) DO NOTHING RETURNING group_id
+		WITH locked AS (
+		  SELECT id,crypto_epoch FROM groups WHERE id=$1 FOR UPDATE
+		), actor AS (
+		  SELECT 1 FROM group_members m JOIN locked g ON g.id=m.group_id
+		  WHERE m.uin=$2 AND m.role='admin'
+		), inserted AS (
+		  INSERT INTO group_members (group_id,uin,role)
+		  SELECT id,$3,'member' FROM locked WHERE EXISTS(SELECT 1 FROM actor)
+		  ON CONFLICT (group_id,uin) DO NOTHING RETURNING group_id
+		), updated AS (
+		  UPDATE groups SET crypto_epoch = crypto_epoch + 1 FROM inserted i
+		  WHERE groups.id=i.group_id RETURNING groups.id
+		), retired AS (
+		  UPDATE sender_key_distributions d SET retired_at=COALESCE(retired_at,NOW())
+		  FROM locked l WHERE d.group_id=l.id AND d.epoch=l.crypto_epoch
+		    AND EXISTS(SELECT 1 FROM inserted) RETURNING 1
 		)
-		UPDATE groups SET crypto_epoch = crypto_epoch + 1
-		WHERE id = $1 AND EXISTS (SELECT 1 FROM inserted)
+		SELECT EXISTS(SELECT 1 FROM actor),EXISTS(SELECT 1 FROM inserted)
 	`
 
 	// qDeleteGroupMember removes a (group_id, uin) row.
