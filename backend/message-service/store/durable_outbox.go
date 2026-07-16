@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -33,32 +34,51 @@ type outboxBucketReader interface {
 	fetchGroupBucket(context.Context, int8, int) ([]OutboxEntry, error)
 }
 
-func fetchPendingOutbox(ctx context.Context, reader outboxBucketReader, limit int) ([]OutboxEntry, error) {
+type outboxFetchCursor struct {
+	next atomic.Uint32
+}
+
+var pendingOutboxCursor outboxFetchCursor
+
+func (c *outboxFetchCursor) fetch(ctx context.Context, reader outboxBucketReader, limit int) ([]OutboxEntry, error) {
 	if limit <= 0 {
 		return nil, ErrInvalidOutboxLimit
 	}
 	if limit > maxPendingOutboxFetch {
 		limit = maxPendingOutboxFetch
 	}
+	start := int(c.next.Add(1)-1) % outboxBucketCount
+	perBucket := (limit + outboxBucketCount - 1) / outboxBucketCount
 	result := make([]OutboxEntry, 0, limit)
-	for rawBucket := 0; rawBucket < outboxBucketCount && len(result) < limit; rawBucket++ {
+	for offset := 0; offset < outboxBucketCount && len(result) < limit; offset++ {
+		rawBucket := (start + offset) % outboxBucketCount
 		bucket := int8(rawBucket)
+		bucketRemaining := perBucket
 		fetchers := []func(context.Context, int8, int) ([]OutboxEntry, error){reader.fetchDirectBucket, reader.fetchGroupBucket}
 		if rawBucket%2 == 1 {
 			fetchers[0], fetchers[1] = fetchers[1], fetchers[0]
 		}
 		for _, fetch := range fetchers {
-			rows, err := fetch(ctx, bucket, limit-len(result))
+			fetchLimit := min(bucketRemaining, limit-len(result))
+			if fetchLimit == 0 {
+				break
+			}
+			rows, err := fetch(ctx, bucket, fetchLimit)
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, rows...)
-			if len(result) == limit {
-				break
+			if len(rows) > fetchLimit {
+				rows = rows[:fetchLimit]
 			}
+			result = append(result, rows...)
+			bucketRemaining -= len(rows)
 		}
 	}
 	return result, nil
+}
+
+func fetchPendingOutbox(ctx context.Context, reader outboxBucketReader, limit int) ([]OutboxEntry, error) {
+	return pendingOutboxCursor.fetch(ctx, reader, limit)
 }
 
 // FetchPending returns a bounded recovery batch across the fixed outbox

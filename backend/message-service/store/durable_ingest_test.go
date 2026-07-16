@@ -297,8 +297,8 @@ func TestFetchPendingIsBoundedAndIncludesDirectAndGroupBuckets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 3 {
-		t.Fatalf("rows = %d, want bounded 3", len(rows))
+	if len(rows) > 3 {
+		t.Fatalf("rows = %d, want at most 3", len(rows))
 	}
 	seenDirect, seenGroup := false, false
 	for _, row := range rows {
@@ -307,5 +307,48 @@ func TestFetchPendingIsBoundedAndIncludesDirectAndGroupBuckets(t *testing.T) {
 	}
 	if !seenDirect || !seenGroup {
 		t.Fatalf("pending recovery omitted a kind: direct=%v group=%v", seenDirect, seenGroup)
+	}
+}
+
+func TestFetchPendingRotatesStartingBucketAcrossCalls(t *testing.T) {
+	reader := &fakeOutboxBucketReader{direct: map[int8][]OutboxEntry{}, group: map[int8][]OutboxEntry{}}
+	for bucket := int8(0); bucket < outboxBucketCount; bucket++ {
+		reader.direct[bucket] = []OutboxEntry{{ReceiverUIN: int64(bucket)}}
+	}
+	cursor := &outboxFetchCursor{}
+
+	first, err := cursor.fetch(context.Background(), reader, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := cursor.fetch(context.Background(), reader, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first[0].ReceiverUIN != 0 || second[0].ReceiverUIN != 1 {
+		t.Fatalf("starting buckets = %d, %d; want 0, 1", first[0].ReceiverUIN, second[0].ReceiverUIN)
+	}
+}
+
+func TestFetchPendingReservesQuotaForLaterBucketsAndCapsAtOneHundred(t *testing.T) {
+	reader := &fakeOutboxBucketReader{direct: map[int8][]OutboxEntry{}, group: map[int8][]OutboxEntry{}}
+	for i := 0; i < 200; i++ {
+		reader.direct[0] = append(reader.direct[0], OutboxEntry{ReceiverUIN: 1000})
+	}
+	reader.direct[15] = []OutboxEntry{{ReceiverUIN: 15}}
+
+	rows, err := (&outboxFetchCursor{}).fetch(context.Background(), reader, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) > maxPendingOutboxFetch {
+		t.Fatalf("rows = %d, want hard cap %d", len(rows), maxPendingOutboxFetch)
+	}
+	foundLateBucket := false
+	for _, row := range rows {
+		foundLateBucket = foundLateBucket || row.ReceiverUIN == 15
+	}
+	if !foundLateBucket {
+		t.Fatal("hot bucket 0 starved bucket 15")
 	}
 }
