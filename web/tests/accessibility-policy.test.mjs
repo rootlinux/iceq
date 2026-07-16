@@ -3,6 +3,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cycleDialogFocus, focusInitialTarget, handleDialogEscape, restoreDialogFocus } from "../src/hooks/dialogFocus.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(root, path), "utf8");
@@ -11,7 +12,36 @@ test("settings dialogs manage focus, Escape, and focus return", () => {
   const sidebar = read("src/components/Layout/Sidebar.tsx");
   assert.match(sidebar, /useDialogFocus/);
   assert.match(sidebar, /settingsTriggerRef/);
-  assert.match(sidebar, /onKeyDown/);
+  assert.match(sidebar, /settingsDialogRef/);
+});
+
+test("all dialog surfaces use managed dialog focus", () => {
+  for (const path of ["src/components/Contacts/AddContact.tsx", "src/components/Groups/GroupList.tsx", "src/components/Layout/Sidebar.tsx", "src/components/Settings/SecuritySettings.tsx"]) {
+    assert.match(read(path), /useDialogFocus/, `${path} lacks managed focus`);
+  }
+});
+
+test("dialog keyboard helper wraps Tab in both directions", () => {
+  const first = { focusCalls: 0, focus() { this.focusCalls += 1; } };
+  const last = { focusCalls: 0, focus() { this.focusCalls += 1; } };
+  assert.equal(cycleDialogFocus([first, last], first, true), true);
+  assert.equal(last.focusCalls, 1);
+  assert.equal(cycleDialogFocus([first, last], last, false), true);
+  assert.equal(first.focusCalls, 1);
+  assert.equal(cycleDialogFocus([first, last], first, false), false);
+});
+
+test("dialog behavior focuses the preferred control, closes on Escape, and restores opener", () => {
+  const preferred = { focusCalls: 0, focus() { this.focusCalls += 1; } };
+  const fallback = { focusCalls: 0, focus() { this.focusCalls += 1; } };
+  focusInitialTarget(preferred, fallback);
+  assert.equal(preferred.focusCalls, 1);
+  let closes = 0;
+  assert.equal(handleDialogEscape("Escape", () => { closes += 1; }), true);
+  assert.equal(handleDialogEscape("Enter", () => { closes += 1; }), false);
+  assert.equal(closes, 1);
+  restoreDialogFocus(fallback);
+  assert.equal(fallback.focusCalls, 1);
 });
 
 test("connection errors are announced and message state has visible text", () => {
@@ -27,4 +57,3 @@ test("global styles include visible focus, touch targets, and reduced motion", (
   assert.match(css, /min-height:\s*44px/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
 });
-

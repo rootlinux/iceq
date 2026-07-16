@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useGroupStore } from "../../store/groupStore";
 import { useChatStore } from "../../store/chatStore";
+import { useDialogFocus } from "../../hooks/useDialogFocus";
 
 export function GroupList(): JSX.Element {
   const groups = useGroupStore((s) => s.groups);
@@ -13,6 +14,10 @@ export function GroupList(): JSX.Element {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
+  const openerRef = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const closeDialog = useCallback(() => setOpen(false), []);
+  const dialogRef = useDialogFocus(open, closeDialog, openerRef, inputRef);
 
   useEffect(() => {
     loadGroups().catch(() => {
@@ -45,6 +50,7 @@ export function GroupList(): JSX.Element {
       <div className="p-3">
         <button
           type="button"
+          ref={openerRef}
           className="iceq-btn-secondary w-full"
           onClick={() => setOpen(true)}
         >
@@ -95,10 +101,11 @@ export function GroupList(): JSX.Element {
           role="dialog"
           aria-modal="true"
           aria-labelledby="create-group-title"
-          onClick={() => setOpen(false)}
+          onClick={closeDialog}
         >
           <div
             className="iceq-modal"
+            ref={dialogRef}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-4 flex items-start justify-between gap-4">
@@ -114,7 +121,7 @@ export function GroupList(): JSX.Element {
                 type="button"
                 className="iceq-btn-secondary"
                 aria-label="Close create group"
-                onClick={() => setOpen(false)}
+                onClick={closeDialog}
               >
                 ✕
               </button>
@@ -127,6 +134,7 @@ export function GroupList(): JSX.Element {
                 </label>
                 <input
                   id="group-name"
+                  ref={inputRef}
                   type="text"
                   className="iceq-input"
                   value={name}
@@ -146,7 +154,7 @@ export function GroupList(): JSX.Element {
                 <button
                   type="button"
                   className="iceq-btn-secondary"
-                  onClick={() => setOpen(false)}
+                  onClick={closeDialog}
                   disabled={creating}
                 >
                   Cancel

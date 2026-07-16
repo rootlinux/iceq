@@ -89,7 +89,6 @@ export function Sidebar({ open, onClose }: SidebarProps): JSX.Element {
           aria-modal="true"
           aria-labelledby="sidebar-settings-title"
           onClick={closeSettings}
-          onKeyDown={(event) => { if (event.key === "Escape") closeSettings(); }}
         >
           <div
             id="sidebar-settings-modal"

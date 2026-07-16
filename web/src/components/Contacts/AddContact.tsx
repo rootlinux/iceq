@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError } from "../../api/client";
 import { useAuthStore } from "../../store/authStore";
 import { useContactStore } from "../../store/contactStore";
+import { useDialogFocus } from "../../hooks/useDialogFocus";
 
 function getAddContactErrorMessage(error: unknown): string {
   if (error instanceof ApiError) {
@@ -23,13 +24,16 @@ export function AddContact(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
-  function closeModal(): void {
+  const openerRef = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const closeModal = useCallback((): void => {
     setOpen(false);
     setTargetUIN("");
     setSubmitting(false);
     setError(null);
     setSuccess(null);
-  }
+  }, []);
+  const dialogRef = useDialogFocus(open, closeModal, openerRef, inputRef);
 
   async function onSubmit(e: FormEvent): Promise<void> {
     e.preventDefault();
@@ -68,6 +72,7 @@ export function AddContact(): JSX.Element {
     <>
       <button
         type="button"
+        ref={openerRef}
         className="iceq-btn-secondary m-2 w-[calc(100%-1rem)]"
         onClick={() => setOpen(true)}
       >
@@ -82,7 +87,7 @@ export function AddContact(): JSX.Element {
           aria-labelledby="add-contact-title"
           onClick={closeModal}
         >
-          <div className="iceq-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="iceq-modal" ref={dialogRef} onClick={(e) => e.stopPropagation()}>
             <div className="mb-4 flex items-start justify-between gap-4">
               <div>
                 <h2 id="add-contact-title" className="text-lg font-semibold text-text">
@@ -110,6 +115,7 @@ export function AddContact(): JSX.Element {
                 </label>
                 <input
                   id="add-contact-uin"
+                  ref={inputRef}
                   type="number"
                   min="1"
                   inputMode="numeric"
