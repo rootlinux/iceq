@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,17 +26,26 @@ type OutboxEntry struct {
 	ConversationID string
 	GroupID        gocql.UUID
 	CryptoEpoch    int64
+	RecipientUINs  []int64
 	Envelope       []byte
 	EnvelopeHash   [sha256.Size]byte
 }
 
 type outboxBucketReader interface {
-	fetchDirectBucket(context.Context, int8, int) ([]OutboxEntry, error)
-	fetchGroupBucket(context.Context, int8, int) ([]OutboxEntry, error)
+	fetchDirectBucket(context.Context, int8, outboxPageCursor, int) ([]OutboxEntry, error)
+	fetchGroupBucket(context.Context, int8, outboxPageCursor, int) ([]OutboxEntry, error)
+}
+
+type outboxPageCursor struct {
+	CreatedAt time.Time
+	MessageID gocql.UUID
+	Valid     bool
 }
 
 type outboxFetchCursor struct {
-	next atomic.Uint32
+	next  atomic.Uint32
+	mu    sync.Mutex
+	pages [outboxBucketCount * 2]outboxPageCursor
 }
 
 var pendingOutboxCursor outboxFetchCursor
@@ -54,16 +64,22 @@ func (c *outboxFetchCursor) fetch(ctx context.Context, reader outboxBucketReader
 		rawBucket := (start + offset) % outboxBucketCount
 		bucket := int8(rawBucket)
 		bucketRemaining := perBucket
-		fetchers := []func(context.Context, int8, int) ([]OutboxEntry, error){reader.fetchDirectBucket, reader.fetchGroupBucket}
+		fetchers := []func(context.Context, int8, outboxPageCursor, int) ([]OutboxEntry, error){reader.fetchDirectBucket, reader.fetchGroupBucket}
+		kinds := []int{0, 1}
 		if rawBucket%2 == 1 {
 			fetchers[0], fetchers[1] = fetchers[1], fetchers[0]
+			kinds[0], kinds[1] = kinds[1], kinds[0]
 		}
-		for _, fetch := range fetchers {
+		for index, fetch := range fetchers {
 			fetchLimit := min(bucketRemaining, limit-len(result))
 			if fetchLimit == 0 {
 				break
 			}
-			rows, err := fetch(ctx, bucket, fetchLimit)
+			pageIndex := rawBucket*2 + kinds[index]
+			c.mu.Lock()
+			after := c.pages[pageIndex]
+			c.mu.Unlock()
+			rows, err := fetch(ctx, bucket, after, fetchLimit)
 			if err != nil {
 				return nil, err
 			}
@@ -71,6 +87,14 @@ func (c *outboxFetchCursor) fetch(ctx context.Context, reader outboxBucketReader
 				rows = rows[:fetchLimit]
 			}
 			result = append(result, rows...)
+			c.mu.Lock()
+			if len(rows) == 0 {
+				c.pages[pageIndex] = outboxPageCursor{}
+			} else {
+				last := rows[len(rows)-1]
+				c.pages[pageIndex] = outboxPageCursor{CreatedAt: last.CreatedAt, MessageID: last.MessageID, Valid: true}
+			}
+			c.mu.Unlock()
 			bucketRemaining -= len(rows)
 		}
 	}
@@ -88,10 +112,14 @@ func (w *ScyllaDurableDirectWriter) FetchPending(ctx context.Context, limit int)
 	return fetchPendingOutbox(ctx, w, limit)
 }
 
-func (w *ScyllaDurableDirectWriter) fetchDirectBucket(ctx context.Context, bucket int8, limit int) ([]OutboxEntry, error) {
-	const query = `SELECT created_at, message_id, receiver_uin, sender_uin, client_id, conversation_id, envelope, envelope_hash, expires_at
-	  FROM iceq.message_outbox WHERE bucket = ? LIMIT ?`
-	iter := w.session.Query(query, bucket, limit).WithContext(ctx).Consistency(gocql.Quorum).Iter()
+func (w *ScyllaDurableDirectWriter) fetchDirectBucket(ctx context.Context, bucket int8, after outboxPageCursor, limit int) ([]OutboxEntry, error) {
+	query := `SELECT created_at, message_id, receiver_uin, sender_uin, client_id, conversation_id, envelope, envelope_hash, expires_at FROM iceq.message_outbox WHERE bucket = ? LIMIT ?`
+	args := []any{bucket, limit}
+	if after.Valid {
+		query = `SELECT created_at, message_id, receiver_uin, sender_uin, client_id, conversation_id, envelope, envelope_hash, expires_at FROM iceq.message_outbox WHERE bucket = ? AND (created_at, message_id) > (?, ?) LIMIT ?`
+		args = []any{bucket, after.CreatedAt, after.MessageID, limit}
+	}
+	iter := w.session.Query(query, args...).WithContext(ctx).Consistency(gocql.Quorum).Iter()
 	rows := make([]OutboxEntry, 0, limit)
 	for {
 		row := OutboxEntry{Kind: IngestKindDirect}
@@ -113,15 +141,19 @@ func (w *ScyllaDurableDirectWriter) fetchDirectBucket(ctx context.Context, bucke
 	return rows, nil
 }
 
-func (w *ScyllaDurableDirectWriter) fetchGroupBucket(ctx context.Context, bucket int8, limit int) ([]OutboxEntry, error) {
-	const query = `SELECT created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, envelope, envelope_hash, expires_at
-	  FROM iceq.group_message_outbox WHERE bucket = ? LIMIT ?`
-	iter := w.session.Query(query, bucket, limit).WithContext(ctx).Consistency(gocql.Quorum).Iter()
+func (w *ScyllaDurableDirectWriter) fetchGroupBucket(ctx context.Context, bucket int8, after outboxPageCursor, limit int) ([]OutboxEntry, error) {
+	query := `SELECT created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, expires_at FROM iceq.group_message_outbox WHERE bucket = ? LIMIT ?`
+	args := []any{bucket, limit}
+	if after.Valid {
+		query = `SELECT created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, expires_at FROM iceq.group_message_outbox WHERE bucket = ? AND (created_at, message_id) > (?, ?) LIMIT ?`
+		args = []any{bucket, after.CreatedAt, after.MessageID, limit}
+	}
+	iter := w.session.Query(query, args...).WithContext(ctx).Consistency(gocql.Quorum).Iter()
 	rows := make([]OutboxEntry, 0, limit)
 	for {
 		row := OutboxEntry{Kind: IngestKindGroup}
 		var hash []byte
-		if !iter.Scan(&row.CreatedAt, &row.MessageID, &row.GroupID, &row.Key.SenderUIN, &row.Key.ClientID, &row.CryptoEpoch, &row.Envelope, &hash, &row.ExpiresAt) {
+		if !iter.Scan(&row.CreatedAt, &row.MessageID, &row.GroupID, &row.Key.SenderUIN, &row.Key.ClientID, &row.CryptoEpoch, &row.RecipientUINs, &row.Envelope, &hash, &row.ExpiresAt) {
 			break
 		}
 		if err := finishOutboxRow(&row, hash); err != nil {

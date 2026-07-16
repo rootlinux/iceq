@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -48,6 +49,7 @@ type IngestRecord struct {
 	ConversationID   string
 	GroupID          gocql.UUID
 	CryptoEpoch      int64
+	RecipientUINs    []int64
 	Envelope         []byte
 	EnvelopeHash     [sha256.Size]byte
 	MessageID        gocql.UUID
@@ -85,6 +87,7 @@ type DurableGroupRequest struct {
 	ClientID         string
 	GroupID          gocql.UUID
 	CryptoEpoch      int64
+	RecipientUINs    []int64
 	Envelope         []byte
 	Ciphertext       []byte
 	MsgType          string
@@ -92,11 +95,12 @@ type DurableGroupRequest struct {
 }
 
 type DurableGroupWrite struct {
-	Key          IngestKey
-	Envelope     []byte
-	EnvelopeHash [sha256.Size]byte
-	ExpiresAt    time.Time
-	Message      SaveGroupRequest
+	Key           IngestKey
+	Envelope      []byte
+	EnvelopeHash  [sha256.Size]byte
+	ExpiresAt     time.Time
+	RecipientUINs []int64
+	Message       SaveGroupRequest
 }
 
 type DurableIngestResult struct {
@@ -186,6 +190,8 @@ func deterministicMessageID(key IngestKey) gocql.UUID {
 	return id
 }
 
+func sameRecipientSnapshot(a, b []int64) bool { return slices.Equal(a, b) }
+
 func (s *DurableIngestStore) PersistDirect(ctx context.Context, req DurableDirectRequest) (DurableIngestResult, error) {
 	if req.SenderUIN <= 0 || req.ReceiverUIN <= 0 || req.ClientID == "" || req.ConversationID == "" || len(req.Envelope) == 0 || len(req.Ciphertext) == 0 || req.ExpiresInSeconds < 0 {
 		return DurableIngestResult{}, ErrInvalidIngest
@@ -254,8 +260,13 @@ func (s *DurableIngestStore) PersistGroup(ctx context.Context, req DurableGroupR
 	if s.groupWriter == nil {
 		return DurableIngestResult{}, errors.New("store: durable group writer is not configured")
 	}
-	if req.SenderUIN <= 0 || req.ClientID == "" || req.GroupID == (gocql.UUID{}) || len(req.Envelope) == 0 || len(req.Ciphertext) == 0 || req.MsgType == "" || req.CryptoEpoch <= 0 || req.ExpiresInSeconds < 0 {
+	if req.SenderUIN <= 0 || req.ClientID == "" || req.GroupID == (gocql.UUID{}) || len(req.RecipientUINs) == 0 || len(req.Envelope) == 0 || len(req.Ciphertext) == 0 || req.MsgType == "" || req.CryptoEpoch <= 0 || req.ExpiresInSeconds < 0 {
 		return DurableIngestResult{}, ErrInvalidIngest
+	}
+	for _, uin := range req.RecipientUINs {
+		if uin <= 0 {
+			return DurableIngestResult{}, ErrInvalidIngest
+		}
 	}
 	now := s.now().UTC()
 	hash := sha256.Sum256(req.Envelope)
@@ -263,6 +274,7 @@ func (s *DurableIngestStore) PersistGroup(ctx context.Context, req DurableGroupR
 	proposed.Kind = IngestKindGroup
 	proposed.GroupID = req.GroupID
 	proposed.CryptoEpoch = req.CryptoEpoch
+	proposed.RecipientUINs = append([]int64(nil), req.RecipientUINs...)
 	proposed.ExpiresInSeconds = req.ExpiresInSeconds
 	if ttl := durableTTL(req.ExpiresInSeconds); ttl > 0 {
 		proposed.ExpiresAt = proposed.CreatedAt.Add(ttl)
@@ -286,7 +298,7 @@ func (s *DurableIngestStore) PersistGroup(ctx context.Context, req DurableGroupR
 		return DurableIngestResult{}, fmt.Errorf("store: unknown claim disposition %d", disposition)
 	}
 	write := DurableGroupWrite{
-		Key: record.Key, Envelope: append([]byte(nil), record.Envelope...), EnvelopeHash: record.EnvelopeHash, ExpiresAt: record.ExpiresAt,
+		Key: record.Key, Envelope: append([]byte(nil), record.Envelope...), EnvelopeHash: record.EnvelopeHash, ExpiresAt: record.ExpiresAt, RecipientUINs: append([]int64(nil), record.RecipientUINs...),
 		Message: SaveGroupRequest{GroupID: record.GroupID, ID: record.MessageID, SenderUIN: req.SenderUIN, CryptoEpoch: record.CryptoEpoch, Ciphertext: append([]byte(nil), req.Ciphertext...), MsgType: req.MsgType, CreatedAt: record.CreatedAt, ExpiresInSeconds: req.ExpiresInSeconds},
 	}
 	if err := s.groupWriter.WriteGroup(ctx, write); err != nil {

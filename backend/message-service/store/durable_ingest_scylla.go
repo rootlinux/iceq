@@ -23,12 +23,12 @@ func NewScyllaIngestBackend(session *gocql.Session) *ScyllaIngestBackend {
 
 func (b *ScyllaIngestBackend) Claim(ctx context.Context, proposed IngestRecord, now time.Time) (IngestRecord, ClaimDisposition, error) {
 	const insert = `INSERT INTO iceq.message_ingest
-	  (sender_uin, client_id, message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until)
-	  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS`
+	  (sender_uin, client_id, message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until)
+	  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS`
 	const insertTTL = `INSERT INTO iceq.message_ingest
-	  (sender_uin, client_id, message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until)
-	  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS USING TTL ?`
-	args := []any{proposed.Key.SenderUIN, proposed.Key.ClientID, proposed.Kind, proposed.ReceiverUIN, proposed.ConversationID, nullableUUID(proposed.GroupID), proposed.CryptoEpoch, proposed.Envelope, proposed.EnvelopeHash[:], proposed.MessageID, proposed.CreatedAt, nullableTime(proposed.ExpiresAt), proposed.State, proposed.OwnerToken, proposed.LeaseUntil}
+	  (sender_uin, client_id, message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until)
+	  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS USING TTL ?`
+	args := []any{proposed.Key.SenderUIN, proposed.Key.ClientID, proposed.Kind, proposed.ReceiverUIN, proposed.ConversationID, nullableUUID(proposed.GroupID), proposed.CryptoEpoch, proposed.RecipientUINs, proposed.Envelope, proposed.EnvelopeHash[:], proposed.MessageID, proposed.CreatedAt, nullableTime(proposed.ExpiresAt), proposed.State, proposed.OwnerToken, proposed.LeaseUntil}
 	query := insert
 	if proposed.ExpiresInSeconds > 0 {
 		query = insertTTL
@@ -45,7 +45,7 @@ func (b *ScyllaIngestBackend) Claim(ctx context.Context, proposed IngestRecord, 
 	if err != nil {
 		return IngestRecord{}, 0, err
 	}
-	if current.EnvelopeHash != proposed.EnvelopeHash || current.Kind != proposed.Kind || current.ReceiverUIN != proposed.ReceiverUIN || current.ConversationID != proposed.ConversationID || current.GroupID != proposed.GroupID || current.CryptoEpoch != proposed.CryptoEpoch {
+	if current.EnvelopeHash != proposed.EnvelopeHash || current.Kind != proposed.Kind || current.ReceiverUIN != proposed.ReceiverUIN || current.ConversationID != proposed.ConversationID || current.GroupID != proposed.GroupID || current.CryptoEpoch != proposed.CryptoEpoch || !sameRecipientSnapshot(current.RecipientUINs, proposed.RecipientUINs) {
 		return IngestRecord{}, 0, ErrIngestConflict
 	}
 	if current.State == IngestStored || current.State == IngestDelivered {
@@ -150,13 +150,13 @@ func (b *ScyllaIngestBackend) MarkDelivered(ctx context.Context, key IngestKey, 
 }
 
 func (b *ScyllaIngestBackend) load(ctx context.Context, key IngestKey) (IngestRecord, error) {
-	const query = `SELECT message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until, stored_at, delivered_at
+	const query = `SELECT message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until, stored_at, delivered_at
 	  FROM iceq.message_ingest WHERE sender_uin = ? AND client_id = ?`
 	var record IngestRecord
 	var hash []byte
 	record.Key = key
 	err := b.session.Query(query, key.SenderUIN, key.ClientID).WithContext(ctx).Consistency(gocql.Quorum).Scan(
-		&record.Kind, &record.ReceiverUIN, &record.ConversationID, &record.GroupID, &record.CryptoEpoch, &record.Envelope, &hash, &record.MessageID, &record.CreatedAt, &record.ExpiresAt, &record.State,
+		&record.Kind, &record.ReceiverUIN, &record.ConversationID, &record.GroupID, &record.CryptoEpoch, &record.RecipientUINs, &record.Envelope, &hash, &record.MessageID, &record.CreatedAt, &record.ExpiresAt, &record.State,
 		&record.OwnerToken, &record.LeaseUntil, &record.StoredAt, &record.DeliveredAt,
 	)
 	if err != nil {
@@ -244,11 +244,11 @@ func (w *ScyllaDurableDirectWriter) WriteGroup(ctx context.Context, write Durabl
 		}
 		batch.Query(`INSERT INTO iceq.group_messages (group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`, req.GroupID, req.CreatedAt, req.ID, req.SenderUIN, req.CryptoEpoch, req.Ciphertext, req.MsgType, write.ExpiresAt, seconds)
 		batch.Query(`INSERT INTO iceq.group_message_deletion_index (uin, group_id, created_at, id) VALUES (?, ?, ?, ?) USING TTL ?`, req.SenderUIN, req.GroupID, req.CreatedAt, req.ID, seconds)
-		batch.Query(`INSERT INTO iceq.group_message_outbox (bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, envelope, envelope_hash, state, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`, outboxBucket(req.ID), req.CreatedAt, req.ID, req.GroupID, req.SenderUIN, write.Key.ClientID, req.CryptoEpoch, write.Envelope, write.EnvelopeHash[:], "pending", write.ExpiresAt, seconds)
+		batch.Query(`INSERT INTO iceq.group_message_outbox (bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`, outboxBucket(req.ID), req.CreatedAt, req.ID, req.GroupID, req.SenderUIN, write.Key.ClientID, req.CryptoEpoch, write.RecipientUINs, write.Envelope, write.EnvelopeHash[:], "pending", write.ExpiresAt, seconds)
 	} else {
 		batch.Query(`INSERT INTO iceq.group_messages (group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type) VALUES (?, ?, ?, ?, ?, ?, ?)`, req.GroupID, req.CreatedAt, req.ID, req.SenderUIN, req.CryptoEpoch, req.Ciphertext, req.MsgType)
 		batch.Query(`INSERT INTO iceq.group_message_deletion_index (uin, group_id, created_at, id) VALUES (?, ?, ?, ?)`, req.SenderUIN, req.GroupID, req.CreatedAt, req.ID)
-		batch.Query(`INSERT INTO iceq.group_message_outbox (bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, envelope, envelope_hash, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, outboxBucket(req.ID), req.CreatedAt, req.ID, req.GroupID, req.SenderUIN, write.Key.ClientID, req.CryptoEpoch, write.Envelope, write.EnvelopeHash[:], "pending")
+		batch.Query(`INSERT INTO iceq.group_message_outbox (bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, outboxBucket(req.ID), req.CreatedAt, req.ID, req.GroupID, req.SenderUIN, write.Key.ClientID, req.CryptoEpoch, write.RecipientUINs, write.Envelope, write.EnvelopeHash[:], "pending")
 	}
 	if err := w.session.ExecuteBatch(batch); err != nil {
 		return fmt.Errorf("store: execute durable group batch: %w", err)

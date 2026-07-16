@@ -28,7 +28,7 @@ func (m *memoryIngestBackend) Claim(_ context.Context, proposed IngestRecord, no
 		m.records[proposed.Key] = proposed
 		return proposed, ClaimAcquired, nil
 	}
-	if current.EnvelopeHash != proposed.EnvelopeHash || current.Kind != proposed.Kind || current.GroupID != proposed.GroupID || current.CryptoEpoch != proposed.CryptoEpoch || current.ReceiverUIN != proposed.ReceiverUIN {
+	if current.EnvelopeHash != proposed.EnvelopeHash || current.Kind != proposed.Kind || current.GroupID != proposed.GroupID || current.CryptoEpoch != proposed.CryptoEpoch || current.ReceiverUIN != proposed.ReceiverUIN || !sameRecipientSnapshot(current.RecipientUINs, proposed.RecipientUINs) {
 		return IngestRecord{}, 0, ErrIngestConflict
 	}
 	if current.State == IngestStored || current.State == IngestDelivered {
@@ -218,7 +218,8 @@ func TestDurableGroupFailureThenReplayUsesOneDeterministicRow(t *testing.T) {
 	groupID := gocql.TimeUUID()
 	req := DurableGroupRequest{
 		SenderUIN: 41, ClientID: "group-client-1", GroupID: groupID, CryptoEpoch: 7,
-		Envelope: []byte(`{"group_id":"opaque"}`), Ciphertext: []byte("opaque"), MsgType: "sender_key_message", ExpiresInSeconds: 3600,
+		RecipientUINs: []int64{52, 63},
+		Envelope:      []byte(`{"group_id":"opaque"}`), Ciphertext: []byte("opaque"), MsgType: "sender_key_message", ExpiresInSeconds: 3600,
 	}
 
 	if _, err := store.PersistGroup(context.Background(), req); err == nil {
@@ -249,7 +250,7 @@ func TestStoredGroupReplayReturnsCommittedWithoutSecondWrite(t *testing.T) {
 	backend := newMemoryIngestBackend()
 	groupWriter := &recordingDurableGroupWriter{}
 	store := NewDurableIngestStoreWithGroup(backend, &recordingDurableWriter{}, groupWriter, func() time.Time { return now }, time.Second)
-	req := DurableGroupRequest{SenderUIN: 41, ClientID: "group-client-1", GroupID: gocql.TimeUUID(), CryptoEpoch: 3, Envelope: []byte("opaque-envelope"), Ciphertext: []byte("opaque"), MsgType: "sender_key_message"}
+	req := DurableGroupRequest{SenderUIN: 41, ClientID: "group-client-1", GroupID: gocql.TimeUUID(), CryptoEpoch: 3, RecipientUINs: []int64{52, 63}, Envelope: []byte("opaque-envelope"), Ciphertext: []byte("opaque"), MsgType: "sender_key_message"}
 
 	first, err := store.PersistGroup(context.Background(), req)
 	if err != nil || !first.Committed {
@@ -267,25 +268,52 @@ func TestStoredGroupReplayReturnsCommittedWithoutSecondWrite(t *testing.T) {
 	}
 }
 
+func TestDurableGroupRecipientSnapshotIsImmutableAcrossReplay(t *testing.T) {
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	backend := newMemoryIngestBackend()
+	groupWriter := &recordingDurableGroupWriter{failures: 1}
+	store := NewDurableIngestStoreWithGroup(backend, &recordingDurableWriter{}, groupWriter, func() time.Time { return now }, time.Second)
+	recipients := []int64{52, 63}
+	req := DurableGroupRequest{SenderUIN: 41, ClientID: "snapshot-1", GroupID: gocql.TimeUUID(), CryptoEpoch: 7, RecipientUINs: recipients, Envelope: []byte("opaque-envelope"), Ciphertext: []byte("opaque"), MsgType: "sender_key_message"}
+	if _, err := store.PersistGroup(context.Background(), req); err == nil {
+		t.Fatal("first write should fail")
+	}
+	recipients[0] = 999
+	req.RecipientUINs = []int64{52, 63, 74}
+	now = now.Add(2 * time.Second)
+	if _, err := store.PersistGroup(context.Background(), req); !errors.Is(err, ErrIngestConflict) {
+		t.Fatalf("changed membership snapshot = %v, want conflict", err)
+	}
+	if got := groupWriter.writes[0].RecipientUINs; len(got) != 2 || got[0] != 52 || got[1] != 63 {
+		t.Fatalf("stored recipient snapshot mutated: %v", got)
+	}
+}
+
 type fakeOutboxBucketReader struct {
 	direct map[int8][]OutboxEntry
 	group  map[int8][]OutboxEntry
 }
 
-func (f *fakeOutboxBucketReader) fetchDirectBucket(_ context.Context, bucket int8, limit int) ([]OutboxEntry, error) {
-	rows := f.direct[bucket]
+func rowsAfter(rows []OutboxEntry, after outboxPageCursor, limit int) []OutboxEntry {
+	start := 0
+	if after.Valid {
+		for start < len(rows) && (rows[start].CreatedAt.Before(after.CreatedAt) || rows[start].CreatedAt.Equal(after.CreatedAt) && rows[start].MessageID.String() <= after.MessageID.String()) {
+			start++
+		}
+	}
+	rows = rows[start:]
 	if len(rows) > limit {
 		rows = rows[:limit]
 	}
-	return rows, nil
+	return rows
 }
 
-func (f *fakeOutboxBucketReader) fetchGroupBucket(_ context.Context, bucket int8, limit int) ([]OutboxEntry, error) {
-	rows := f.group[bucket]
-	if len(rows) > limit {
-		rows = rows[:limit]
-	}
-	return rows, nil
+func (f *fakeOutboxBucketReader) fetchDirectBucket(_ context.Context, bucket int8, after outboxPageCursor, limit int) ([]OutboxEntry, error) {
+	return rowsAfter(f.direct[bucket], after, limit), nil
+}
+
+func (f *fakeOutboxBucketReader) fetchGroupBucket(_ context.Context, bucket int8, after outboxPageCursor, limit int) ([]OutboxEntry, error) {
+	return rowsAfter(f.group[bucket], after, limit), nil
 }
 
 func TestFetchPendingIsBoundedAndIncludesDirectAndGroupBuckets(t *testing.T) {
@@ -350,5 +378,30 @@ func TestFetchPendingReservesQuotaForLaterBucketsAndCapsAtOneHundred(t *testing.
 	}
 	if !foundLateBucket {
 		t.Fatal("hot bucket 0 starved bucket 15")
+	}
+}
+
+func TestFetchPendingAdvancesPastSameBucketPoisonPrefix(t *testing.T) {
+	reader := &fakeOutboxBucketReader{direct: map[int8][]OutboxEntry{}, group: map[int8][]OutboxEntry{}}
+	base := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 12; i++ {
+		reader.direct[0] = append(reader.direct[0], OutboxEntry{CreatedAt: base.Add(time.Duration(i) * time.Second), MessageID: gocql.TimeUUID(), ReceiverUIN: int64(i + 1)})
+	}
+	cursor := &outboxFetchCursor{}
+	for i := 0; i < outboxBucketCount; i++ { // rotate start back to bucket zero
+		if _, err := cursor.fetch(context.Background(), reader, 16); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := cursor.fetch(context.Background(), reader, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundLater := false
+	for _, row := range rows {
+		foundLater = foundLater || row.ReceiverUIN > 1
+	}
+	if !foundLater {
+		t.Fatal("permanent earliest row starved later rows in the same bucket")
 	}
 }
