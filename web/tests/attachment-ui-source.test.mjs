@@ -32,6 +32,8 @@ test("message item renders encrypted attachments with a decrypting download acti
   assert.match(item, /withObjectUrl/);
   assert.match(item, /download=\{attachment\.name/);
   assert.match(item, /"Download"/);
+  assert.match(item, /Attachment unavailable.*security validation/);
+  assert.match(item, /assertSafeDownloadMetadata/);
 });
 
 test("message model carries parsed encrypted attachment metadata separately from plaintext", () => {

@@ -59,6 +59,46 @@ export function assertQrUploadBounds(bytes: number, width: number, height: numbe
   if (width * height > MAX_QR_PIXELS) throw new Error("QR image has too many pixels");
 }
 
+export async function decodeValidatedQrBitmap(
+  file: Blob,
+  decoder: (blob: Blob) => Promise<ImageBitmap> = (blob) => createImageBitmap(blob),
+): Promise<ImageBitmap> {
+  assertQrUploadBounds(file.size, 1, 1);
+  const header = new Uint8Array(await file.arrayBuffer());
+  const dimensions = parseSupportedImageDimensions(header);
+  assertQrUploadBounds(file.size, dimensions.width, dimensions.height);
+  return decoder(file);
+}
+
+function parseSupportedImageDimensions(bytes: Uint8Array): { width: number; height: number } {
+  const png = [137, 80, 78, 71, 13, 10, 26, 10];
+  if (png.every((value, index) => bytes[index] === value)) {
+    if (bytes.length < 24 || String.fromCharCode(...bytes.slice(12, 16)) !== "IHDR") throw new Error("malformed PNG header");
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let offset = 2;
+    const sof = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+    while (offset + 4 <= bytes.length) {
+      if (bytes[offset] !== 0xff) throw new Error("malformed JPEG header");
+      while (bytes[offset] === 0xff) offset++;
+      const marker = bytes[offset++]!;
+      if (marker === 0xd9 || marker === 0xda) break;
+      if (offset + 2 > bytes.length) break;
+      const length = (bytes[offset]! << 8) | bytes[offset + 1]!;
+      if (length < 2 || offset + length > bytes.length) throw new Error("malformed JPEG header");
+      if (sof.has(marker)) {
+        if (length < 7) throw new Error("malformed JPEG dimensions");
+        return { height: (bytes[offset + 3]! << 8) | bytes[offset + 4]!, width: (bytes[offset + 5]! << 8) | bytes[offset + 6]! };
+      }
+      offset += length;
+    }
+    throw new Error("malformed JPEG header");
+  }
+  throw new Error("unsupported QR image format; use PNG or JPEG");
+}
+
 export function SafetyQr({ fingerprint }: { fingerprint: string }): JSX.Element {
   const [comparison, setComparison] = useState<"idle" | "match" | "mismatch" | "invalid">("idle");
   const [svg, setSvg] = useState("");
@@ -79,9 +119,7 @@ export function SafetyQr({ fingerprint }: { fingerprint: string }): JSX.Element 
   const decodeImage = async (file: File): Promise<void> => {
     let bitmap: ImageBitmap | null = null;
     try {
-      assertQrUploadBounds(file.size, 1, 1);
-      bitmap = await createImageBitmap(file);
-      assertQrUploadBounds(file.size, bitmap.width, bitmap.height);
+      bitmap = await decodeValidatedQrBitmap(file);
       const ratio = Math.min(1, MAX_QR_CANVAS_DIMENSION / Math.max(bitmap.width, bitmap.height));
       const canvas = document.createElement("canvas");
       canvas.width = Math.max(1, Math.round(bitmap.width * ratio)); canvas.height = Math.max(1, Math.round(bitmap.height * ratio));

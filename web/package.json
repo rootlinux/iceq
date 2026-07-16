@@ -13,6 +13,7 @@
     "icons": "node web/scripts/generate-icons.mjs"
   },
   "dependencies": {
+    "@privacyresearch/libsignal-protocol-protobuf-ts": "0.0.9",
     "@privacyresearch/libsignal-protocol-typescript": "^0.0.16",
     "jsqr": "^1.4.0",
     "qrcode": "^1.5.4",

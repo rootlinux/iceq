@@ -29,7 +29,13 @@ function formatTime(iso: string): string {
 }
 
 function parseAttachment(message: Message): MessageAttachment | null {
-  if (message.attachment) return message.attachment;
+  if (message.attachment) {
+    try {
+      if (!isEncryptedFileManifest(message.attachment.manifest)) return null;
+      assertSafeDownloadMetadata(message.attachment.object_key, message.attachment.name);
+      return message.attachment;
+    } catch { return null; }
+  }
   const isFileMessage = message.content_type === "file";
   if (!isFileMessage || !message.plaintext) return null;
   try {
@@ -61,7 +67,8 @@ export function MessageItem({ message }: MessageItemProps): JSX.Element {
   // supplied plaintext through, we explicitly never render
   // the ciphertext on the client.
   const attachment = parseAttachment(message);
-  const text = attachment ? "" : message.plaintext;
+  const invalidAttachment = message.content_type === "file" && !attachment;
+  const text = attachment || invalidAttachment ? "" : message.plaintext;
 
   const onDownload = async (e: React.MouseEvent<HTMLAnchorElement>): Promise<void> => {
     e.preventDefault();
@@ -115,6 +122,8 @@ export function MessageItem({ message }: MessageItemProps): JSX.Element {
             </a>
             {downloadError && <div role="alert" className="text-xs text-red-400">{downloadError}</div>}
           </div>
+        ) : invalidAttachment ? (
+          <div role="alert">Attachment unavailable — failed security validation.</div>
         ) : (
           <div className="whitespace-pre-wrap break-words">{text}</div>
         )}
