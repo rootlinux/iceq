@@ -28,7 +28,7 @@ func (m *memoryIngestBackend) Claim(_ context.Context, proposed IngestRecord, no
 		m.records[proposed.Key] = proposed
 		return proposed, ClaimAcquired, nil
 	}
-	if current.EnvelopeHash != proposed.EnvelopeHash {
+	if current.EnvelopeHash != proposed.EnvelopeHash || current.Kind != proposed.Kind || current.GroupID != proposed.GroupID || current.CryptoEpoch != proposed.CryptoEpoch || current.ReceiverUIN != proposed.ReceiverUIN {
 		return IngestRecord{}, 0, ErrIngestConflict
 	}
 	if current.State == IngestStored || current.State == IngestDelivered {
@@ -74,6 +74,23 @@ type recordingDurableWriter struct {
 }
 
 func (w *recordingDurableWriter) WriteDirect(_ context.Context, write DurableDirectWrite) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writes = append(w.writes, write)
+	if w.failures > 0 {
+		w.failures--
+		return errors.New("scylla unavailable")
+	}
+	return nil
+}
+
+type recordingDurableGroupWriter struct {
+	mu       sync.Mutex
+	failures int
+	writes   []DurableGroupWrite
+}
+
+func (w *recordingDurableGroupWriter) WriteGroup(_ context.Context, write DurableGroupWrite) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.writes = append(w.writes, write)
@@ -189,5 +206,106 @@ func TestMessageIDIsDeterministicForAuthenticatedIdempotencyKey(t *testing.T) {
 	}
 	if deterministicMessageID(key) == deterministicMessageID(IngestKey{SenderUIN: 42, ClientID: key.ClientID}) {
 		t.Fatal("message id was not sender-bound")
+	}
+}
+
+func TestDurableGroupFailureThenReplayUsesOneDeterministicRow(t *testing.T) {
+	now := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	backend := newMemoryIngestBackend()
+	directWriter := &recordingDurableWriter{}
+	groupWriter := &recordingDurableGroupWriter{failures: 1}
+	store := NewDurableIngestStoreWithGroup(backend, directWriter, groupWriter, func() time.Time { return now }, time.Second)
+	groupID := gocql.TimeUUID()
+	req := DurableGroupRequest{
+		SenderUIN: 41, ClientID: "group-client-1", GroupID: groupID, CryptoEpoch: 7,
+		Envelope: []byte(`{"group_id":"opaque"}`), Ciphertext: []byte("opaque"), MsgType: "sender_key_message", ExpiresInSeconds: 3600,
+	}
+
+	if _, err := store.PersistGroup(context.Background(), req); err == nil {
+		t.Fatal("first group write should surface storage failure")
+	}
+	now = now.Add(2 * time.Second)
+	result, err := store.PersistGroup(context.Background(), req)
+	if err != nil || !result.Committed {
+		t.Fatalf("group replay = %+v, %v", result, err)
+	}
+	if len(groupWriter.writes) != 2 {
+		t.Fatalf("group writes = %d, want 2 attempts", len(groupWriter.writes))
+	}
+	first, second := groupWriter.writes[0], groupWriter.writes[1]
+	if first.Message.ID != second.Message.ID || !first.Message.CreatedAt.Equal(second.Message.CreatedAt) {
+		t.Fatal("group retry changed deterministic primary key")
+	}
+	if first.Message.GroupID != groupID || first.Message.CryptoEpoch != 7 {
+		t.Fatal("group write lost authenticated group metadata")
+	}
+	if got, want := first.ExpiresAt, result.CreatedAt.Add(time.Hour); !got.Equal(want) {
+		t.Fatalf("group expiry = %v, want %v", got, want)
+	}
+}
+
+func TestStoredGroupReplayReturnsCommittedWithoutSecondWrite(t *testing.T) {
+	now := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	backend := newMemoryIngestBackend()
+	groupWriter := &recordingDurableGroupWriter{}
+	store := NewDurableIngestStoreWithGroup(backend, &recordingDurableWriter{}, groupWriter, func() time.Time { return now }, time.Second)
+	req := DurableGroupRequest{SenderUIN: 41, ClientID: "group-client-1", GroupID: gocql.TimeUUID(), CryptoEpoch: 3, Envelope: []byte("opaque-envelope"), Ciphertext: []byte("opaque"), MsgType: "sender_key_message"}
+
+	first, err := store.PersistGroup(context.Background(), req)
+	if err != nil || !first.Committed {
+		t.Fatalf("first group persist = %+v, %v", first, err)
+	}
+	second, err := store.PersistGroup(context.Background(), req)
+	if err != nil || !second.Committed {
+		t.Fatalf("stored group replay = %+v, %v", second, err)
+	}
+	if first.MessageID != second.MessageID || !first.CreatedAt.Equal(second.CreatedAt) {
+		t.Fatal("stored group replay changed identity")
+	}
+	if len(groupWriter.writes) != 1 {
+		t.Fatalf("group durable writes = %d, want 1", len(groupWriter.writes))
+	}
+}
+
+type fakeOutboxBucketReader struct {
+	direct map[int8][]OutboxEntry
+	group  map[int8][]OutboxEntry
+}
+
+func (f *fakeOutboxBucketReader) fetchDirectBucket(_ context.Context, bucket int8, limit int) ([]OutboxEntry, error) {
+	rows := f.direct[bucket]
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+func (f *fakeOutboxBucketReader) fetchGroupBucket(_ context.Context, bucket int8, limit int) ([]OutboxEntry, error) {
+	rows := f.group[bucket]
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+func TestFetchPendingIsBoundedAndIncludesDirectAndGroupBuckets(t *testing.T) {
+	reader := &fakeOutboxBucketReader{direct: map[int8][]OutboxEntry{}, group: map[int8][]OutboxEntry{}}
+	reader.direct[0] = []OutboxEntry{{Kind: IngestKindDirect}, {Kind: IngestKindDirect}}
+	reader.group[1] = []OutboxEntry{{Kind: IngestKindGroup}, {Kind: IngestKindGroup}}
+
+	rows, err := fetchPendingOutbox(context.Background(), reader, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want bounded 3", len(rows))
+	}
+	seenDirect, seenGroup := false, false
+	for _, row := range rows {
+		seenDirect = seenDirect || row.Kind == IngestKindDirect
+		seenGroup = seenGroup || row.Kind == IngestKindGroup
+	}
+	if !seenDirect || !seenGroup {
+		t.Fatalf("pending recovery omitted a kind: direct=%v group=%v", seenDirect, seenGroup)
 	}
 }

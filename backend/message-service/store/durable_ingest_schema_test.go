@@ -24,7 +24,9 @@ func TestDurableIngestMigrationDefinesAuthenticatedReceiptAndOutbox(t *testing.T
 		"lease_until TIMESTAMP",
 		"state TEXT",
 		"CREATE TABLE IF NOT EXISTS iceq.message_outbox",
-		"PRIMARY KEY ((receiver_uin), created_at, message_id)",
+		"PRIMARY KEY ((bucket), created_at, message_id)",
+		"CREATE TABLE IF NOT EXISTS iceq.group_message_outbox",
+		"bucket TINYINT",
 	} {
 		if !strings.Contains(normalized, required) {
 			t.Errorf("migration missing %q", required)
@@ -45,11 +47,23 @@ func TestScyllaDurableStoreUsesOwnerCASAndLoggedOutboxBatch(t *testing.T) {
 		"IF state = ? AND owner_token = ? AND lease_until = ?",
 		"gocql.LoggedBatch",
 		"INSERT INTO iceq.message_outbox",
+		"INSERT INTO iceq.group_message_outbox",
 		"DELETE FROM iceq.message_outbox",
+		"DELETE FROM iceq.group_message_outbox",
 		"USING TTL ?",
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("Scylla implementation missing %q", required)
+		}
+	}
+	outboxRaw, err := os.ReadFile("durable_outbox.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxSource := string(outboxRaw)
+	for _, required := range []string{"FetchPending", "WHERE bucket = ? LIMIT ?", "maxPendingOutboxFetch = 100"} {
+		if !strings.Contains(outboxSource, required) {
+			t.Errorf("outbox recovery implementation missing %q", required)
 		}
 	}
 }

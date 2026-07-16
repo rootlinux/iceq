@@ -11,11 +11,14 @@ import (
 )
 
 type IngestState string
+type IngestKind string
 
 const (
-	IngestPending   IngestState = "pending"
-	IngestStored    IngestState = "stored"
-	IngestDelivered IngestState = "delivered"
+	IngestPending    IngestState = "pending"
+	IngestStored     IngestState = "stored"
+	IngestDelivered  IngestState = "delivered"
+	IngestKindDirect IngestKind  = "direct"
+	IngestKindGroup  IngestKind  = "group"
 )
 
 type ClaimDisposition uint8
@@ -40,8 +43,11 @@ type IngestKey struct {
 
 type IngestRecord struct {
 	Key              IngestKey
+	Kind             IngestKind
 	ReceiverUIN      int64
 	ConversationID   string
+	GroupID          gocql.UUID
+	CryptoEpoch      int64
 	Envelope         []byte
 	EnvelopeHash     [sha256.Size]byte
 	MessageID        gocql.UUID
@@ -74,6 +80,25 @@ type DurableDirectWrite struct {
 	Message      SaveRequest
 }
 
+type DurableGroupRequest struct {
+	SenderUIN        int64
+	ClientID         string
+	GroupID          gocql.UUID
+	CryptoEpoch      int64
+	Envelope         []byte
+	Ciphertext       []byte
+	MsgType          string
+	ExpiresInSeconds int64
+}
+
+type DurableGroupWrite struct {
+	Key          IngestKey
+	Envelope     []byte
+	EnvelopeHash [sha256.Size]byte
+	ExpiresAt    time.Time
+	Message      SaveGroupRequest
+}
+
 type DurableIngestResult struct {
 	MessageID gocql.UUID
 	CreatedAt time.Time
@@ -91,11 +116,25 @@ type DurableDirectWriter interface {
 	WriteDirect(context.Context, DurableDirectWrite) error
 }
 
+type DurableGroupWriter interface {
+	WriteGroup(context.Context, DurableGroupWrite) error
+}
+
 type DurableIngestStore struct {
-	backend IngestBackend
-	writer  DurableDirectWriter
-	now     func() time.Time
-	lease   time.Duration
+	backend     IngestBackend
+	writer      DurableDirectWriter
+	groupWriter DurableGroupWriter
+	now         func() time.Time
+	lease       time.Duration
+}
+
+func NewDurableIngestStoreWithGroup(backend IngestBackend, directWriter DurableDirectWriter, groupWriter DurableGroupWriter, now func() time.Time, lease time.Duration) *DurableIngestStore {
+	if groupWriter == nil {
+		panic("store.NewDurableIngestStoreWithGroup: nil group writer")
+	}
+	store := NewDurableIngestStore(backend, directWriter, now, lease)
+	store.groupWriter = groupWriter
+	return store
 }
 
 func NewDurableIngestStore(backend IngestBackend, writer DurableDirectWriter, now func() time.Time, lease time.Duration) *DurableIngestStore {
@@ -108,7 +147,11 @@ func NewDurableIngestStore(backend IngestBackend, writer DurableDirectWriter, no
 	if lease <= 0 {
 		panic("store.NewDurableIngestStore: lease must be positive")
 	}
-	return &DurableIngestStore{backend: backend, writer: writer, now: now, lease: lease}
+	store := &DurableIngestStore{backend: backend, writer: writer, now: now, lease: lease}
+	if groupWriter, ok := writer.(DurableGroupWriter); ok {
+		store.groupWriter = groupWriter
+	}
+	return store
 }
 
 func durableTTL(seconds int64) time.Duration {
@@ -152,6 +195,7 @@ func (s *DurableIngestStore) PersistDirect(ctx context.Context, req DurableDirec
 	proposed := newIngestRecord(IngestKey{SenderUIN: req.SenderUIN, ClientID: req.ClientID}, req.Envelope, hash, now, s.lease)
 	proposed.ReceiverUIN = req.ReceiverUIN
 	proposed.ConversationID = req.ConversationID
+	proposed.Kind = IngestKindDirect
 	proposed.ExpiresInSeconds = req.ExpiresInSeconds
 	if ttl := durableTTL(req.ExpiresInSeconds); ttl > 0 {
 		proposed.ExpiresAt = proposed.CreatedAt.Add(ttl)
@@ -203,6 +247,59 @@ func (s *DurableIngestStore) PersistDirect(ctx context.Context, req DurableDirec
 	}
 	result.State = IngestStored
 	result.Committed = true
+	return result, nil
+}
+
+func (s *DurableIngestStore) PersistGroup(ctx context.Context, req DurableGroupRequest) (DurableIngestResult, error) {
+	if s.groupWriter == nil {
+		return DurableIngestResult{}, errors.New("store: durable group writer is not configured")
+	}
+	if req.SenderUIN <= 0 || req.ClientID == "" || req.GroupID == (gocql.UUID{}) || len(req.Envelope) == 0 || len(req.Ciphertext) == 0 || req.MsgType == "" || req.CryptoEpoch <= 0 || req.ExpiresInSeconds < 0 {
+		return DurableIngestResult{}, ErrInvalidIngest
+	}
+	now := s.now().UTC()
+	hash := sha256.Sum256(req.Envelope)
+	proposed := newIngestRecord(IngestKey{SenderUIN: req.SenderUIN, ClientID: req.ClientID}, req.Envelope, hash, now, s.lease)
+	proposed.Kind = IngestKindGroup
+	proposed.GroupID = req.GroupID
+	proposed.CryptoEpoch = req.CryptoEpoch
+	proposed.ExpiresInSeconds = req.ExpiresInSeconds
+	if ttl := durableTTL(req.ExpiresInSeconds); ttl > 0 {
+		proposed.ExpiresAt = proposed.CreatedAt.Add(ttl)
+		if proposed.LeaseUntil.After(proposed.ExpiresAt) {
+			proposed.LeaseUntil = proposed.ExpiresAt
+		}
+	}
+	record, disposition, err := s.backend.Claim(ctx, proposed, now)
+	if err != nil {
+		return DurableIngestResult{}, err
+	}
+	result := DurableIngestResult{MessageID: record.MessageID, CreatedAt: record.CreatedAt, State: record.State}
+	if disposition == ClaimCommitted {
+		result.Committed = true
+		return result, nil
+	}
+	if disposition == ClaimBusy {
+		return result, ErrIngestBusy
+	}
+	if disposition != ClaimAcquired {
+		return DurableIngestResult{}, fmt.Errorf("store: unknown claim disposition %d", disposition)
+	}
+	write := DurableGroupWrite{
+		Key: record.Key, Envelope: append([]byte(nil), record.Envelope...), EnvelopeHash: record.EnvelopeHash, ExpiresAt: record.ExpiresAt,
+		Message: SaveGroupRequest{GroupID: record.GroupID, ID: record.MessageID, SenderUIN: req.SenderUIN, CryptoEpoch: record.CryptoEpoch, Ciphertext: append([]byte(nil), req.Ciphertext...), MsgType: req.MsgType, CreatedAt: record.CreatedAt, ExpiresInSeconds: req.ExpiresInSeconds},
+	}
+	if err := s.groupWriter.WriteGroup(ctx, write); err != nil {
+		return result, fmt.Errorf("store: durable group/outbox write: %w", err)
+	}
+	applied, err := s.backend.MarkStored(ctx, record.Key, record.OwnerToken, record.LeaseUntil, s.now().UTC())
+	if err != nil {
+		return result, fmt.Errorf("store: mark group ingest stored: %w", err)
+	}
+	if !applied {
+		return result, ErrIngestLeaseLost
+	}
+	result.State, result.Committed = IngestStored, true
 	return result, nil
 }
 

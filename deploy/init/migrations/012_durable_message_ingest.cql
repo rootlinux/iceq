@@ -10,8 +10,11 @@
 CREATE TABLE IF NOT EXISTS iceq.message_ingest (
   sender_uin       BIGINT,
   client_id        TEXT,
+  message_kind     TEXT,
   receiver_uin     BIGINT,
   conversation_id  TEXT,
+  group_id         UUID,
+  crypto_epoch     BIGINT,
   envelope         BLOB,
   envelope_hash    BLOB,
   message_id       UUID,
@@ -29,6 +32,7 @@ CREATE TABLE IF NOT EXISTS iceq.message_ingest (
 -- deterministic message row. Retrying that batch overwrites the same primary
 -- keys rather than creating another logical message.
 CREATE TABLE IF NOT EXISTS iceq.message_outbox (
+  bucket           TINYINT,
   receiver_uin     BIGINT,
   created_at       TIMESTAMP,
   message_id       UUID,
@@ -39,5 +43,20 @@ CREATE TABLE IF NOT EXISTS iceq.message_outbox (
   envelope_hash    BLOB,
   state            TEXT,
   expires_at       TIMESTAMP,
-  PRIMARY KEY ((receiver_uin), created_at, message_id)
+  PRIMARY KEY ((bucket), created_at, message_id)
+) WITH CLUSTERING ORDER BY (created_at ASC, message_id ASC);
+
+CREATE TABLE IF NOT EXISTS iceq.group_message_outbox (
+  bucket           TINYINT,
+  created_at       TIMESTAMP,
+  message_id       UUID,
+  group_id         UUID,
+  sender_uin       BIGINT,
+  client_id        TEXT,
+  crypto_epoch     BIGINT,
+  envelope         BLOB,
+  envelope_hash    BLOB,
+  state            TEXT,
+  expires_at       TIMESTAMP,
+  PRIMARY KEY ((bucket), created_at, message_id)
 ) WITH CLUSTERING ORDER BY (created_at ASC, message_id ASC);
