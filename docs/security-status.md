@@ -21,23 +21,24 @@ Tradeoff:
 
 ## 1. Tor Network Integration
 
-Status: partial to mostly implemented.
+Status: deferred; repository assets retained as opt-in.
 
 Implemented:
-- Docker Compose includes a Tor v3 hidden-service container.
+- Docker Compose retains a Tor v3 hidden-service container behind the explicit `tor` profile; the default clearnet stack excludes it.
 - The `.onion` key material is generated automatically and persisted in the `tor_keys` volume.
 - `deploy/scripts/onion-address.sh` prints the generated onion address and `ICEQ_ONION_LOCATION` value.
 - Caddy can serve clearnet and onion traffic from the same route set.
-- `Onion-Location` is enabled when `ICEQ_ONION_LOCATION` is configured.
+- `Onion-Location` is enabled only when a non-empty `ICEQ_ONION_LOCATION` is configured; the default clearnet response does not advertise it.
+- `deploy/scripts/check-clearnet-compose.sh` verifies default exclusion, explicit profile inclusion, clearnet hosts/routes, and required security headers.
 - Caddy edge logging strips client IP, User-Agent, Authorization, and Cookie data and skips high-volume sensitive routes.
 
 Remaining:
 - Application-wide outbound traffic is not yet forced through a SOCKS5 Tor proxy.
-- No live Docker/Tor boot proof is recorded in this checkout because the previous local environment did not provide a usable Docker daemon.
+- Live Tor boot and integration proof is intentionally deferred until after clearnet deployment and human acceptance.
 - DNS-leak prevention for future outbound integrations must be enforced before adding such integrations.
 
 Tradeoff:
-- Tor ingress is in place without making every internal service Tor-aware. That keeps the stack simpler but means future outbound network code needs a hard policy gate.
+- Tor is not part of the current deployment scope. Keeping its assets opt-in avoids accidental activation while preserving a reviewed starting point for the later Tor phase.
 
 ## 2. End-to-End Encryption
 
@@ -131,7 +132,7 @@ Tradeoff:
 Status: partial.
 
 Implemented:
-- README includes Docker and Tor setup.
+- README documents the default clearnet command and separate explicit Tor-profile command.
 - A baseline Git commit exists for future diffs.
 - Focused unit/source tests cover Argon2id, cookies, CSRF middleware/header wiring, encrypted files, key API behavior, automatic prekey replenishment, safety fingerprinting, and attachment UI wiring.
 - Security CI workflow is present.

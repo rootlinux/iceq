@@ -13,7 +13,7 @@
 #   - Backend transport timeouts on every reverse_proxy block
 #
 # Three listeners share the same route table via the (iceq_routes) snippet:
-#   - :80            — Tor hidden service (plain HTTP; Tor encrypts the wire)
+#   - :80            — optional Tor profile's internal hidden-service target
 #   - iceq.space     — public direct browser access with managed TLS
 #   - https://localhost — direct browser access (self-signed dev cert)
 # All get identical IceQ handlers, security headers, rate limits, and SPA
@@ -329,8 +329,10 @@
     }
 }
 
-# ── Tor hidden service listener ───────────────────────────────────────────────
-# Plain HTTP only. Tor provides transport-layer encryption between the client
+# ── Optional Tor hidden-service target ───────────────────────────────────────
+# This listener is not published by Compose. It becomes reachable only from the
+# internal network when the explicit `tor` profile is enabled. Plain HTTP is
+# used internally; Tor provides transport-layer encryption between the client
 # and this listener, so serving over plain HTTP inside the Docker network
 # does not weaken end-to-end confidentiality. The goldy/tor-hidden-service
 # container sits in front of Caddy on the iceq-net bridge and forwards .onion
@@ -342,6 +344,8 @@
 # ── Public TLS listener (direct browser access) ──────────────────────────────
 # Public domains use Caddy-managed TLS on 443.
 iceq.space, www.iceq.space {
+    # An unset/empty variable produces no Onion-Location header. Clearnet is
+    # therefore the safe default, including when the Tor profile is disabled.
     @hasOnionLocation expression `'{$ICEQ_ONION_LOCATION}' != ''`
     header @hasOnionLocation Onion-Location "{$ICEQ_ONION_LOCATION}"
     import iceq_routes

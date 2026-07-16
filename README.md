@@ -5,8 +5,8 @@ IceQ is a privacy-first, end-to-end encrypted messenger built on the Signal Prot
 ## Architecture
 
 ```
-Browser / Tor client
-      │  HTTPS / WSS (direct)        │  .onion (Tor)
+Browser / optional Tor client
+      │  HTTPS / WSS (default)       │  .onion (opt-in profile)
       ▼                              ▼
 ┌─────────────────────────────────────────────────────┐
 │  Caddy (TLS termination, rate limiting, CSP headers) │◄── iceq-tor (v3
@@ -32,7 +32,7 @@ service     service        (pre-signed
  ciphertext) presence map)  never sees
                             file bytes)
 
-Infrastructure: PostgreSQL · ScyllaDB · Redis · NATS · MinIO · Tor
+Infrastructure: PostgreSQL · ScyllaDB · Redis · NATS · MinIO · optional Tor
 ```
 
 ## Quick Start
@@ -45,7 +45,7 @@ git clone <repo-url> && cd iceq
 cp deploy/.env.example deploy/.env.local
 $EDITOR deploy/.env.local   # set passwords, JWT secret, allowed origins
 
-# 3. Build and start
+# 3. Build and start the default clearnet stack (Tor is excluded)
 docker compose -f deploy/docker-compose.yml up --build
 
 # 4. Open the app
@@ -57,7 +57,7 @@ open https://localhost        # accept the self-signed dev cert
 | Service          | Internal port | Purpose                                    |
 |------------------|---------------|--------------------------------------------|
 | caddy            | 443 (public)  | TLS termination, rate limiting, SPA serving|
-| tor              | —             | v3 hidden service gateway to Caddy (:80)   |
+| tor (opt-in)     | —             | v3 hidden service gateway to Caddy (:80)   |
 | auth-service     | 8080          | Registration, login, JWT, contacts, groups |
 | key-service      | 8081          | Signal Protocol prekey bundle distribution |
 | ws-gateway       | 8082          | WebSocket hub, NATS fan-out                |
@@ -132,14 +132,20 @@ Rollout ordering is service-specific:
 1. Apply and verify migration `004_panic_wipe_message_indexes.cql` **before starting the updated message-service**; otherwise new messages cannot create their deletion-index rows.
 2. Apply and verify migration `005_wiped_accounts.sql` **before starting the updated auth-service or ws-gateway**. Until 005 exists, JWT validation cannot prove durable revocation and fails closed, so authenticated REST requests and WebSocket authentication/message checks are rejected.
 
-## Tor Hidden Service
+## Optional Tor Hidden Service
 
-IceQ runs as a Tor v3 hidden service out of the box. The `.onion` address is auto-generated on first boot and stored in the `tor_keys` Docker volume. Onion-Location is optional and must be enabled after that address is known by setting `ICEQ_ONION_LOCATION` in `deploy/.env.local`.
+The default Compose command starts only the clearnet stack. Tor remains available as an explicit profile for later testing; it is not part of the current `iceq.space` rollout. When enabled, the `.onion` address is auto-generated on first boot and stored in the `tor_keys` Docker volume. `Onion-Location` is emitted only after an operator sets a non-empty `ICEQ_ONION_LOCATION` in `deploy/.env.local`; leaving it absent keeps clearnet responses free of onion advertising.
+
+Validate this contract at any time:
+
+```bash
+./deploy/scripts/check-clearnet-compose.sh
+```
 
 ### Get your .onion address
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml --profile tor up -d
 ./deploy/scripts/onion-address.sh
 ```
 
@@ -181,7 +187,7 @@ docker run --rm \
 After a restore, restart the Tor container to pick up the keypair:
 
 ```bash
-docker compose -f deploy/docker-compose.yml restart tor
+docker compose -f deploy/docker-compose.yml --profile tor restart tor
 ./deploy/scripts/onion-address.sh   # should print the same address
 ```
 

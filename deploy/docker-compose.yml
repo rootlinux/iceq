@@ -394,10 +394,11 @@ services:
     logging: *default-logging
 
   # ==========================================================================
-  # Tor hidden service — sits in front of Caddy, persists its v3 keypair
-  # in the `tor_keys` volume. Auto-generates a .onion address on first boot.
+  # Optional Tor hidden service — enabled only with `--profile tor`. It sits
+  # in front of Caddy and persists its v3 keypair in the `tor_keys` volume.
   # ==========================================================================
   tor:
+    profiles: ["tor"]
     image: goldy/tor-hidden-service:latest
     container_name: iceq-tor
     restart: unless-stopped
