@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import "fake-indexeddb/auto";
 import { saveAuthenticatedGroupContent, saveGroupCryptoState, loadGroupCryptoState, pruneObsoleteGroupEpochs } from "../src/lib/groupCryptoStore";
-import { authenticatedGroupMessageFields, hydrateSenderKeyInbox, GROUP_CONTENT_KIND, GROUP_DISTRIBUTION_KIND, openGroupContent, sealGroupContent } from "../src/lib/groupCrypto";
+import { authenticatedGroupMessageFields, hydrateSenderKeyInbox, GROUP_CONTENT_KIND, GROUP_DISTRIBUTION_KIND, openGroupContent, processDirectControlMessage, sealGroupContent } from "../src/lib/groupCrypto";
 import { createReceiverState, createSenderState, encryptGroupMessage } from "../src/lib/senderKeys";
 import { getGroupCryptoRecord } from "../src/lib/indexeddb";
 
@@ -100,4 +100,38 @@ test("authenticated cache metadata binds context and cannot extend expiry",async
 test("authenticated group content type wins over conflicting outer metadata both ways",()=>{
   assert.deepEqual(authenticatedGroupMessageFields({kind:GROUP_CONTENT_KIND,content_type:"text",text:"hello"},"file"),{plaintext:"hello",content_type:"text"});
   assert.deepEqual(authenticatedGroupMessageFields({kind:GROUP_CONTENT_KIND,content_type:"file",attachment:{id:"x"}},"text"),{plaintext:JSON.stringify({id:"x"}),content_type:"file"});
+});
+
+test("outer routing must match the signed group envelope before rendering",async()=>{
+  const made=await createSenderState("route-bound",3,9);await saveGroupCryptoState({version:1,kind:"receiver",group_id:"route-bound",epoch:3,sender_uin:9,updated_at:1,state:createReceiverState(made.distribution)});
+  const encrypted=await encryptGroupMessage(made.state,new TextEncoder().encode(JSON.stringify({kind:GROUP_CONTENT_KIND,content_type:"text",text:"bound"})));
+  await assert.rejects(()=>openGroupContent(encrypted.envelope,3,[9],false,Date.now(),{group_id:"relayed",sender_uin:9}),/routing context/);
+  await assert.rejects(()=>openGroupContent(encrypted.envelope,3,[9],false,Date.now(),{group_id:"route-bound",sender_uin:8}),/routing context/);
+});
+
+test("authenticated group content rejects oversized text and unsafe file shapes",async()=>{
+  const attempt=async(content:unknown)=>{const made=await createSenderState(`schema-${crypto.randomUUID()}`,1,9);await saveGroupCryptoState({version:1,kind:"receiver",group_id:made.state.group_id,epoch:1,sender_uin:9,updated_at:1,state:createReceiverState(made.distribution)});const encrypted=await encryptGroupMessage(made.state,new TextEncoder().encode(JSON.stringify(content)));return openGroupContent(encrypted.envelope,1,[9]);};
+  await assert.rejects(()=>attempt({kind:GROUP_CONTENT_KIND,content_type:"text",text:"x".repeat(16_385)}),/content/);
+  await assert.rejects(()=>attempt({kind:GROUP_CONTENT_KIND,content_type:"text",text:{toString:"boom"}}),/content/);
+  await assert.rejects(()=>attempt({kind:GROUP_CONTENT_KIND,content_type:"file",attachment:{kind:"iceq.attachment.v1",object_key:"../bad",manifest:{}}}),/content/);
+  await assert.rejects(()=>attempt({kind:GROUP_CONTENT_KIND,content_type:"text",text:"ok",attachment:{unsafe:true}}),/content/);
+});
+
+test("history-first control consumption installs once and later inbox duplicate skips Signal replay",async()=>{
+  const distribution={version:1 as const,distribution_id:"history-first-id",group_id:"history-first",epoch:2,sender_uin:9,chain_key:"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",iteration:0,signing_public_key:"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"};
+  const bytes=new TextEncoder().encode(JSON.stringify({kind:GROUP_DISTRIBUTION_KIND,distribution}));
+  assert.equal(await processDirectControlMessage(9,bytes,async()=>({epoch:2,members:[7,9]})),true);
+  let decrypts=0;const installed=await hydrateSenderKeyInbox("history-first",2,[7,9],async()=>[{sender_uin:9,ciphertext:"replay",msg_type:"signal_message",distribution_id:"history-first-id"}],async()=>{decrypts++;throw new Error("ratchet replay");});
+  assert.equal(installed,0);assert.equal(decrypts,0);
+});
+
+test("ordinary direct plaintext is not consumed as a control message",async()=>{
+  assert.equal(await processDirectControlMessage(9,new TextEncoder().encode("hello"),async()=>{throw new Error("unused");}),false);
+});
+
+test("concurrent group seals reserve distinct sender iterations",async()=>{
+  const made=await createSenderState("concurrent-seal",1,7);
+  await saveGroupCryptoState({version:1,kind:"sender",group_id:"concurrent-seal",epoch:1,sender_uin:7,updated_at:1,state:{sender:made.state,distributed_to:[],revision:0}});
+  const [a,b]=await Promise.all([sealGroupContent(made.state,{kind:GROUP_CONTENT_KIND,content_type:"text",text:"a"}),sealGroupContent(made.state,{kind:GROUP_CONTENT_KIND,content_type:"text",text:"b"})]);
+  assert.deepEqual([a.iteration,b.iteration].sort((x,y)=>x-y),[0,1]);
 });

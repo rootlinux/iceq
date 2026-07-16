@@ -18,6 +18,8 @@ import { MessageInput } from "./MessageInput";
 import { TypingIndicator } from "./TypingIndicator";
 import { historyDM } from "../../api/messages";
 import { decryptMessage } from "../../lib/signal";
+import { processDirectControlMessage } from "../../lib/groupCrypto";
+import { getGroupMembersWithEpoch } from "../../api/groups";
 import { useChatStore, conversationIdForPair } from "../../store/chatStore";
 import { useAuthStore } from "../../store/authStore";
 import { usePresence } from "../../hooks/usePresence";
@@ -93,6 +95,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
           if (row.msg_type === "plaintext" || row.msg_type === "group_ciphertext") continue;
           try {
             const plain = await decryptMessage(row.sender_uin, row.ciphertext, row.msg_type);
+            if(await processDirectControlMessage(row.sender_uin,plain,async(groupId)=>{const roster=await getGroupMembersWithEpoch(groupId);return {epoch:roster.crypto_epoch,members:roster.members.map(member=>member.uin)};}))continue;
             out.push({
               id: row.id,
               conversation_id: row.conversation_id,

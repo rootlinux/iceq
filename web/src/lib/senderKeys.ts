@@ -25,11 +25,13 @@ export async function createSenderState(groupId: string, epoch: number, senderUi
   const priv = signingPrivate ? new Uint8Array(signingPrivate) : crypto.getRandomValues(new Uint8Array(32));
   if (chain.length !== 32 || priv.length !== 32) throw new Error("sender key material must be 32 bytes");
   const pair = await curve.keyPair(toBuffer(priv));
+  const publicBytes=new Uint8Array(pair.pubKey);const privateBytes=new Uint8Array(pair.privKey);
   const distribution: SenderKeyDistribution = {
     version: 1, distribution_id: randomId(), group_id: groupId, epoch, sender_uin: senderUin,
-    chain_key: b64(chain), iteration: 0, signing_public_key: b64(new Uint8Array(pair.pubKey)),
+    chain_key: b64(chain), iteration: 0, signing_public_key: b64(publicBytes),
   };
-  return { state: { ...distribution, signing_private_key: b64(new Uint8Array(pair.privKey)) }, distribution };
+  const encodedPrivate=b64(privateBytes);chain.fill(0);priv.fill(0);privateBytes.fill(0);
+  return { state: { ...distribution, signing_private_key: encodedPrivate }, distribution };
 }
 
 export function createReceiverState(distribution: SenderKeyDistribution, maxSkip = 128): ReceiverState {
@@ -52,9 +54,10 @@ export async function encryptGroupMessage(state: SenderState, plaintext: Uint8Ar
     version: 1, group_id: state.group_id, epoch: state.epoch, sender_uin: state.sender_uin,
     distribution_id: state.distribution_id, iteration: state.iteration, ciphertext: b64(combined),
   };
-  const signature = await curve.sign(toBuffer(unb64(state.signing_private_key, 32)), toBuffer(signingBytes(unsigned)));
-  current.fill(0); messageKey.fill(0);
-  return { state: { ...state, chain_key: b64(next), iteration: state.iteration + 1 }, envelope: { ...unsigned, signature: b64(new Uint8Array(signature)) } };
+  const signingPrivate=unb64(state.signing_private_key,32);const signingInput=signingBytes(unsigned);
+  const signature = new Uint8Array(await curve.sign(toBuffer(signingPrivate),toBuffer(signingInput)));
+  const nextEncoded=b64(next);const signatureEncoded=b64(signature);current.fill(0);messageKey.fill(0);next.fill(0);nonce.fill(0);sealed.fill(0);combined.fill(0);header.fill(0);signingPrivate.fill(0);signingInput.fill(0);signature.fill(0);
+  return { state: { ...state, chain_key: nextEncoded, iteration: state.iteration + 1 }, envelope: { ...unsigned, signature: signatureEncoded } };
 }
 
 export async function decryptGroupMessage(state: ReceiverState, envelope: SenderKeyCiphertext): Promise<Uint8Array> {
@@ -74,20 +77,23 @@ export async function decryptGroupMessage(state: ReceiverState, envelope: Sender
     if (envelope.iteration - state.iteration > state.max_skip) throw new Error("sender-key skipped window exceeded");
     let chain = unb64(state.chain_key, 32);
     while (state.iteration < envelope.iteration) {
-      const skipped = await derive(chain, "message"); state.skipped[String(state.iteration)] = b64(skipped);
+      const skipped = await derive(chain, "message"); state.skipped[String(state.iteration)] = b64(skipped);skipped.fill(0);
       const next = await derive(chain, "chain"); chain.fill(0); chain = next; state.iteration++;
     }
     messageKey = await derive(chain, "message");
-    const next = await derive(chain, "chain"); chain.fill(0); state.chain_key = b64(next); state.iteration++;
+    const next = await derive(chain, "chain"); chain.fill(0); state.chain_key = b64(next);next.fill(0); state.iteration++;
   }
   const combined = unb64(envelope.ciphertext); if (combined.length < 29) throw new Error("sender-key ciphertext invalid");
+  const nonce=combined.slice(0,12);const body=combined.slice(12);
   const aes = await crypto.subtle.importKey("raw", toBuffer(messageKey), "AES-GCM", false, ["decrypt"]);
+  const header=headerBytes(state,envelope.iteration);
   try {
-    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: toBuffer(combined.slice(0, 12)), additionalData: toBuffer(headerBytes(state, envelope.iteration)) }, aes, toBuffer(combined.slice(12)));
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: toBuffer(nonce), additionalData: toBuffer(header) }, aes, toBuffer(body));
     state.seen[String(envelope.iteration)] = true;
     for(const key of Object.keys(state.seen)) if(Number(key)<state.iteration-state.max_skip) delete state.seen[key];
-    messageKey.fill(0); return new Uint8Array(plain);
-  } catch { messageKey.fill(0); throw new Error("sender-key authentication failed"); }
+    return new Uint8Array(plain);
+  } catch { throw new Error("sender-key authentication failed"); }
+  finally{messageKey.fill(0);combined.fill(0);nonce.fill(0);body.fill(0);header.fill(0);}
 }
 
 async function derive(chain: Uint8Array, label: string): Promise<Uint8Array> {

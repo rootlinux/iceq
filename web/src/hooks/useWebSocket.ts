@@ -47,7 +47,7 @@ import type {
 import type { Message } from "../types/models";
 import { parseEnvelope } from "../types/envelope";
 import { useGroupStore } from "../store/groupStore";
-import { authenticatedGroupMessageFields, decodeGroupCiphertext, installSenderDistribution, openGroupContent } from "../lib/groupCrypto";
+import { authenticatedGroupMessageFields, decodeGroupCiphertext, openGroupContent, processDirectControlMessage } from "../lib/groupCrypto";
 import { getGroupMembersWithEpoch } from "../api/groups";
 
 // ----------------------------------------------------------------------------
@@ -348,23 +348,19 @@ export function useWebSocket(): UseWebSocketResult {
             const group=useGroupStore.getState().groups.find(g=>g.group_id===gp.group_id);
             const members=(useGroupStore.getState().members[gp.group_id]??[]).map(m=>m.uin);
             if(!group)throw new Error("group routing state is unavailable");
-            const content=await openGroupContent(decodeGroupCiphertext(gp.ciphertext??""),group.crypto_epoch,members);
+            if(gp.crypto_epoch!==group.crypto_epoch)throw new Error("group routing epoch mismatch");
+            const content=await openGroupContent(decodeGroupCiphertext(gp.ciphertext??""),group.crypto_epoch,members,false,Date.now(),{group_id:gp.group_id,sender_uin:senderUin,epoch:gp.crypto_epoch});
             ({plaintext,content_type:authenticatedContentType}=authenticatedGroupMessageFields(content,p.content_type));
           } else {
             const bytes=await decryptMessage(senderUin,p.ciphertext??"",p.msg_type as "prekey_message"|"signal_message");
             plaintext=decoder.decode(bytes);
-            try {
-              const value:unknown=JSON.parse(plaintext);
-              if(typeof value==="object"&&value!==null&&"kind" in value&&value.kind==="iceq.sender-key-distribution.v1") {
-                const d=(value as {distribution?:{group_id?:string}}).distribution;
-                const gid=d?.group_id??""; let group=useGroupStore.getState().groups.find(g=>g.group_id===gid);
+            if(await processDirectControlMessage(senderUin,bytes,async(gid)=>{
+                let group=useGroupStore.getState().groups.find(g=>g.group_id===gid);
                 const roster=await getGroupMembersWithEpoch(gid);
                 useGroupStore.getState().setMembers(gid,roster.members);
                 if(group){group={...group,crypto_epoch:roster.crypto_epoch};useGroupStore.setState(s=>({groups:s.groups.map(g=>g.group_id===gid?group!:g)}));}
-                const members=roster.members.map(m=>m.uin);
-                await installSenderDistribution(senderUin,value,roster.crypto_epoch,members); return;
-              }
-            } catch(error) { if(error instanceof SyntaxError){ /* ordinary text */ } else throw error; }
+                return {epoch:roster.crypto_epoch,members:roster.members.map(m=>m.uin)};
+            }))return;
           }
           const conversationId = env.type === "message"
             ? conversationIdForPair(senderUin, (p as MessagePayload).receiver_uin)

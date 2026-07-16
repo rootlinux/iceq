@@ -125,8 +125,8 @@ export interface SenderKeyInboxItem { epoch:number; sender_uin:number; ciphertex
 export async function putSenderKeyDistribution(groupId:string,body:{recipient_uin:number;epoch:number;distribution_id:string;ciphertext:string;msg_type:"prekey_message"|"signal_message"}):Promise<void>{
   await fetchJSON<void>(`/api/groups/${encodeURIComponent(groupId)}/sender-key-distributions`,{method:"POST",body});
 }
-export async function getSenderKeyDistributions(groupId:string):Promise<{epoch:number;distributions:SenderKeyInboxItem[]}>{
-  return fetchJSON(`/api/groups/${encodeURIComponent(groupId)}/sender-key-distributions`,{method:"GET"});
+export async function getSenderKeyDistributions(groupId:string,page=0):Promise<{epoch:number;distributions:SenderKeyInboxItem[]}>{
+  return fetchJSON(`/api/groups/${encodeURIComponent(groupId)}/sender-key-distributions?page=${page}`,{method:"GET"});
 }
 
 // deleteGroup removes the entire group. The requesting

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { historyGroup } from "../../api/messages";
 import { getGroupMembersWithEpoch, getSenderKeyDistributions } from "../../api/groups";
-import type { GroupWire } from "../../api/groups";
+import type { GroupWire, SenderKeyInboxItem } from "../../api/groups";
 import { MessageInput } from "../Chat/MessageInput";
 import { MessageList } from "../Chat/MessageList";
 import { useChatStore } from "../../store/chatStore";
@@ -28,15 +28,14 @@ function loadEncryptedGroupHistory(groupId: string, selfUin: number, conversatio
     await pruneObsoleteGroupEpochs(groupId, roster.crypto_epoch);
     useGroupStore.getState().setMembers(groupId, roster.members);
     useGroupStore.setState((state) => ({ groups: state.groups.map((item) => item.group_id === groupId ? { ...item, crypto_epoch: roster.crypto_epoch } : item) }));
-    const inbox = await getSenderKeyDistributions(groupId);
-    if (inbox.epoch !== roster.crypto_epoch) throw new Error("sender-key inbox epoch changed during hydration");
-    await hydrateSenderKeyInbox(groupId, roster.crypto_epoch, memberUins, async () => inbox.distributions, decryptMessage);
+    const distributions:SenderKeyInboxItem[]=[];for(let page=0;page<128;page++){const inbox=await getSenderKeyDistributions(groupId,page);if(inbox.epoch!==roster.crypto_epoch)throw new Error("sender-key inbox epoch changed during hydration");distributions.push(...inbox.distributions);if(inbox.distributions.length<8)break;if(page===127)throw new Error("sender-key inbox page limit exceeded");}
+    await hydrateSenderKeyInbox(groupId, roster.crypto_epoch, memberUins, async () => distributions, decryptMessage);
     const resp = await historyGroup(groupId, 50);
     const out: Message[] = [];
     for (const row of resp.messages) {
       try {
         if (row.msg_type !== "group_ciphertext") throw new Error("legacy insecure group row");
-        const content = await openGroupContent(decodeGroupCiphertext(row.ciphertext), roster.crypto_epoch, memberUins, true);
+        const content = await openGroupContent(decodeGroupCiphertext(row.ciphertext), roster.crypto_epoch, memberUins, true, Date.now(), {group_id:groupId,sender_uin:row.sender_uin});
         out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: content.content_type === "file" ? JSON.stringify(content.attachment ?? null) : (content.text ?? ""), content_type: content.content_type, created_at: row.created_at, state: "delivered", is_outgoing: row.sender_uin === selfUin });
       } catch {
         out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: "Security warning: this historical group message could not be verified or decrypted.", content_type: "text", created_at: row.created_at, state: "failed", is_outgoing: row.sender_uin === selfUin });

@@ -321,6 +321,14 @@ export async function loadCachedMessages(conversationId: string): Promise<unknow
 export async function putGroupCryptoRecord(key: string, value: unknown): Promise<void> {
   const db = await openDB(); await idbPut(db, STORE_GROUP_CRYPTO, value, key); db.close();
 }
+export async function compareAndSwapGroupCryptoRecord<T extends {state?:unknown}>(key:string,expectedRevision:number,value:T):Promise<boolean>{
+  const db=await openDB();const tx=db.transaction(STORE_GROUP_CRYPTO,"readwrite");const done=transactionDone(tx);
+  try{
+    const store=tx.objectStore(STORE_GROUP_CRYPTO);const current=await requestResult<{state?:{revision?:number}}|undefined>(store.get(key));
+    if((current?.state?.revision??0)!==expectedRevision){tx.abort();await done.catch(()=>undefined);return false;}
+    store.put(value,key);await done;return true;
+  }finally{db.close();}
+}
 export async function getGroupCryptoRecord<T>(key: string): Promise<T | null> {
   const db = await openDB(); const value = await idbGet<T>(db, STORE_GROUP_CRYPTO, key); db.close(); return value ?? null;
 }
