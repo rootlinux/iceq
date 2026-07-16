@@ -41,6 +41,7 @@ const (
 	qListGroupsForMember = `
 		SELECT g.id, g.name, g.owner_uin, g.created_at,
 		       (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) AS member_count
+		       , g.crypto_epoch
 		FROM groups g
 		JOIN group_members m ON m.group_id = g.id
 		WHERE m.uin = $1
@@ -83,9 +84,12 @@ const (
 	// re-adding an existing member a no-op (handler returns
 	// 201 because the intent is satisfied).
 	qInsertGroupMember = `
-		INSERT INTO group_members (group_id, uin, role)
-		VALUES ($1, $2, 'member')
-		ON CONFLICT (group_id, uin) DO NOTHING
+		WITH inserted AS (
+		  INSERT INTO group_members (group_id, uin, role) VALUES ($1, $2, 'member')
+		  ON CONFLICT (group_id, uin) DO NOTHING RETURNING group_id
+		)
+		UPDATE groups SET crypto_epoch = crypto_epoch + 1
+		WHERE id = $1 AND EXISTS (SELECT 1 FROM inserted)
 	`
 
 	// qDeleteGroupMember removes a (group_id, uin) row.
@@ -93,8 +97,11 @@ const (
 	// the requester's own UIN) and the "kick" case (where
 	// uin is some other member's UIN).
 	qDeleteGroupMember = `
-		DELETE FROM group_members
-		WHERE group_id = $1 AND uin = $2
+		WITH removed AS (
+		  DELETE FROM group_members WHERE group_id = $1 AND uin = $2 RETURNING group_id
+		)
+		UPDATE groups SET crypto_epoch = crypto_epoch + 1
+		WHERE id = $1 AND EXISTS (SELECT 1 FROM removed)
 	`
 
 	// qCountGroupMembers counts the current members of a
@@ -134,4 +141,5 @@ const (
 	// to group X"). Avoids the handler re-querying the
 	// membership roster just to get the group's name.
 	qGetGroupName = `SELECT name FROM groups WHERE id = $1`
+	qGetGroupEpoch = `SELECT crypto_epoch FROM groups WHERE id = $1`
 )

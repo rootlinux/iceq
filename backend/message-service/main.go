@@ -213,7 +213,7 @@ func main() {
 	// subscribe-time are fatal: a service that thinks it
 	// has listeners but actually has none is worse than
 	// a service that crashes and restarts.
-	if err := startNATSSubscribers(bus, msgStore); err != nil {
+	if err := startNATSSubscribers(bus, msgStore, pgPool); err != nil {
 		log.Fatalf("nats subscribe: %v", err)
 	}
 
@@ -337,7 +337,7 @@ func main() {
 
 // startNATSSubscribers wires the three subscriptions.
 // Errors at subscribe-time are fatal.
-func startNATSSubscribers(bus *natsclient.Client, ms *store.MessageStore) error {
+func startNATSSubscribers(bus *natsclient.Client, ms *store.MessageStore, pg *pgxpool.Pool) error {
 	// 1. msg.direct.* — the gateway publishes here for
 	//    every 1:1 chat message it forwards. The
 	//    subject suffix is the receiver_uin; the
@@ -354,7 +354,7 @@ func startNATSSubscribers(bus *natsclient.Client, ms *store.MessageStore) error 
 	//    every group chat message. The subject suffix
 	//    is the group_id (UUID string).
 	if _, err := bus.Subscribe("msg.group.*", func(m *nats.Msg) {
-		handleGroupMessage(bus, ms, m.Subject, m.Data)
+		handleGroupMessage(bus, ms, pg, m.Subject, m.Data)
 	}); err != nil {
 		return err
 	}
@@ -518,7 +518,7 @@ func handleDirectMessage(bus *natsclient.Client, ms *store.MessageStore, subject
 // Privacy: same contract as handleDirectMessage. The
 // E2EE bytes are forwarded as-is to the store; the
 // handler does not log them.
-func handleGroupMessage(_ *natsclient.Client, ms *store.MessageStore, subject string, data []byte) {
+func handleGroupMessage(_ *natsclient.Client, ms *store.MessageStore, pg *pgxpool.Pool, subject string, data []byte) {
 	groupIDStr, ok := subjectTail(subject, "msg.group.")
 	if !ok {
 		return
@@ -536,15 +536,17 @@ func handleGroupMessage(_ *natsclient.Client, ms *store.MessageStore, subject st
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return
 	}
-	if p.SenderUIN == 0 {
+	if p.SenderUIN == 0 || p.CryptoVersion != 1 || p.CryptoEpoch < 1 || p.MsgType != "group_ciphertext" || len(p.Ciphertext) == 0 || p.Content != "" {
+		return
+	}
+	ctxAuth, cancelAuth := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelAuth()
+	var probe int
+	if pg == nil || pg.QueryRow(ctxAuth, `SELECT 1 FROM group_members m JOIN groups g ON g.id=m.group_id WHERE m.group_id=$1 AND m.uin=$2 AND g.crypto_epoch=$3`, groupIDStr, p.SenderUIN, p.CryptoEpoch).Scan(&probe) != nil {
 		return
 	}
 	ciphertext := p.Ciphertext
 	msgType := p.MsgType
-	if len(ciphertext) == 0 && p.Content != "" {
-		ciphertext = []byte(p.Content)
-		msgType = "plaintext"
-	}
 
 	id, err := gocql.ParseUUID(env.ID)
 	if err != nil {

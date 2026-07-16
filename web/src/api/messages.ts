@@ -24,7 +24,7 @@ export interface HistoryMessage {
   // ISO 8601 timestamp. Server-assigned.
   created_at: string;
   ciphertext: string;
-  msg_type: "prekey_message" | "signal_message" | "plaintext";
+  msg_type: "prekey_message" | "signal_message" | "plaintext" | "group_ciphertext";
 }
 
 export interface HistoryResponse {

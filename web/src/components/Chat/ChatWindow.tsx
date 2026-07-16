@@ -90,7 +90,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
         const out: Message[] = [];
         for (const row of resp.messages) {
           if (!row.ciphertext || !row.msg_type) continue;
-          if (row.msg_type === "plaintext") continue;
+          if (row.msg_type === "plaintext" || row.msg_type === "group_ciphertext") continue;
           try {
             const plain = await decryptMessage(row.sender_uin, row.ciphertext, row.msg_type);
             out.push({

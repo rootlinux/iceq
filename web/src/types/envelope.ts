@@ -129,7 +129,9 @@ export interface GroupMessagePayload {
   file_url?: string;
   client_id?: string;
   ciphertext?: string;
-  msg_type?: "prekey_message" | "signal_message" | "plaintext";
+  msg_type: "group_ciphertext";
+  crypto_version: 1;
+  crypto_epoch: number;
 }
 
 export interface AckPayload {

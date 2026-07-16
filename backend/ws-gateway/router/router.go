@@ -315,9 +315,9 @@ func handleGroup(c *client.Client, deps client.Deps, env models.Envelope) {
 	// publish.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	const q = `SELECT 1 FROM group_members WHERE group_id = $1 AND uin = $2`
+	const q = `SELECT 1 FROM group_members m JOIN groups g ON g.id = m.group_id WHERE m.group_id = $1 AND m.uin = $2 AND g.crypto_epoch = $3`
 	var probe int
-	if err := deps.PG.QueryRow(ctx, q, p.GroupID, c.UIN()).Scan(&probe); err != nil {
+	if err := deps.PG.QueryRow(ctx, q, p.GroupID, c.UIN(), p.CryptoEpoch).Scan(&probe); err != nil {
 		if err == pgx.ErrNoRows {
 			// Not a member. 403 in error-frame form.
 			// We do NOT distinguish "group doesn't exist"
@@ -340,14 +340,16 @@ func handleGroup(c *client.Client, deps client.Deps, env models.Envelope) {
 		ID:   msgID,
 		TS:   ts,
 		Payload: mustMarshalRaw(models.GroupMessagePayload{
-			GroupID:     p.GroupID,
-			SenderUIN:   p.SenderUIN,
-			Content:     p.Content,
-			ContentType: p.ContentType,
-			FileURL:     p.FileURL,
-			ClientID:    p.ClientID,
-			Ciphertext:  p.Ciphertext,
-			MsgType:     p.MsgType,
+			GroupID:       p.GroupID,
+			SenderUIN:     p.SenderUIN,
+			Content:       p.Content,
+			ContentType:   p.ContentType,
+			FileURL:       p.FileURL,
+			ClientID:      p.ClientID,
+			Ciphertext:    p.Ciphertext,
+			MsgType:       p.MsgType,
+			CryptoVersion: p.CryptoVersion,
+			CryptoEpoch:   p.CryptoEpoch,
 		}),
 	}
 	data, err := json.Marshal(out)
@@ -382,14 +384,16 @@ func ackMessageID(serverID, clientID string) string {
 }
 
 type groupMessageWirePayload struct {
-	GroupID     string `json:"group_id"`
-	SenderUIN   int64  `json:"sender_uin"`
-	Content     string `json:"content"`
-	ContentType string `json:"content_type"`
-	FileURL     string `json:"file_url,omitempty"`
-	ClientID    string `json:"client_id,omitempty"`
-	Ciphertext  string `json:"ciphertext,omitempty"`
-	MsgType     string `json:"msg_type,omitempty"`
+	GroupID       string `json:"group_id"`
+	SenderUIN     int64  `json:"sender_uin"`
+	Content       string `json:"content"`
+	ContentType   string `json:"content_type"`
+	FileURL       string `json:"file_url,omitempty"`
+	ClientID      string `json:"client_id,omitempty"`
+	Ciphertext    string `json:"ciphertext,omitempty"`
+	MsgType       string `json:"msg_type,omitempty"`
+	CryptoVersion int    `json:"crypto_version"`
+	CryptoEpoch   int64  `json:"crypto_epoch"`
 }
 
 func parseGroupPayload(raw json.RawMessage) (models.GroupMessagePayload, error) {
@@ -402,14 +406,16 @@ func parseGroupPayload(raw json.RawMessage) (models.GroupMessagePayload, error) 
 		return models.GroupMessagePayload{}, err
 	}
 	return models.GroupMessagePayload{
-		GroupID:     wire.GroupID,
-		SenderUIN:   wire.SenderUIN,
-		Content:     wire.Content,
-		ContentType: wire.ContentType,
-		FileURL:     wire.FileURL,
-		ClientID:    wire.ClientID,
-		Ciphertext:  ciphertext,
-		MsgType:     wire.MsgType,
+		GroupID:       wire.GroupID,
+		SenderUIN:     wire.SenderUIN,
+		Content:       wire.Content,
+		ContentType:   wire.ContentType,
+		FileURL:       wire.FileURL,
+		ClientID:      wire.ClientID,
+		Ciphertext:    ciphertext,
+		MsgType:       wire.MsgType,
+		CryptoVersion: wire.CryptoVersion,
+		CryptoEpoch:   wire.CryptoEpoch,
 	}, nil
 }
 
@@ -417,11 +423,14 @@ func validateGroupPayload(p models.GroupMessagePayload) error {
 	if p.GroupID == "" {
 		return fmt.Errorf("group_id is required")
 	}
-	if len(p.Content) == 0 && len(p.Ciphertext) == 0 {
-		return fmt.Errorf("content or ciphertext is required")
+	if p.Content != "" {
+		return fmt.Errorf("plaintext group content is forbidden")
 	}
-	if len(p.Ciphertext) > 0 && !isValidMessageType(p.MsgType) {
-		return fmt.Errorf("msg_type must be prekey_message or signal_message")
+	if len(p.Ciphertext) == 0 {
+		return fmt.Errorf("ciphertext is required")
+	}
+	if p.CryptoVersion != 1 || p.CryptoEpoch < 1 || p.MsgType != "group_ciphertext" {
+		return fmt.Errorf("versioned group ciphertext is required")
 	}
 	return nil
 }

@@ -69,7 +69,7 @@ func TestValidateGroupPayloadRequiresContentOrCiphertext(t *testing.T) {
 		GroupID:     "7f0300f2-0494-4f61-9f41-7c198f73b2fa",
 		ContentType: "text",
 	})
-	if err == nil || err.Error() != "content or ciphertext is required" {
+	if err == nil || err.Error() != "ciphertext is required" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

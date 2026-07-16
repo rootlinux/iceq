@@ -6,7 +6,8 @@ import { MessageList } from "../Chat/MessageList";
 import { useChatStore } from "../../store/chatStore";
 import { useAuthStore } from "../../store/authStore";
 import type { Message } from "../../types/models";
-import { decryptMessage } from "../../lib/signal";
+import { decodeGroupCiphertext, openGroupContent } from "../../lib/groupCrypto";
+import { useGroupStore } from "../../store/groupStore";
 import { GroupDetail } from "./GroupDetail";
 
 interface GroupChatWindowProps {
@@ -20,6 +21,8 @@ export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
   const conversationId = `group:${group.group_id}`;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const members = useGroupStore((s) => s.members[group.group_id] ?? []);
+  const currentEpoch = useGroupStore((s) => s.groups.find((item) => item.group_id === group.group_id)?.crypto_epoch ?? group.crypto_epoch);
 
   useEffect(() => {
     markConversationRead(conversationId);
@@ -33,13 +36,12 @@ export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
     (async () => {
       try {
         const resp = await historyGroup(group.group_id, 50);
-        const decoder = new TextDecoder();
         const out: Message[] = [];
         for (const row of resp.messages) {
           try {
-            const plaintext = row.msg_type === "plaintext"
-              ? decodeBase64UrlText(row.ciphertext)
-              : decoder.decode(await decryptMessage(row.sender_uin, row.ciphertext, row.msg_type));
+            if(row.msg_type!=="group_ciphertext")throw new Error("legacy insecure group row");
+            const content=await openGroupContent(decodeGroupCiphertext(row.ciphertext),currentEpoch,members.map(m=>m.uin),true);
+            const plaintext=content.content_type==="file"?JSON.stringify(content.attachment??null):(content.text??"");
             out.push({
               id: row.id,
               conversation_id: conversationId,
@@ -53,8 +55,7 @@ export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
               is_outgoing: row.sender_uin === selfUin,
             });
           } catch {
-            // History may contain older E2EE group rows this client
-            // cannot decrypt. Skip them rather than blocking the group.
+            out.push({id:row.id,conversation_id:conversationId,sender_uin:row.sender_uin,receiver_uin:0,plaintext:"Security warning: this historical group message could not be verified or decrypted.",content_type:"text",created_at:row.created_at,state:"failed",is_outgoing:row.sender_uin===selfUin});
           }
         }
         if (cancelled) return;
@@ -69,7 +70,7 @@ export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [conversationId, group.group_id, selfUin, setMessages]);
+  }, [conversationId, group.group_id, currentEpoch, members, selfUin, setMessages]);
 
   return (
     <div className="flex h-full min-h-0">
@@ -104,14 +105,6 @@ export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
       <GroupDetail group={group} />
     </div>
   );
-}
-
-function decodeBase64UrlText(value: string): string {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-  const binary = atob(padded);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
 }
 
 export default GroupChatWindow;

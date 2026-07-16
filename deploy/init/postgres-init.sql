@@ -103,6 +103,7 @@ CREATE TABLE groups (
   id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   name        TEXT        NOT NULL,
   owner_uin   BIGINT      REFERENCES users(uin),
+  crypto_epoch BIGINT     NOT NULL DEFAULT 1 CHECK (crypto_epoch > 0),
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 

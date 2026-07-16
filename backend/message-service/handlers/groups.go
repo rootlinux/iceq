@@ -93,6 +93,7 @@ type groupItem struct {
 	OwnerUIN    int64     `json:"owner_uin"`
 	MemberCount int       `json:"member_count"`
 	CreatedAt   time.Time `json:"created_at"`
+	CryptoEpoch int64     `json:"crypto_epoch"`
 }
 
 // listGroupsResponse is the body of GET /api/groups.
@@ -113,7 +114,8 @@ type groupMember struct {
 // listGroupMembersResponse is the body of GET
 // /api/groups/{id}/members.
 type listGroupMembersResponse struct {
-	Members []groupMember `json:"members"`
+	Members     []groupMember `json:"members"`
+	CryptoEpoch int64         `json:"crypto_epoch"`
 }
 
 // addMemberRequest is the body of POST
@@ -204,6 +206,7 @@ func NewCreateGroupHandler(deps GroupsDeps) http.HandlerFunc {
 			OwnerUIN:    ownerOut,
 			MemberCount: 1,
 			CreatedAt:   createdAt,
+			CryptoEpoch: 1,
 		})
 	}
 }
@@ -237,7 +240,7 @@ func NewListGroupsHandler(deps GroupsDeps) http.HandlerFunc {
 		groups := make([]groupItem, 0, 8)
 		for rows.Next() {
 			var g groupItem
-			if err := rows.Scan(&g.GroupID, &g.Name, &g.OwnerUIN, &g.CreatedAt, &g.MemberCount); err != nil {
+			if err := rows.Scan(&g.GroupID, &g.Name, &g.OwnerUIN, &g.CreatedAt, &g.MemberCount, &g.CryptoEpoch); err != nil {
 				log.Printf("[message-service] scan group row: %v", err)
 				writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not read groups")
 				return
@@ -316,7 +319,12 @@ func NewListGroupMembersHandler(deps GroupsDeps) http.HandlerFunc {
 			return
 		}
 
-		writeJSON(w, http.StatusOK, listGroupMembersResponse{Members: members})
+		var epoch int64
+		if err := deps.PG.QueryRow(ctx, qGetGroupEpoch, groupID).Scan(&epoch); err != nil {
+			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not read group epoch")
+			return
+		}
+		writeJSON(w, http.StatusOK, listGroupMembersResponse{Members: members, CryptoEpoch: epoch})
 	}
 }
 

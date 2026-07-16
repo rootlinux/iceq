@@ -16,12 +16,14 @@ import { useChatStore, conversationIdForPair } from "../../store/chatStore";
 import { useAuthStore } from "../../store/authStore";
 import { useChatShell } from "../Layout/MainLayout";
 import { encryptMessage, SignalError } from "../../lib/signal";
-import { uploadEncryptedFile } from "../../api/files";
+import { grantFileAccess, revokeFileAccess, uploadEncryptedFile } from "../../api/files";
 import { attachmentGrantLifecycle } from "../../lib/attachmentGrantLifecycle";
 import { cryptoRandomId } from "../../hooks/useWebSocket";
 import type { Message } from "../../types/models";
 import type { GroupMessagePayload, MessagePayload } from "../../types/envelope";
 import type { Envelope } from "../../types/envelope";
+import { getGroupMembersWithEpoch } from "../../api/groups";
+import { ensureGroupSender, sealGroupContent, encodeGroupCiphertext, GROUP_CONTENT_KIND } from "../../lib/groupCrypto";
 
 interface MessageInputProps {
   peerUin?: number;
@@ -106,13 +108,24 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
 
     try {
       if (isGroup) {
+        const roster = await getGroupMembersWithEpoch(groupId);
+        const sender = await ensureGroupSender(groupId, roster.crypto_epoch, selfUin, roster.members.map((m) => m.uin), async (uin, plaintext) => {
+          const sealedDistribution = await encryptMessage(uin, plaintext);
+          const directPayload: MessagePayload = { conversation_id: conversationIdForPair(selfUin,uin), sender_uin:selfUin, to_uin:uin, receiver_uin:uin, content:"", content_type:"text", client_id:cryptoRandomId(), ciphertext:sealedDistribution.ciphertext, msg_type:sealedDistribution.msgType };
+          if (!send({type:"message",id:cryptoRandomId(),ts:Date.now(),payload:directPayload})) throw new Error("sender-key distribution transport is unavailable");
+        });
+        const sealed = await sealGroupContent(sender,{kind:GROUP_CONTENT_KIND,content_type:"text",text:trimmed});
         const payload: GroupMessagePayload = {
           conversation_id: `group:${groupId}`,
           group_id: groupId,
           sender_uin: selfUin,
-          content: trimmed,
+          content: "",
           content_type: "text",
           client_id: clientId,
+          ciphertext: encodeGroupCiphertext(sealed),
+          msg_type: "group_ciphertext",
+          crypto_version: 1,
+          crypto_epoch: roster.crypto_epoch,
         };
         const frame: Envelope<typeof payload> = {
           type: "group_msg",
@@ -172,13 +185,27 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
 
   const handleAttachment = async (file: File): Promise<void> => {
     if (attaching || sending) return;
-    if (selfUin === null || peerUin === undefined || groupId !== undefined) return;
+    if (selfUin === null || (peerUin === undefined && groupId === undefined)) return;
     setAttaching(true);
     setSecurityError(null);
     const clientId = cryptoRandomId();
-    const convId = conversationIdForPair(selfUin, peerUin as number);
+    const convId = groupId!==undefined?`group:${groupId}`:conversationIdForPair(selfUin, peerUin as number);
+    let groupGrantCleanup: { objectKey:string; recipients:number[] }|null=null;
     try {
       const uploaded = await uploadEncryptedFile(file, file.name);
+      if(groupId!==undefined){
+        const roster=await getGroupMembersWithEpoch(groupId); const recipients=roster.members.map(m=>m.uin).filter(u=>u!==selfUin);
+        groupGrantCleanup={objectKey:uploaded.object_key,recipients:[]};
+        for(const recipient of recipients){await grantFileAccess(uploaded.object_key,recipient);groupGrantCleanup.recipients.push(recipient);}
+        const sender=await ensureGroupSender(groupId,roster.crypto_epoch,selfUin,roster.members.map(m=>m.uin),async(uin,plaintext)=>{const sealedDistribution=await encryptMessage(uin,plaintext);const directPayload:MessagePayload={conversation_id:conversationIdForPair(selfUin,uin),sender_uin:selfUin,to_uin:uin,receiver_uin:uin,content:"",content_type:"text",client_id:cryptoRandomId(),ciphertext:sealedDistribution.ciphertext,msg_type:sealedDistribution.msgType};if(!send({type:"message",id:cryptoRandomId(),ts:Date.now(),payload:directPayload}))throw new Error("sender-key distribution transport is unavailable");});
+        const attachment={kind:"iceq.attachment.v1",object_key:uploaded.object_key,manifest:uploaded.manifest};
+        const sealed=await sealGroupContent(sender,{kind:GROUP_CONTENT_KIND,content_type:"file",attachment});
+        addMessage(convId,{id:clientId,conversation_id:convId,sender_uin:selfUin,receiver_uin:0,plaintext:"",content_type:"file",file_object_key:uploaded.object_key,attachment:{object_key:uploaded.object_key,manifest:uploaded.manifest,name:uploaded.manifest.name??file.name,mime_type:uploaded.manifest.mime_type,size:uploaded.manifest.size},created_at:new Date().toISOString(),state:"sending",is_outgoing:true});
+        const payload:GroupMessagePayload={conversation_id:convId,group_id:groupId,sender_uin:selfUin,content:"",content_type:"file",client_id:clientId,ciphertext:encodeGroupCiphertext(sealed),msg_type:"group_ciphertext",crypto_version:1,crypto_epoch:roster.crypto_epoch};
+        if(!send({type:"group_msg",id:cryptoRandomId(),ts:Date.now(),payload})) throw new Error("message transport is unavailable");
+        groupGrantCleanup=null;
+        return;
+      }
       await attachmentGrantLifecycle.prepare(clientId, uploaded.object_key, peerUin as number);
       const attachment = {
         object_key: uploaded.object_key,
@@ -230,6 +257,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
 		throw new Error("message transport is unavailable");
 	  }
     } catch (e) {
+      if(groupGrantCleanup) await Promise.allSettled(groupGrantCleanup.recipients.map(u=>revokeFileAccess(groupGrantCleanup!.objectKey,u)));
       await attachmentGrantLifecycle.fail(clientId).catch(() => undefined);
       const reason = e instanceof SignalError ? e.message : (e as Error).message;
       setSecurityError(reason);
@@ -259,7 +287,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
           ref={fileInputRef}
           type="file"
           className="sr-only"
-          disabled={sending || attaching || groupId !== undefined}
+          disabled={sending || attaching}
           onChange={(e) => {
             const file = e.currentTarget.files?.[0];
             if (file) void handleAttachment(file);
@@ -269,8 +297,8 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
           type="button"
           className="iceq-btn-secondary shrink-0"
           onClick={() => fileInputRef.current?.click()}
-          disabled={sending || attaching || groupId !== undefined}
-          title={groupId !== undefined ? "Files are available in direct messages" : "Attach file"}
+          disabled={sending || attaching}
+          title="Attach encrypted file"
           aria-label="Attach file"
         >
           {attaching ? "..." : "+"}

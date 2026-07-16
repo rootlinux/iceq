@@ -58,7 +58,7 @@
 // Schema v3: adds metadata for the replenishment prekey-id cursor.
 
 export const ICEQ_INDEXEDDB_NAME = "iceq";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 
 const STORE_IDENTITY = "identity";
 const STORE_SESSIONS = "sessions";
@@ -68,6 +68,7 @@ const STORE_PEER_IDENTITIES = "identities";
 const STORE_MESSAGES = "messages";
 const STORE_METADATA = "metadata";
 const STORE_PEER_TRUST = "peer_trust";
+const STORE_GROUP_CRYPTO = "group_crypto";
 
 const SELF_KEY = "self";
 const NEXT_PREKEY_ID_KEY = "next_prekey_id";
@@ -317,6 +318,19 @@ export async function loadCachedMessages(conversationId: string): Promise<unknow
   return (all ?? []).filter((c) => c.conversation_id === conversationId).map((c) => c.message);
 }
 
+export async function putGroupCryptoRecord(key: string, value: unknown): Promise<void> {
+  const db = await openDB(); await idbPut(db, STORE_GROUP_CRYPTO, value, key); db.close();
+}
+export async function getGroupCryptoRecord<T>(key: string): Promise<T | null> {
+  const db = await openDB(); const value = await idbGet<T>(db, STORE_GROUP_CRYPTO, key); db.close(); return value ?? null;
+}
+export async function getAllGroupCryptoRecords<T>(): Promise<T[]> {
+  const db = await openDB(); const value = await idbGetAll<T>(db, STORE_GROUP_CRYPTO); db.close(); return value;
+}
+export async function deleteGroupCryptoRecord(key: string): Promise<void> {
+  const db = await openDB(); await idbDelete(db, STORE_GROUP_CRYPTO, key); db.close();
+}
+
 // ----------------------------------------------------------------------------
 // clearAll — called on 4403 (panic-wipe). Drops the whole
 // database. We do this with deleteDatabase rather than
@@ -367,6 +381,9 @@ function openDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_PEER_TRUST)) {
         db.createObjectStore(STORE_PEER_TRUST);
+      }
+      if (!db.objectStoreNames.contains(STORE_GROUP_CRYPTO)) {
+        db.createObjectStore(STORE_GROUP_CRYPTO);
       }
     };
     req.onsuccess = () => resolve(req.result);

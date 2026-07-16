@@ -233,14 +233,16 @@ type DirectMessagePayload struct {
 // MsgType follows the same X3DH / Double Ratchet discriminator
 // convention as DirectMessagePayload; see that type's docs.
 type GroupMessagePayload struct {
-	GroupID     string `json:"group_id"`
-	SenderUIN   int64  `json:"sender_uin"`
-	Content     string `json:"content"`
-	ContentType string `json:"content_type"`
-	FileURL     string `json:"file_url,omitempty"`
-	ClientID    string `json:"client_id,omitempty"`
-	Ciphertext  []byte `json:"ciphertext,omitempty"`
-	MsgType     string `json:"msg_type,omitempty"`
+	GroupID       string `json:"group_id"`
+	SenderUIN     int64  `json:"sender_uin"`
+	Content       string `json:"content"`
+	ContentType   string `json:"content_type"`
+	FileURL       string `json:"file_url,omitempty"`
+	ClientID      string `json:"client_id,omitempty"`
+	Ciphertext    []byte `json:"ciphertext,omitempty"`
+	MsgType       string `json:"msg_type,omitempty"`
+	CryptoVersion int    `json:"crypto_version"`
+	CryptoEpoch   int64  `json:"crypto_epoch"`
 }
 
 // TypingPayload is a transient indicator. The server-side presence

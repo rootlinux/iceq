@@ -46,6 +46,9 @@ import type {
 } from "../types/envelope";
 import type { Message } from "../types/models";
 import { parseEnvelope } from "../types/envelope";
+import { useGroupStore } from "../store/groupStore";
+import { decodeGroupCiphertext, installSenderDistribution, openGroupContent } from "../lib/groupCrypto";
+import { getGroupMembersWithEpoch } from "../api/groups";
 
 // ----------------------------------------------------------------------------
 // Backoff schedule. Reset on a successful auth_ok. The 5th
@@ -337,11 +340,31 @@ export function useWebSocket(): UseWebSocketResult {
         const senderUin = p.sender_uin;
         try {
           const decoder = new TextDecoder();
-          const plaintext = isGroupMessage && (p as GroupMessagePayload).content
-            ? (p as GroupMessagePayload).content
-            : p.msg_type === "plaintext" && p.ciphertext
-              ? decodeBase64UrlText(p.ciphertext)
-              : decoder.decode(await decryptMessage(senderUin, p.ciphertext ?? "", p.msg_type as "prekey_message" | "signal_message"));
+          let plaintext:string;
+          if (isGroupMessage) {
+            const gp=p as GroupMessagePayload;
+            if(selfUin!==null&&senderUin===selfUin&&gp.client_id&&useChatStore.getState().messagesByConversation[`group:${gp.group_id}`]?.some(m=>m.id===gp.client_id)) return;
+            const group=useGroupStore.getState().groups.find(g=>g.group_id===gp.group_id);
+            const members=(useGroupStore.getState().members[gp.group_id]??[]).map(m=>m.uin);
+            if(!group)throw new Error("group routing state is unavailable");
+            const content=await openGroupContent(decodeGroupCiphertext(gp.ciphertext??""),group.crypto_epoch,members);
+            plaintext=content.content_type==="file"?JSON.stringify(content.attachment??null):(content.text??"");
+          } else {
+            const bytes=await decryptMessage(senderUin,p.ciphertext??"",p.msg_type as "prekey_message"|"signal_message");
+            plaintext=decoder.decode(bytes);
+            try {
+              const value:unknown=JSON.parse(plaintext);
+              if(typeof value==="object"&&value!==null&&"kind" in value&&value.kind==="iceq.sender-key-distribution.v1") {
+                const d=(value as {distribution?:{group_id?:string}}).distribution;
+                const gid=d?.group_id??""; let group=useGroupStore.getState().groups.find(g=>g.group_id===gid);
+                const roster=await getGroupMembersWithEpoch(gid);
+                useGroupStore.getState().setMembers(gid,roster.members);
+                if(group){group={...group,crypto_epoch:roster.crypto_epoch};useGroupStore.setState(s=>({groups:s.groups.map(g=>g.group_id===gid?group!:g)}));}
+                const members=roster.members.map(m=>m.uin);
+                await installSenderDistribution(senderUin,value,roster.crypto_epoch,members); return;
+              }
+            } catch(error) { if(error instanceof SyntaxError){ /* ordinary text */ } else throw error; }
+          }
           const conversationId = env.type === "message"
             ? conversationIdForPair(senderUin, (p as MessagePayload).receiver_uin)
             : `group:${(p as GroupMessagePayload).group_id}`;
@@ -372,6 +395,10 @@ export function useWebSocket(): UseWebSocketResult {
           }
         } catch (e) {
           if (__DEV__) console.error("[ws] decrypt failed:", e);
+          if (env.type === "group_msg") {
+            const gp=p as GroupMessagePayload; const conversationId=`group:${gp.group_id}`;
+            useChatStore.getState().addMessage(conversationId,{id:env.id,conversation_id:conversationId,sender_uin:gp.sender_uin,receiver_uin:0,plaintext:"Security warning: this encrypted group message could not be verified or decrypted.",content_type:"text",created_at:new Date(env.ts).toISOString(),state:"failed",is_outgoing:false});
+          }
         }
         return;
       }
@@ -532,14 +559,6 @@ function sendReadReceipt(ws: WebSocket, message: Message): void {
         : {}),
     } satisfies ReadPayload,
   });
-}
-
-function decodeBase64UrlText(value: string): string {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-  const binary = atob(padded);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
 }
 
 // The __DEV__ global is set in vite.config.ts. We declare

@@ -22,6 +22,7 @@ export interface GroupWire {
   owner_uin: number;
   member_count: number;
   created_at: string;
+  crypto_epoch: number;
 }
 
 export interface ListGroupsResponse {
@@ -37,6 +38,7 @@ export interface GroupMemberWire {
 
 export interface ListGroupMembersResponse {
   members: GroupMemberWire[];
+  crypto_epoch: number;
 }
 
 export interface CreateGroupRequest {
@@ -78,13 +80,14 @@ export async function getGroups(): Promise<GroupWire[]> {
 // group, joined with users for the public-facing fields.
 // Sorted by joined_at ASC (oldest first). Caller must
 // also be a member; the server returns 403 otherwise.
-export async function getGroupMembers(groupId: string): Promise<GroupMemberWire[]> {
+export async function getGroupMembersWithEpoch(groupId: string): Promise<ListGroupMembersResponse> {
   const resp = await fetchJSON<ListGroupMembersResponse>(
     `/api/groups/${encodeURIComponent(groupId)}/members`,
     { method: "GET" },
   );
-  return resp.members;
+  return resp;
 }
+export async function getGroupMembers(groupId: string): Promise<GroupMemberWire[]> { return (await getGroupMembersWithEpoch(groupId)).members; }
 
 // addMember invites a UIN to a group. The requesting user
 // must be an admin of the group; the server returns 403

@@ -168,7 +168,7 @@ func (s *historyFakeStore) GetGroupHistory(_ context.Context, r store.GroupHisto
 
 func TestGroupListIsScopedToAuthenticatedMember(t *testing.T) {
 	now := time.Now()
-	db := &groupFakeDB{rowsQueue: [][][]any{{{behaviorGroupID, "team", int64(100), now, 2}}}}
+	db := &groupFakeDB{rowsQueue: [][][]any{{{behaviorGroupID, "team", int64(100), now, 2, int64(1)}}}}
 	rr := httptest.NewRecorder()
 	NewListGroupsHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodGet, "/api/groups/", "", 200))
 	if rr.Code != 200 || !strings.Contains(rr.Body.String(), behaviorGroupID) {
@@ -216,7 +216,7 @@ func TestGroupMembersRequireMembershipAndUseUniformForbiddenShape(t *testing.T) 
 	}
 }
 func TestGroupMemberListSucceedsForMember(t *testing.T) {
-	db := &groupFakeDB{rowQueue: [][]any{{"member"}}, rowsQueue: [][][]any{{{int64(100), "alice", "", "admin"}, {int64(200), "bob", "", "member"}}}}
+	db := &groupFakeDB{rowQueue: [][]any{{"member"}, {int64(1)}}, rowsQueue: [][][]any{{{int64(100), "alice", "", "admin"}, {int64(200), "bob", "", "member"}}}}
 	rr := httptest.NewRecorder()
 	NewListGroupMembersHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodGet, "/api/groups/"+behaviorGroupID+"/members", "", 200))
 	if rr.Code != 200 || !strings.Contains(rr.Body.String(), `"uin":100`) {
