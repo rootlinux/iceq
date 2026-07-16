@@ -14,13 +14,13 @@ import (
 )
 
 var (
-	ErrInvalidAcceptance = errors.New("invalid recipient acceptance")
-	ErrAcceptanceExpired = errors.New("recipient acceptance expired")
+	ErrInvalidAcceptance   = errors.New("invalid recipient acceptance")
+	ErrAcceptanceExpired   = errors.New("recipient acceptance expired")
+	ErrAcceptanceQueueFull = errors.New("recipient acceptance queue full")
 )
 
-// RecipientAcceptanceScope identifies one independently deduplicated recipient.
-// Group messages include the group in the seen scope while still sharing the
-// recipient's poll stream with direct messages.
+const recipientAcceptanceMaxActive = 1000
+
 type RecipientAcceptanceScope struct {
 	recipientUIN int64
 	seenScope    string
@@ -38,34 +38,26 @@ func GroupMemberScope(groupID string, recipientUIN int64) (RecipientAcceptanceSc
 		return RecipientAcceptanceScope{}, fmt.Errorf("%w: group_id and positive recipient_uin are required", ErrInvalidAcceptance)
 	}
 	sum := sha256.Sum256([]byte(groupID))
-	return RecipientAcceptanceScope{
-		recipientUIN: recipientUIN,
-		seenScope:    "group:" + hex.EncodeToString(sum[:16]),
-	}, nil
+	return RecipientAcceptanceScope{recipientUIN: recipientUIN, seenScope: "group:" + hex.EncodeToString(sum[:16])}, nil
 }
 
-// AcceptanceQueueKey is the common per-recipient stream consumed by the poll
-// and WebSocket delivery paths.
+// AcceptanceQueueKey is an ordered index of record references. It contains no ciphertext.
 func AcceptanceQueueKey(scope RecipientAcceptanceScope) string {
-	return "poll:stream:" + strconv.FormatInt(scope.recipientUIN, 10)
+	return acceptancePrefix(scope) + ":index"
 }
 
 type RecipientAcceptance struct {
 	Scope     RecipientAcceptanceScope
 	MessageID string
 	Envelope  []byte
-	// ExpiresAt nil means retention is off and both the seen marker and the
-	// recipient stream remain TTL-less.
 	ExpiresAt *time.Time
 }
-
 type AcceptedEnvelope struct {
 	StreamID  string
 	MessageID string
 	Envelope  []byte
 	Scope     string
 }
-
 type RecipientAcceptanceStore struct {
 	rdb *redis.Client
 	now func() time.Time
@@ -79,111 +71,149 @@ func NewRecipientAcceptanceStore(rdb *redis.Client) *RecipientAcceptanceStore {
 }
 
 var acceptRecipientScript = redis.NewScript(`
-if redis.call('EXISTS', KEYS[1]) == 1 then
-  return 0
+if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+local refs = redis.call('ZRANGE', KEYS[1], 0, -1)
+for _, ref in ipairs(refs) do
+  if redis.call('EXISTS', ref) == 0 then redis.call('ZREM', KEYS[1], ref) end
 end
-
-local stream_existed = redis.call('EXISTS', KEYS[2])
-redis.call('XADD', KEYS[2], '*', 'message_id', ARGV[1], 'envelope', ARGV[2], 'scope', ARGV[3])
-
-if ARGV[4] == 'off' then
-  redis.call('SET', KEYS[1], '1')
-  redis.call('PERSIST', KEYS[2])
-else
-  local ttl = tonumber(ARGV[5])
-  redis.call('SET', KEYS[1], '1', 'PX', ttl)
-  if stream_existed == 0 then
-    redis.call('PEXPIRE', KEYS[2], ttl)
-  else
-    local current = redis.call('PTTL', KEYS[2])
-    if current >= 0 and current < ttl then
-      redis.call('PEXPIRE', KEYS[2], ttl)
-    end
-  end
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[5]) then return -1 end
+local seq = redis.call('INCR', KEYS[4])
+redis.call('HSET', KEYS[3], 'message_id', ARGV[1], 'envelope', ARGV[2], 'scope', ARGV[3], 'seq', seq)
+redis.call('SET', KEYS[2], '1')
+if ARGV[4] ~= 'off' then
+  redis.call('PEXPIREAT', KEYS[3], ARGV[4])
+  redis.call('PEXPIREAT', KEYS[2], ARGV[4])
 end
+redis.call('ZADD', KEYS[1], seq, KEYS[3])
 return 1
 `)
 
-// Accept atomically records the scope/message seen marker and appends exactly
-// one item to the recipient stream. A false result is a successful replay no-op.
-func (s *RecipientAcceptanceStore) Accept(ctx context.Context, acceptance RecipientAcceptance) (bool, error) {
-	if acceptance.Scope.recipientUIN <= 0 || acceptance.Scope.seenScope == "" ||
-		strings.TrimSpace(acceptance.MessageID) == "" || len(acceptance.Envelope) == 0 {
+func (s *RecipientAcceptanceStore) Accept(ctx context.Context, a RecipientAcceptance) (bool, error) {
+	if a.Scope.recipientUIN <= 0 || a.Scope.seenScope == "" || strings.TrimSpace(a.MessageID) == "" || len(a.Envelope) == 0 {
 		return false, ErrInvalidAcceptance
 	}
-
-	mode := "off"
-	ttlMillis := int64(0)
-	if acceptance.ExpiresAt != nil {
-		remaining := acceptance.ExpiresAt.Sub(s.now())
-		if remaining <= 0 {
+	expires := "off"
+	if a.ExpiresAt != nil {
+		if !a.ExpiresAt.After(s.now()) {
 			return false, ErrAcceptanceExpired
 		}
-		// Redis PX rejects zero. Round up so a positive sub-millisecond
-		// remainder cannot accidentally become an invalid/expired TTL.
-		ttlMillis = (remaining.Nanoseconds() + int64(time.Millisecond) - 1) / int64(time.Millisecond)
-		mode = "expires"
+		expires = strconv.FormatInt(a.ExpiresAt.UnixMilli(), 10)
 	}
-
-	seenKey := acceptanceSeenKey(acceptance.Scope, acceptance.MessageID)
-	result, err := acceptRecipientScript.Run(ctx, s.rdb,
-		[]string{seenKey, AcceptanceQueueKey(acceptance.Scope)},
-		acceptance.MessageID, acceptance.Envelope, acceptance.Scope.seenScope, mode, ttlMillis,
-	).Int64()
+	result, err := acceptRecipientScript.Run(ctx, s.rdb, []string{
+		AcceptanceQueueKey(a.Scope), acceptanceSeenKey(a.Scope, a.MessageID), acceptanceRecordKey(a.Scope, a.MessageID), acceptanceSequenceKey(a.Scope),
+	}, a.MessageID, a.Envelope, a.Scope.seenScope, expires, recipientAcceptanceMaxActive).Int64()
 	if err != nil {
 		return false, err
+	}
+	if result == -1 {
+		return false, ErrAcceptanceQueueFull
 	}
 	return result == 1, nil
 }
 
-// ReadAccepted exposes the stream in the representation needed by poll/WS
-// delivery without removing entries or weakening replay protection.
-func (s *RecipientAcceptanceStore) ReadAccepted(ctx context.Context, scope RecipientAcceptanceScope, start, stop string, count int64) ([]AcceptedEnvelope, error) {
-	if scope.recipientUIN <= 0 || scope.seenScope == "" {
+var readAcceptedScript = redis.NewScript(`
+local refs = redis.call('ZRANGEBYSCORE', KEYS[1], '(' .. ARGV[1], '+inf')
+local out = {}
+local limit = tonumber(ARGV[2])
+for _, ref in ipairs(refs) do
+  local values = redis.call('HMGET', ref, 'seq', 'message_id', 'envelope', 'scope')
+  if not values[1] then
+    redis.call('ZREM', KEYS[1], ref)
+  elseif limit == 0 or (#out / 4) < limit then
+    for _, value in ipairs(values) do table.insert(out, value) end
+  end
+end
+return out
+`)
+
+var drainAcceptedScript = redis.NewScript(`
+local refs = redis.call('ZRANGEBYSCORE', KEYS[1], '(' .. ARGV[1], '+inf')
+local out = {}
+local limit = tonumber(ARGV[2])
+for _, ref in ipairs(refs) do
+  local values = redis.call('HMGET', ref, 'seq', 'message_id', 'envelope', 'scope')
+  if not values[1] then
+    redis.call('ZREM', KEYS[1], ref)
+  elseif limit == 0 or (#out / 4) < limit then
+    for _, value in ipairs(values) do table.insert(out, value) end
+    redis.call('ZREM', KEYS[1], ref)
+    redis.call('DEL', ref)
+  end
+end
+return out
+`)
+
+// ReadAcceptedAfter returns live records ordered after the durable sequence cursor.
+// An empty cursor starts at the beginning; callers may persist the returned StreamID.
+func (s *RecipientAcceptanceStore) ReadAcceptedAfter(ctx context.Context, scope RecipientAcceptanceScope, after string, count int64) ([]AcceptedEnvelope, error) {
+	return s.readOrDrain(ctx, scope, after, count, false)
+}
+
+// DrainAccepted atomically returns and removes live records. A crash before this
+// operation replays the record; after success the capacity is immediately reusable.
+func (s *RecipientAcceptanceStore) DrainAccepted(ctx context.Context, scope RecipientAcceptanceScope, after string, count int64) ([]AcceptedEnvelope, error) {
+	return s.readOrDrain(ctx, scope, after, count, true)
+}
+
+// ReadAccepted preserves the older poll-facing shape. start is a sequence cursor;
+// "-" and an empty string mean the beginning. stop is retained for compatibility.
+func (s *RecipientAcceptanceStore) ReadAccepted(ctx context.Context, scope RecipientAcceptanceScope, start, _ string, count int64) ([]AcceptedEnvelope, error) {
+	if start == "-" {
+		start = ""
+	}
+	return s.ReadAcceptedAfter(ctx, scope, start, count)
+}
+
+func (s *RecipientAcceptanceStore) readOrDrain(ctx context.Context, scope RecipientAcceptanceScope, after string, count int64, drain bool) ([]AcceptedEnvelope, error) {
+	if scope.recipientUIN <= 0 || scope.seenScope == "" || count < 0 {
 		return nil, ErrInvalidAcceptance
 	}
-	if start == "" {
-		start = "-"
+	if after == "" {
+		after = "-inf"
+	} else if _, err := strconv.ParseUint(after, 10, 64); err != nil {
+		return nil, ErrInvalidAcceptance
 	}
-	if stop == "" {
-		stop = "+"
+	script := readAcceptedScript
+	if drain {
+		script = drainAcceptedScript
 	}
-	var (
-		messages []redis.XMessage
-		err      error
-	)
-	if count > 0 {
-		messages, err = s.rdb.XRangeN(ctx, AcceptanceQueueKey(scope), start, stop, count).Result()
-	} else {
-		messages, err = s.rdb.XRange(ctx, AcceptanceQueueKey(scope), start, stop).Result()
-	}
+	values, err := script.Run(ctx, s.rdb, []string{AcceptanceQueueKey(scope)}, after, count).Slice()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]AcceptedEnvelope, 0, len(messages))
-	for _, message := range messages {
-		out = append(out, AcceptedEnvelope{
-			StreamID:  message.ID,
-			MessageID: streamString(message.Values["message_id"]),
-			Envelope:  []byte(streamString(message.Values["envelope"])),
-			Scope:     streamString(message.Values["scope"]),
-		})
+	if len(values)%4 != 0 {
+		return nil, fmt.Errorf("recipient acceptance: corrupt read result")
+	}
+	out := make([]AcceptedEnvelope, 0, len(values)/4)
+	for i := 0; i < len(values); i += 4 {
+		out = append(out, AcceptedEnvelope{StreamID: redisValue(values[i]), MessageID: redisValue(values[i+1]), Envelope: []byte(redisValue(values[i+2])), Scope: redisValue(values[i+3])})
 	}
 	return out, nil
 }
 
-func acceptanceSeenKey(scope RecipientAcceptanceScope, messageID string) string {
-	sum := sha256.Sum256([]byte(messageID))
-	return "poll:seen:" + strconv.FormatInt(scope.recipientUIN, 10) + ":" + scope.seenScope + ":" + hex.EncodeToString(sum[:])
+func acceptancePrefix(scope RecipientAcceptanceScope) string {
+	return "poll:{" + strconv.FormatInt(scope.recipientUIN, 10) + "}"
 }
-
-func streamString(value any) string {
-	switch typed := value.(type) {
+func acceptanceSequenceKey(scope RecipientAcceptanceScope) string {
+	return acceptancePrefix(scope) + ":sequence"
+}
+func acceptanceSeenKey(scope RecipientAcceptanceScope, messageID string) string {
+	return acceptancePrefix(scope) + ":seen:" + acceptanceDigest(scope, messageID)
+}
+func acceptanceRecordKey(scope RecipientAcceptanceScope, messageID string) string {
+	return acceptancePrefix(scope) + ":record:" + acceptanceDigest(scope, messageID)
+}
+func acceptanceDigest(scope RecipientAcceptanceScope, messageID string) string {
+	sum := sha256.Sum256([]byte(scope.seenScope + "\x00" + messageID))
+	return hex.EncodeToString(sum[:])
+}
+func redisValue(value any) string {
+	switch v := value.(type) {
 	case string:
-		return typed
+		return v
 	case []byte:
-		return string(typed)
+		return string(v)
 	default:
-		return fmt.Sprint(typed)
+		return fmt.Sprint(v)
 	}
 }
