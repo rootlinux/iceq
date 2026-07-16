@@ -394,8 +394,39 @@ services:
     logging: *default-logging
 
   # ==========================================================================
+  # Optional Tor-only edge. The default Caddy has no port-80 listener; this
+  # profile-scoped service is the sole internal HTTP target for onion ingress.
+  # It forwards to the normal HTTPS edge so route/header policy stays shared.
+  # ==========================================================================
+  caddy-tor:
+    <<: [*default-security, *resources-app]
+    profiles: ["tor"]
+    image: iceq/caddy:dev
+    container_name: iceq-caddy-tor
+    hostname: caddy-tor
+    restart: unless-stopped
+    networks: [iceq-net]
+    volumes:
+      - ./Caddyfile.tor:/etc/caddy/Caddyfile:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /data:size=16m,mode=0700
+      - /config:size=16m,mode=0700
+    depends_on:
+      caddy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:80/edge-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  # ==========================================================================
   # Optional Tor hidden service — enabled only with `--profile tor`. It sits
-  # in front of Caddy and persists its v3 keypair in the `tor_keys` volume.
+  # in front of the isolated Tor edge and persists its v3 keypair in the
+  # `tor_keys` volume.
   # ==========================================================================
   tor:
     profiles: ["tor"]
@@ -405,7 +436,7 @@ services:
     networks:
       - iceq-net
     depends_on:
-      caddy:
+      caddy-tor:
         condition: service_healthy
     environment:
       # goldy/tor-hidden-service expects env vars prefixed with the
@@ -413,7 +444,7 @@ services:
       # the prefix → the onion hostname is associated with the "icecq"
       # service, while still a single hidden service with a single
       # v3 address.
-      - ICECQ_TOR_SERVICE_HOSTS=80:caddy:80
+      - ICECQ_TOR_SERVICE_HOSTS=80:caddy-tor:80
       - ICECQ_TOR_SERVICE_VERSION=3
     volumes:
       - tor_keys:/var/lib/tor/hidden_service/

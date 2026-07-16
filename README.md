@@ -9,8 +9,8 @@ Browser / optional Tor client
       │  HTTPS / WSS (default)       │  .onion (opt-in profile)
       ▼                              ▼
 ┌─────────────────────────────────────────────────────┐
-│  Caddy (TLS termination, rate limiting, CSP headers) │◄── iceq-tor (v3
-└──────────────────────┬──────────────────────────────┘     hidden service)
+│  Caddy (TLS termination, rate limiting, CSP headers) │◄── caddy-tor ◄── Tor
+└──────────────────────┬──────────────────────────────┘     (opt-in profile)
                        │  Docker bridge (iceq-net)
      ┌─────────────────┼──────────────────────┐
      │                 │                      │
@@ -57,7 +57,8 @@ open https://localhost        # accept the self-signed dev cert
 | Service          | Internal port | Purpose                                    |
 |------------------|---------------|--------------------------------------------|
 | caddy            | 443 (public)  | TLS termination, rate limiting, SPA serving|
-| tor (opt-in)     | —             | v3 hidden service gateway to Caddy (:80)   |
+| caddy-tor (opt-in)| 80 (internal)| Isolated Tor-profile edge to clearnet policy|
+| tor (opt-in)     | —             | v3 hidden service gateway to caddy-tor     |
 | auth-service     | 8080          | Registration, login, JWT, contacts, groups |
 | key-service      | 8081          | Signal Protocol prekey bundle distribution |
 | ws-gateway       | 8082          | WebSocket hub, NATS fan-out                |
@@ -142,6 +143,8 @@ Validate this contract at any time:
 ./deploy/scripts/check-clearnet-compose.sh
 ```
 
+Without the project Caddy image and a running Docker daemon, this command reports a structural `STATIC PASS` and an explicit runtime `SKIP`. Runtime Caddy parsing and live response headers remain a required later Docker/deployment gate.
+
 ### Get your .onion address
 
 ```bash
@@ -196,20 +199,20 @@ docker compose -f deploy/docker-compose.yml --profile tor restart tor
 ### How it works
 
 ```
-Tor Browser ──► Tor Network ──► iceq-tor container ──► Caddy (:80 inside iceq-net)
-                                                  │
-                                                  └─► import (iceq_routes) — same
-                                                      routing as direct HTTPS
+Tor Browser ──► Tor Network ──► iceq-tor ──► caddy-tor (:80, profile-only)
+                                               │
+                                               └─► default Caddy HTTPS edge
+                                                   (shared routes/policy)
 ```
 
-> **Why plain HTTP between Tor and Caddy is acceptable for this deployment:** Tor provides transport encryption between the client and the Tor container. The Tor-to-Caddy hop stays inside Docker's internal `iceq-net` bridge and is not host-exposed. TLS on this hop would add CPU cost and certificate-management complexity; operators with stricter container-network isolation requirements can split Tor and Caddy onto a dedicated bridge in a later hardening pass.
+> **Why plain HTTP into the profile edge is acceptable for this deployment:** Tor provides transport encryption between the client and the Tor container. The Tor-to-`caddy-tor` hop stays inside Docker's internal `iceq-net` bridge and is not host-exposed; the next hop to default Caddy uses HTTPS.
 
 The `goldy/tor-hidden-service` container:
 - generates a v3 ed25519 keypair on first boot and persists it in `tor_keys`
 - strips Tor's transport encryption and forwards plain HTTP into the Docker network
 - exposes the v3 onion address via its `hostname` file (used by the script above)
 
-Caddy serves both `:80` (Tor traffic) and `https://localhost` (direct browser access) from the same `(iceq_routes)` snippet, so `.onion` users and direct-HTTPS users get identical IceQ functionality.
+The default Caddy loads no Tor-only `:80` listener. Enabling the `tor` profile starts the isolated `caddy-tor` internal edge, which forwards onion requests to the default Caddy HTTPS policy surface. This keeps Tor listeners absent from the default stack while reusing the clearnet routes and security headers.
 
 ### Security note
 

@@ -12,12 +12,11 @@
 #   - Per-IP rate limits at the edge (caddy-ratelimit)
 #   - Backend transport timeouts on every reverse_proxy block
 #
-# Three listeners share the same route table via the (iceq_routes) snippet:
-#   - :80            — optional Tor profile's internal hidden-service target
+# The default clearnet listeners share the (iceq_routes) snippet:
 #   - iceq.space     — public direct browser access with managed TLS
 #   - https://localhost — direct browser access (self-signed dev cert)
-# All get identical IceQ handlers, security headers, rate limits, and SPA
-# serving. Only the transport (and tls directive) differs per site.
+# The optional Tor profile uses a separate Caddyfile.tor edge and forwards to
+# this HTTPS policy surface. The default Caddy loads no Tor-only HTTP listener.
 
 {
     admin localhost:2019
@@ -327,18 +326,6 @@
         try_files {path} /index.html
         file_server
     }
-}
-
-# ── Optional Tor hidden-service target ───────────────────────────────────────
-# This listener is not published by Compose. It becomes reachable only from the
-# internal network when the explicit `tor` profile is enabled. Plain HTTP is
-# used internally; Tor provides transport-layer encryption between the client
-# and this listener, so serving over plain HTTP inside the Docker network
-# does not weaken end-to-end confidentiality. The goldy/tor-hidden-service
-# container sits in front of Caddy on the iceq-net bridge and forwards .onion
-# traffic to this listener.
-:80 {
-    import iceq_routes
 }
 
 # ── Public TLS listener (direct browser access) ──────────────────────────────

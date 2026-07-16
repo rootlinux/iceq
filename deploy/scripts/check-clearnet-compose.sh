@@ -4,6 +4,7 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 compose_file="$repo_root/deploy/docker-compose.yml"
 caddyfile="$repo_root/deploy/Caddyfile"
+tor_caddyfile="$repo_root/deploy/Caddyfile.tor"
 onion_script="$repo_root/deploy/scripts/onion-address.sh"
 
 fail() {
@@ -22,6 +23,10 @@ printf '%s\n' "$default_services" | grep -qx tor &&
   fail "default Compose configuration must exclude the Tor service"
 printf '%s\n' "$tor_services" | grep -qx tor ||
   fail "the tor profile must include the Tor service"
+printf '%s\n' "$default_services" | grep -qx caddy-tor &&
+  fail "default Compose configuration must exclude the Tor edge"
+printf '%s\n' "$tor_services" | grep -qx caddy-tor ||
+  fail "the tor profile must include the isolated Tor edge"
 
 default_config=$(docker compose -f "$compose_file" config)
 printf '%s\n' "$default_config" | grep -Eq '^[[:space:]]+tor:$' &&
@@ -29,8 +34,20 @@ printf '%s\n' "$default_config" | grep -Eq '^[[:space:]]+tor:$' &&
 printf '%s\n' "$default_config" | grep -Eq 'condition:.*tor|tor:.*condition' &&
   fail "a default service depends on Tor"
 
+grep -Eq '^:80[[:space:]]*\{' "$caddyfile" &&
+  fail "default Caddyfile must not load the Tor-only :80 listener"
+test -f "$tor_caddyfile" || fail "isolated Tor edge Caddyfile is missing"
+grep -Eq '^:80[[:space:]]*\{' "$tor_caddyfile" ||
+  fail "isolated Tor edge must own the internal :80 listener"
+grep -Fq 'reverse_proxy https://caddy:443' "$tor_caddyfile" ||
+  fail "isolated Tor edge must forward to the shared clearnet policy edge"
+grep -Fq 'header_up Host iceq.space' "$tor_caddyfile" ||
+  fail "isolated Tor edge must select the iceq.space Caddy site"
+grep -Fq 'ICECQ_TOR_SERVICE_HOSTS=80:caddy-tor:80' "$compose_file" ||
+  fail "Tor hidden service must target only the isolated Tor edge"
+
 clearnet_site=$(sed -n '/^iceq\.space, www\.iceq\.space {$/,/^}$/p' "$caddyfile")
-route_snippet=$(sed -n '/^(iceq_routes) {$/,/^# ── Optional Tor hidden-service target/p' "$caddyfile")
+route_snippet=$(sed -n '/^(iceq_routes) {$/,/^# ── Public TLS listener/p' "$caddyfile")
 security_snippet=$(sed -n '/^(security_headers) {$/,/^# ── Upstream forwarding headers/p' "$caddyfile")
 
 printf '%s\n' "$clearnet_site" | grep -Eq '^iceq\.space, www\.iceq\.space \{' ||
@@ -67,9 +84,13 @@ if docker image inspect iceq/caddy:dev >/dev/null 2>&1; then
     -v "$caddyfile:/etc/caddy/Caddyfile:ro" \
     iceq/caddy:dev validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
     fail "Caddy failed to validate the clearnet configuration"
-  printf 'PASS: Caddy runtime syntax validation completed with iceq/caddy:dev.\n'
+  docker run --rm \
+    -v "$tor_caddyfile:/etc/caddy/Caddyfile:ro" \
+    iceq/caddy:dev validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
+    fail "Caddy failed to validate the isolated Tor-edge configuration"
+  printf 'PASS: Caddy runtime syntax validation completed for both edge configurations.\n'
 else
   printf 'SKIP: iceq/caddy:dev is unavailable; runtime Caddy validation was not performed.\n'
 fi
 
-printf 'PASS: default Compose is clearnet-only; Tor is opt-in and Caddy clearnet policy is present.\n'
+printf 'STATIC PASS: default Compose is clearnet-only; Tor edge isolation and Caddy policy are structurally valid.\n'

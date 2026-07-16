@@ -27,9 +27,9 @@ Implemented:
 - Docker Compose retains a Tor v3 hidden-service container behind the explicit `tor` profile; the default clearnet stack excludes it.
 - The `.onion` key material is generated automatically and persisted in the `tor_keys` volume.
 - `deploy/scripts/onion-address.sh` prints the locally generated onion address and `ICEQ_ONION_LOCATION` value; this is not claimed as consensus-publication or reachability proof.
-- Caddy can serve clearnet and onion traffic from the same route set.
+- Default Caddy loads only HTTPS sites. The explicit Tor profile adds an isolated `caddy-tor` HTTP edge that forwards to the default Caddy HTTPS route/header policy; neither Tor service is instantiated by default.
 - `Onion-Location` is enabled only when a non-empty `ICEQ_ONION_LOCATION` is configured; the default clearnet response does not advertise it.
-- `deploy/scripts/check-clearnet-compose.sh` verifies default exclusion, explicit profile inclusion, clearnet hosts/routes, and required security headers.
+- `deploy/scripts/check-clearnet-compose.sh` verifies default exclusion of both Tor services, explicit profile inclusion, edge isolation, clearnet hosts/routes, and required security headers. It labels structural-only evidence `STATIC PASS` and runtime parser absence `SKIP`.
 - Caddy edge logging strips client IP, User-Agent, Authorization, and Cookie data and skips high-volume sensitive routes.
 
 Remaining:
