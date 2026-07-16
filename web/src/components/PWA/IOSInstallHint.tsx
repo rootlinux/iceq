@@ -4,6 +4,7 @@
 // manual instructions instead.
 
 import { useEffect, useState } from "react";
+import { useI18n } from "../../i18n";
 
 const HINT_KEY = "iceq_ios_hint_shown";
 
@@ -42,6 +43,7 @@ interface IOSInstallHintProps {
 }
 
 export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | null {
+  const i18n = useI18n();
   const [show, setShow] = useState(false);
 
   useEffect(() => {
@@ -94,27 +96,10 @@ export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | 
             color: "#e5e5e5",
           }}
         >
-          Install IceQ
+          {i18n.t("pwa.installIceq")}
         </h2>
         <p style={{ margin: "0 0 20px", fontSize: 14, color: "#999", lineHeight: 1.5 }}>
-          Tap the{" "}
-          <svg
-            style={{ display: "inline", verticalAlign: "middle", margin: "0 4px" }}
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="#00b4d8"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" />
-            <polyline points="16 6 12 2 8 6" />
-            <line x1="12" y1="2" x2="12" y2="15" />
-          </svg>
-          Share button then tap{" "}
-          <strong style={{ color: "#e5e5e5" }}>"Add to Home Screen"</strong>
+          {i18n.t("pwa.iosHelp")}
         </p>
         <button
           onClick={handleGotIt}
@@ -130,7 +115,7 @@ export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | 
             cursor: "pointer",
           }}
         >
-          Got it
+          {i18n.t("pwa.gotIt")}
         </button>
       </div>
     </div>

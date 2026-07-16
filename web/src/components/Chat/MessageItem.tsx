@@ -96,7 +96,7 @@ export function MessageItem({ message }: MessageItemProps): JSX.Element {
         a.remove();
       });
     } catch {
-      setDownloadError("File authentication failed. The file was not opened.");
+      setDownloadError(i18n.t("chat.fileAuthFailed"));
     } finally {
       setDownloading(false);
     }
@@ -127,12 +127,12 @@ export function MessageItem({ message }: MessageItemProps): JSX.Element {
                 (outgoing ? "border-bg/40 text-bg" : "border-border text-text")
               }
             >
-              {downloading ? "Decrypting..." : "Download"}
+              {downloading ? i18n.t("chat.decrypting") : i18n.t("chat.download")}
             </a>
             {downloadError && <div role="alert" className="text-xs text-red-400">{downloadError}</div>}
           </div>
         ) : invalidAttachment ? (
-          <div role="alert">Attachment unavailable — failed security validation.</div>
+          <div role="alert">{i18n.t("chat.attachmentUnavailable")}</div>
         ) : (
           <div className="whitespace-pre-wrap break-words">{text}</div>
         )}

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import QRCode from "qrcode";
 import jsQR from "jsqr";
+import { useI18n } from "../../i18n";
 
 export interface SafetyQrPayload { version: 1; fingerprint: string }
 const MAX_QR_UPLOAD_BYTES = 2_000_000;
@@ -100,6 +101,7 @@ function parseSupportedImageDimensions(bytes: Uint8Array): { width: number; heig
 }
 
 export function SafetyQr({ fingerprint }: { fingerprint: string }): JSX.Element {
+  const i18n = useI18n();
   const [comparison, setComparison] = useState<"idle" | "match" | "mismatch" | "invalid">("idle");
   const [svg, setSvg] = useState("");
   const payload = createSafetyQrPayload(fingerprint);
@@ -132,17 +134,17 @@ export function SafetyQr({ fingerprint }: { fingerprint: string }): JSX.Element 
   };
   return (
     <div className="iceq-settings-status">
-      <strong>Safety QR</strong>
-      {svg && <img aria-label="Your scannable safety QR code" src={`data:image/svg+xml,${encodeURIComponent(svg)}`} />}
-      <details><summary>Accessible text payload</summary><textarea readOnly aria-label="Your safety QR payload" value={payload} rows={3} /></details>
-      <label>Scan from image<input aria-label="Contact safety QR image" type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void decodeImage(file); }} /></label>
+      <strong>{i18n.t("safety.title")}</strong>
+      {svg && <img aria-label={i18n.t("safety.yourQr")} src={`data:image/svg+xml,${encodeURIComponent(svg)}`} />}
+      <details><summary>{i18n.t("safety.accessiblePayload")}</summary><textarea readOnly aria-label={i18n.t("safety.yourPayload")} value={payload} rows={3} /></details>
+      <label>{i18n.t("safety.scanImage")}<input aria-label={i18n.t("safety.contactImage")} type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void decodeImage(file); }} /></label>
       <label>
-        Or compare accessible text payload
-        <textarea aria-label="Contact safety QR payload" rows={3} onChange={(event) => {
+        {i18n.t("safety.comparePayload")}
+        <textarea aria-label={i18n.t("safety.contactPayload")} rows={3} onChange={(event) => {
           compare(event.target.value);
         }} />
       </label>
-      {comparison !== "idle" && <div role="status">{comparison === "match" ? "Fingerprints match" : comparison === "mismatch" ? "Fingerprint mismatch — do not send" : "Invalid safety payload"}</div>}
+      {comparison !== "idle" && <div role="status">{comparison === "match" ? i18n.t("safety.match") : comparison === "mismatch" ? i18n.t("safety.mismatch") : i18n.t("safety.invalid")}</div>}
     </div>
   );
 }

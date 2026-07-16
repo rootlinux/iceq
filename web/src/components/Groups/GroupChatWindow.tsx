@@ -12,13 +12,14 @@ import { useGroupStore } from "../../store/groupStore";
 import { decryptMessage } from "../../lib/signal";
 import { pruneObsoleteGroupEpochs } from "../../lib/groupCryptoStore";
 import { GroupDetail } from "./GroupDetail";
+import { useI18n } from "../../i18n";
 
 interface GroupChatWindowProps {
   group: GroupWire;
 }
 const inFlightHistoryLoads = new Map<string, Promise<Message[]>>();
 
-function loadEncryptedGroupHistory(groupId: string, selfUin: number, conversationId: string): Promise<Message[]> {
+function loadEncryptedGroupHistory(groupId: string, selfUin: number, conversationId: string, securityWarning: string): Promise<Message[]> {
   const key = `${groupId}:${selfUin}`;
   const existing = inFlightHistoryLoads.get(key);
   if (existing) return existing;
@@ -39,7 +40,7 @@ function loadEncryptedGroupHistory(groupId: string, selfUin: number, conversatio
         const content = await openGroupContent(decodeGroupCiphertext(row.ciphertext), roster.crypto_epoch, memberUins, true, Date.now(), {group_id:groupId,sender_uin:row.sender_uin,epoch:row.crypto_epoch});
         out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: content.content_type === "file" ? JSON.stringify(content.attachment ?? null) : (content.text ?? ""), content_type: content.content_type, created_at: row.created_at, state: "delivered", is_outgoing: row.sender_uin === selfUin });
       } catch {
-        out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: "Security warning: this historical group message could not be verified or decrypted.", content_type: "text", created_at: row.created_at, state: "failed", is_outgoing: row.sender_uin === selfUin });
+        out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: securityWarning, content_type: "text", created_at: row.created_at, state: "failed", is_outgoing: row.sender_uin === selfUin });
       }
     }
     return out;
@@ -50,6 +51,7 @@ function loadEncryptedGroupHistory(groupId: string, selfUin: number, conversatio
 }
 
 export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
+  const i18n = useI18n();
   const selfUin = useAuthStore((s) => s.uin);
   const setMessages = useChatStore((s) => s.setMessages);
   const markConversationRead = useChatStore((s) => s.markConversationRead);
@@ -68,7 +70,7 @@ export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
     setError(null);
     (async () => {
       try {
-        const out=await loadEncryptedGroupHistory(group.group_id,selfUin,conversationId);
+        const out=await loadEncryptedGroupHistory(group.group_id,selfUin,conversationId,i18n.t("chat.historySecurityWarning"));
         if (cancelled) return;
         setMessages(conversationId, out);
       } catch (e) {
@@ -93,17 +95,17 @@ export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
           <div className="min-w-0">
             <div className="truncate text-sm font-medium text-text">{group.name}</div>
             <div className="text-xs text-text-2">
-              {group.member_count} member{group.member_count === 1 ? "" : "s"}
+              {i18n.t(group.member_count === 1 ? "groups.memberCount" : "groups.memberCountPlural", { count: group.member_count })}
             </div>
           </div>
         </header>
 
         <div className="min-h-0 flex flex-1 flex-col">
           {loading ? (
-            <div className="h-full overflow-y-auto p-4 text-sm text-text-2">Loading history...</div>
+            <div className="h-full overflow-y-auto p-4 text-sm text-text-2">{i18n.t("chat.loadingHistory")}</div>
           ) : error ? (
             <div role="alert" className="h-full overflow-y-auto p-4 text-sm">
-              Could not load group history: {error}
+              {i18n.t("chat.groupHistoryError")} {error}
             </div>
           ) : (
             <MessageList conversationId={`group:${group.group_id}`} />

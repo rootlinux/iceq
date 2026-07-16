@@ -24,12 +24,14 @@ import {
 import { AddContact } from "./AddContact";
 import { ContactItem } from "./ContactItem";
 import type { Contact } from "../../types/models";
+import { useI18n } from "../../i18n";
 
 interface ContactListProps {
   onContactSelected?: () => void;
 }
 
 export function ContactList({ onContactSelected }: ContactListProps): JSX.Element {
+  const i18n = useI18n();
   const contacts = useContactStore((s) => s.contacts);
   const loadContacts = useContactStore((s) => s.loadContacts);
   const statuses = useContactStatusStore((s) => s.statuses);
@@ -127,14 +129,14 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
 
       {isEmpty && (
         <div className="p-4 text-sm text-text-2">
-          No contacts yet. Add a friend by their UIN to start chatting.
+          {i18n.t("contacts.empty")}
         </div>
       )}
 
       {incoming.length > 0 && (
-        <section aria-label="Incoming contact requests">
+        <section aria-label={i18n.t("contacts.incoming")}>
           <h2 className="px-3 pt-3 text-xs font-semibold uppercase tracking-wide text-text-2">
-            Requests · {incoming.length}
+            {i18n.t("contacts.requests")} · {incoming.length}
           </h2>
           <ul role="list" className="divide-y divide-border">
             {incoming.map((c) => (
@@ -149,7 +151,7 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
                       {c.nickname ?? c.username}
                     </div>
                     <div className="flex items-center gap-2 text-xs text-text-2">
-                      <span>Pending</span>
+                      <span>{i18n.t("contacts.pending")}</span>
                       <span>#{c.uin}</span>
                     </div>
                   </div>
@@ -160,16 +162,16 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
                   onClick={() => void onAccept(c.uin)}
                   disabled={busyUin === c.uin}
                 >
-                  {busyUin === c.uin ? "…" : "Accept"}
+                  {busyUin === c.uin ? "…" : i18n.t("contacts.accept")}
                 </button>
                 <button
                   type="button"
                   className="iceq-btn-secondary text-xs"
                   onClick={() => void onBlock(c.uin)}
                   disabled={busyUin === c.uin}
-                  aria-label="Block"
+                  aria-label={i18n.t("contacts.block")}
                 >
-                  Block
+                  {i18n.t("contacts.block")}
                 </button>
               </li>
             ))}
@@ -178,9 +180,9 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
       )}
 
       {outgoing.length > 0 && (
-        <section aria-label="Outgoing contact requests">
+        <section aria-label={i18n.t("contacts.outgoing")}>
           <h2 className="px-3 pt-3 text-xs font-semibold uppercase tracking-wide text-text-2">
-            Sent requests · {outgoing.length}
+            {i18n.t("contacts.sentRequests")} · {outgoing.length}
           </h2>
           <ul role="list" className="divide-y divide-border">
             {outgoing.map((c) => (
@@ -195,7 +197,7 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
                       {c.nickname ?? c.username}
                     </div>
                     <div className="flex items-center gap-2 text-xs text-text-2">
-                      <span>Waiting for accept</span>
+                      <span>{i18n.t("contacts.waiting")}</span>
                       <span>#{c.uin}</span>
                     </div>
                   </div>
@@ -207,9 +209,9 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
       )}
 
       {accepted.length > 0 && (
-        <section aria-label="Contacts">
+        <section aria-label={i18n.t("contacts.title")}>
           <h2 className="px-3 pt-3 text-xs font-semibold uppercase tracking-wide text-text-2">
-            Contacts
+            {i18n.t("contacts.title")}
           </h2>
           <ul role="list" className="divide-y divide-border">
             {accepted.map((c) => (
@@ -222,14 +224,14 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
       )}
 
       {blocked.length > 0 && (
-        <section aria-label="Blocked contacts" className="mt-2">
+        <section aria-label={i18n.t("contacts.blockedTitle")} className="mt-2">
           <button
             type="button"
             className="px-3 pt-3 text-xs font-semibold uppercase tracking-wide text-text-2 hover:text-text"
             onClick={() => setShowBlocked((s) => !s)}
             aria-expanded={showBlocked}
           >
-            Blocked · {blocked.length} {showBlocked ? "▾" : "▸"}
+            {i18n.t("contacts.blocked")} · {blocked.length} {showBlocked ? "▾" : "▸"}
           </button>
           {showBlocked && (
             <ul role="list" className="divide-y divide-border">
@@ -239,7 +241,7 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
                     <div className="text-sm font-medium text-text line-through opacity-60">
                       #{c.uin}
                     </div>
-                    <div className="text-xs text-text-2">blocked</div>
+                    <div className="text-xs text-text-2">{i18n.t("contacts.blocked")}</div>
                   </div>
                   <button
                     type="button"
@@ -247,7 +249,7 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
                     onClick={() => void onRemove(c.uin)}
                     disabled={busyUin === c.uin}
                   >
-                    Unblock
+                    {i18n.t("contacts.unblock")}
                   </button>
                 </li>
               ))}

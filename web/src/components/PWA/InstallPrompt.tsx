@@ -3,6 +3,7 @@
 // when PWA criteria are met and the app isn't already installed.
 
 import { useEffect, useState } from "react";
+import { useI18n } from "../../i18n";
 
 const DISMISS_KEY = "iceq_install_dismissed";
 const DISMISS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -19,6 +20,7 @@ function isDismissed(): boolean {
 }
 
 export function InstallPrompt(): JSX.Element | null {
+  const i18n = useI18n();
   const [deferredPrompt, setDeferredPrompt] =
     useState<BeforeInstallPromptEvent | null>(null);
 
@@ -68,7 +70,7 @@ export function InstallPrompt(): JSX.Element | null {
         style={{ width: 24, height: 24, borderRadius: 4, flexShrink: 0 }}
       />
       <span style={{ flex: 1, fontSize: 14, color: "#e5e5e5" }}>
-        Add IceQ to your home screen
+        {i18n.t("pwa.addHome")}
       </span>
       <button
         onClick={handleInstall}
@@ -83,11 +85,11 @@ export function InstallPrompt(): JSX.Element | null {
           cursor: "pointer",
         }}
       >
-        Install
+        {i18n.t("pwa.install")}
       </button>
       <button
         onClick={handleDismiss}
-        aria-label="Dismiss"
+        aria-label={i18n.t("pwa.dismiss")}
         style={{
           background: "none",
           border: "none",

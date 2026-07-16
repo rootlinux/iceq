@@ -8,12 +8,14 @@ import { useLayoutEffect, useRef } from "react";
 import { useChatStore } from "../../store/chatStore";
 import { MessageItem } from "./MessageItem";
 import type { Message } from "../../types/models";
+import { useI18n } from "../../i18n";
 
 interface MessageListProps {
   conversationId: string;
 }
 
 export function MessageList({ conversationId }: MessageListProps): JSX.Element {
+  const i18n = useI18n();
   const messages = useChatStore((s) => s.messagesByConversation[conversationId] ?? []);
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
@@ -25,7 +27,7 @@ export function MessageList({ conversationId }: MessageListProps): JSX.Element {
     <div className="relative flex min-h-0 flex-1 flex-col overflow-y-auto px-4 py-3">
       {messages.length === 0 ? (
         <div className="mt-auto pb-8 text-center text-sm text-text-2">
-          No messages yet. Say hi.
+        {i18n.t("chat.empty")}
         </div>
       ) : (
         <ul role="list" className="mt-auto space-y-2">

@@ -12,6 +12,7 @@
 // relative-positioned container.
 
 import type { PresenceStatus } from "../../types/models";
+import { useI18n } from "../../i18n";
 
 interface PresenceDotProps {
   status: PresenceStatus;
@@ -26,9 +27,11 @@ const COLORS: Record<PresenceStatus, string> = {
 };
 
 export function PresenceDot({ status, className = "" }: PresenceDotProps): JSX.Element {
+  const i18n = useI18n();
+  const statusKey = { online: "presence.online", away: "presence.away", dnd: "presence.dnd", offline: "presence.offline" } as const;
   return (
     <span
-      aria-label={`Presence: ${status}`}
+      aria-label={i18n.t("presence.label", { status: i18n.t(statusKey[status]) })}
       className={`absolute -bottom-0.5 -right-0.5 inline-block h-2.5 w-2.5 rounded-full border-2 border-surface-2 ${COLORS[status]} ${className}`}
     />
   );

@@ -29,6 +29,7 @@ import { cryptoRandomId } from "../../hooks/useWebSocket";
 import type { Message } from "../../types/models";
 import type { Envelope, ReadPayload } from "../../types/envelope";
 import { permitsPrivacySignal } from "../../lib/privacySettings";
+import { useI18n } from "../../i18n";
 
 interface ChatWindowProps {
   peerUin: number;
@@ -36,6 +37,7 @@ interface ChatWindowProps {
 }
 
 export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Element {
+  const i18n = useI18n();
   const { send } = useChatShell();
   const selfUin = useAuthStore((s) => s.uin);
   const convId = selfUin !== null ? conversationIdForPair(selfUin, peerUin) : "";
@@ -150,10 +152,10 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
 
       <div className="min-h-0 flex flex-1 flex-col">
         {loading ? (
-          <div className="h-full overflow-y-auto p-4 text-sm text-text-2">Loading history…</div>
+          <div className="h-full overflow-y-auto p-4 text-sm text-text-2">{i18n.t("chat.loadingHistory")}</div>
         ) : error ? (
           <div role="alert" className="h-full overflow-y-auto p-4 text-sm">
-            Could not load history: {error}
+            {i18n.t("chat.historyError")} {error}
           </div>
         ) : (
           <MessageList conversationId={convId} />

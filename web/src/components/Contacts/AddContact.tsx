@@ -4,18 +4,20 @@ import { ApiError } from "../../api/client";
 import { useAuthStore } from "../../store/authStore";
 import { useContactStore } from "../../store/contactStore";
 import { useDialogFocus } from "../../hooks/useDialogFocus";
+import { useI18n } from "../../i18n";
 
-function getAddContactErrorMessage(error: unknown): string {
+function getAddContactErrorMessage(error: unknown, t: ReturnType<typeof useI18n>["t"]): string {
   if (error instanceof ApiError) {
-    if (error.status === 404 || error.code === "USER_NOT_FOUND") return "User not found";
-    if (error.status === 409 || error.code === "CONTACT_EXISTS") return "Already added";
-    if (error.code === "SELF_CONTACT_FORBIDDEN") return "You can't add yourself";
+    if (error.status === 404 || error.code === "USER_NOT_FOUND") return t("contacts.userNotFound");
+    if (error.status === 409 || error.code === "CONTACT_EXISTS") return t("contacts.alreadyAdded");
+    if (error.code === "SELF_CONTACT_FORBIDDEN") return t("contacts.noSelf");
   }
   if (error instanceof Error && error.message.trim() !== "") return error.message;
-  return "Could not send contact request";
+  return t("contacts.sendFailed");
 }
 
 export function AddContact(): JSX.Element {
+  const i18n = useI18n();
   const selfUin = useAuthStore((s) => s.uin);
   const addContact = useContactStore((s) => s.addContact);
   const [open, setOpen] = useState(false);
@@ -42,27 +44,27 @@ export function AddContact(): JSX.Element {
 
     const trimmed = targetUIN.trim();
     if (trimmed === "") {
-      setError("Please enter a UIN");
+      setError(i18n.t("contacts.enterUin"));
       return;
     }
 
     const parsed = Number.parseInt(trimmed, 10);
     if (!Number.isFinite(parsed) || parsed <= 0) {
-      setError("UIN must be a positive integer");
+      setError(i18n.t("contacts.positiveUin"));
       return;
     }
     if (selfUin !== null && parsed === selfUin) {
-      setError("You can't add yourself");
+      setError(i18n.t("contacts.noSelf"));
       return;
     }
 
     setSubmitting(true);
     try {
       await addContact(parsed);
-      setSuccess("Contact request sent");
+      setSuccess(i18n.t("contacts.sent"));
       setTargetUIN("");
     } catch (err) {
-      setError(getAddContactErrorMessage(err));
+      setError(getAddContactErrorMessage(err, i18n.t));
     } finally {
       setSubmitting(false);
     }
@@ -76,7 +78,7 @@ export function AddContact(): JSX.Element {
         className="iceq-btn-secondary m-2 w-[calc(100%-1rem)]"
         onClick={() => setOpen(true)}
       >
-        + Add contact
+        + {i18n.t("contacts.add")}
       </button>
 
       {open && (
@@ -91,16 +93,16 @@ export function AddContact(): JSX.Element {
             <div className="mb-4 flex items-start justify-between gap-4">
               <div>
                 <h2 id="add-contact-title" className="text-lg font-semibold text-text">
-                  Add contact
+                  {i18n.t("contacts.add")}
                 </h2>
                 <p className="mt-1 text-sm text-text-2">
-                  Enter a UIN to send a contact request.
+                  {i18n.t("contacts.addHelp")}
                 </p>
               </div>
               <button
                 type="button"
                 className="iceq-btn-secondary"
-                aria-label="Close add contact"
+                aria-label={i18n.t("contacts.closeAdd")}
                 onClick={closeModal}
                 disabled={submitting}
               >
@@ -111,7 +113,7 @@ export function AddContact(): JSX.Element {
             <form onSubmit={(e) => void onSubmit(e)} className="space-y-3">
               <div>
                 <label htmlFor="add-contact-uin" className="mb-1 block text-xs text-text-2">
-                  UIN
+                  {i18n.t("contacts.uin")}
                 </label>
                 <input
                   id="add-contact-uin"
@@ -124,7 +126,7 @@ export function AddContact(): JSX.Element {
                   value={targetUIN}
                   onChange={(e) => setTargetUIN(e.target.value)}
                   disabled={submitting}
-                  placeholder="e.g. 10000042"
+                  placeholder={i18n.t("contacts.uinExample")}
                   required
                 />
               </div>
@@ -151,10 +153,10 @@ export function AddContact(): JSX.Element {
                   onClick={closeModal}
                   disabled={submitting}
                 >
-                  Cancel
+                  {i18n.t("common.cancel")}
                 </button>
                 <button type="submit" className="iceq-btn-primary" disabled={submitting}>
-                  {submitting ? "Sending…" : "Send request"}
+                  {submitting ? i18n.t("contacts.sending") : i18n.t("contacts.sendRequest")}
                 </button>
               </div>
             </form>

@@ -2,12 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import type { GroupWire } from "../../api/groups";
 import { useAuthStore } from "../../store/authStore";
 import { useGroupStore } from "../../store/groupStore";
+import { useI18n } from "../../i18n";
 
 interface GroupDetailProps {
   group: GroupWire;
 }
 
 export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
+  const i18n = useI18n();
   const selfUin = useAuthStore((s) => s.uin);
   const members = useGroupStore((s) => s.members[group.group_id] ?? []);
   const loadMembers = useGroupStore((s) => s.loadMembers);
@@ -31,7 +33,7 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
     e.preventDefault();
     const parsedUin = Number.parseInt(uin.trim(), 10);
     if (!Number.isFinite(parsedUin) || parsedUin <= 0) {
-      setLocalError("UIN must be a positive number.");
+      setLocalError(i18n.t("groups.uinInvalid"));
       return;
     }
     setBusy(true);
@@ -61,9 +63,9 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
   return (
     <aside className="hidden w-72 shrink-0 border-l border-border bg-bg/50 md:flex md:min-h-0 md:flex-col">
       <div className="border-b border-border p-4">
-        <div className="text-sm font-semibold text-text">Members</div>
+        <div className="text-sm font-semibold text-text">{i18n.t("groups.members")}</div>
         <div className="mt-1 text-xs text-text-2">
-          {members.length} member{members.length === 1 ? "" : "s"}
+          {i18n.t(members.length === 1 ? "groups.memberCount" : "groups.memberCountPlural", { count: members.length })}
         </div>
       </div>
 
@@ -79,7 +81,7 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
                   <span className="truncate text-sm font-medium text-text">{member.username}</span>
                   {member.uin === group.owner_uin && (
                     <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-semibold uppercase leading-none text-bg">
-                      Admin
+                      {i18n.t("groups.admin")}
                     </span>
                   )}
                 </div>
@@ -92,7 +94,7 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
                   onClick={() => void onRemove(member.uin)}
                   disabled={busy}
                 >
-                  Remove
+                  {i18n.t("groups.remove")}
                 </button>
               )}
             </li>
@@ -103,7 +105,7 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
       {canManageMembers && (
         <form className="border-t border-border p-3" onSubmit={(e) => void onAdd(e)}>
           <label htmlFor="group-member-uin" className="text-xs font-medium text-text-2">
-            Add member by UIN
+            {i18n.t("groups.addByUin")}
           </label>
           <div className="mt-2 flex gap-2">
             <input
@@ -119,7 +121,7 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
               className="iceq-btn-primary"
               disabled={busy || uin.trim().length === 0}
             >
-              Add
+              {i18n.t("groups.add")}
             </button>
           </div>
           {localError && <div className="mt-2 text-xs text-presence-dnd">{localError}</div>}

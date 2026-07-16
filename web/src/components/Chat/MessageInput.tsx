@@ -25,6 +25,7 @@ import type { Envelope } from "../../types/envelope";
 import { getGroupMembersWithEpoch, putSenderKeyDistribution } from "../../api/groups";
 import { ensureGroupSender, sealGroupContent, encodeGroupCiphertext, GROUP_CONTENT_KIND } from "../../lib/groupCrypto";
 import { loadDisappearingSeconds, permitsPrivacySignal } from "../../lib/privacySettings";
+import { useI18n } from "../../i18n";
 
 interface MessageInputProps {
   peerUin?: number;
@@ -34,6 +35,7 @@ interface MessageInputProps {
 const TYPING_DEBOUNCE_MS = 500;
 
 export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Element {
+  const i18n = useI18n();
   const { send } = useChatShell();
   const selfUin = useAuthStore((s) => s.uin);
   const addMessage = useChatStore((s) => s.addMessage);
@@ -287,7 +289,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
 
   return (
     <div className="border-t border-border p-3">
-      {securityError && <div role="alert" className="mb-2 text-sm text-red-400">Send blocked: {securityError}</div>}
+      {securityError && <div role="alert" className="mb-2 text-sm text-red-400">{i18n.t("chat.sendBlocked")} {securityError}</div>}
       <div className="flex items-end gap-2">
         <input
           ref={fileInputRef}
@@ -304,8 +306,8 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
           className="iceq-btn-secondary shrink-0"
           onClick={() => fileInputRef.current?.click()}
           disabled={sending || attaching}
-          title="Attach encrypted file"
-          aria-label="Attach file"
+          title={i18n.t("chat.attachEncrypted")}
+          aria-label={i18n.t("chat.attachFile")}
         >
           {attaching ? "..." : "+"}
         </button>
@@ -314,7 +316,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
           value={text}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Type a message…"
+          placeholder={i18n.t("chat.messagePlaceholder")}
           className="iceq-input max-h-32 resize-y"
           disabled={sending}
         />
@@ -324,7 +326,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
           onClick={() => void onSend()}
           disabled={sending || text.trim().length === 0}
         >
-          Send
+          {i18n.t("common.send")}
         </button>
       </div>
     </div>

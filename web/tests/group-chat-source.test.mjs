@@ -35,7 +35,7 @@ test("group detail shows members, admin badge, and member management controls", 
   assert.match(detail, /inviteMember\(group\.group_id, parsedUin\)/);
   assert.match(detail, /kickMember\(group\.group_id, memberUin\)/);
   assert.match(detail, /member\.uin === group\.owner_uin/);
-  assert.match(detail, /Admin/);
+  assert.match(detail, /groups\.admin/);
 });
 
 test("message input can send group_msg frames with group conversation ids", () => {

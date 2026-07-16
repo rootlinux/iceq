@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useGroupStore } from "../../store/groupStore";
 import { useChatStore } from "../../store/chatStore";
 import { useDialogFocus } from "../../hooks/useDialogFocus";
+import { useI18n } from "../../i18n";
 
 export function GroupList(): JSX.Element {
+  const i18n = useI18n();
   const groups = useGroupStore((s) => s.groups);
   const loading = useGroupStore((s) => s.loading);
   const error = useGroupStore((s) => s.error);
@@ -29,7 +31,7 @@ export function GroupList(): JSX.Element {
     e.preventDefault();
     const trimmed = name.trim();
     if (trimmed.length < 3 || trimmed.length > 50) {
-      setLocalError("Group name must be 3-50 characters.");
+      setLocalError(i18n.t("groups.nameInvalid"));
       return;
     }
     setCreating(true);
@@ -46,7 +48,7 @@ export function GroupList(): JSX.Element {
   }
 
   return (
-    <section aria-label="Groups" className="border-t border-border">
+    <section aria-label={i18n.t("groups.title")} className="border-t border-border">
       <div className="p-3">
         <button
           type="button"
@@ -54,21 +56,21 @@ export function GroupList(): JSX.Element {
           className="iceq-btn-secondary w-full"
           onClick={() => setOpen(true)}
         >
-          + Create group
+          + {i18n.t("groups.create")}
         </button>
       </div>
 
       <h2 className="px-3 pb-2 text-xs font-semibold uppercase tracking-wide text-text-2">
-        Groups
+        {i18n.t("groups.title")}
       </h2>
 
       {loading && groups.length === 0 && (
-        <div className="px-3 pb-3 text-sm text-text-2">Loading groups…</div>
+        <div className="px-3 pb-3 text-sm text-text-2">{i18n.t("groups.loading")}</div>
       )}
 
       {!loading && groups.length === 0 && (
         <div className="px-3 pb-3 text-sm text-text-2">
-          No groups yet. Create one to start organizing chats.
+          {i18n.t("groups.empty")}
         </div>
       )}
 
@@ -83,7 +85,7 @@ export function GroupList(): JSX.Element {
               >
                 <div className="truncate text-sm font-medium text-text">{group.name}</div>
                 <div className="truncate text-xs text-text-2">
-                  {group.member_count} member{group.member_count === 1 ? "" : "s"}
+                  {i18n.t(group.member_count === 1 ? "groups.memberCount" : "groups.memberCountPlural", { count: group.member_count })}
                 </div>
               </button>
             </li>
@@ -111,16 +113,16 @@ export function GroupList(): JSX.Element {
             <div className="mb-4 flex items-start justify-between gap-4">
               <div>
                 <h2 id="create-group-title" className="text-lg font-semibold text-text">
-                  Create group
+                  {i18n.t("groups.create")}
                 </h2>
                 <p className="mt-1 text-sm text-text-2">
-                  Create the group first; member management can follow from the API-backed store.
+                  {i18n.t("groups.createHelp")}
                 </p>
               </div>
               <button
                 type="button"
                 className="iceq-btn-secondary"
-                aria-label="Close create group"
+                aria-label={i18n.t("groups.closeCreate")}
                 onClick={closeDialog}
               >
                 ✕
@@ -130,7 +132,7 @@ export function GroupList(): JSX.Element {
             <form className="space-y-3" onSubmit={(e) => void onCreate(e)}>
               <div className="space-y-1">
                 <label htmlFor="group-name" className="text-sm text-text-2">
-                  Group name
+                  {i18n.t("groups.name")}
                 </label>
                 <input
                   id="group-name"
@@ -157,14 +159,14 @@ export function GroupList(): JSX.Element {
                   onClick={closeDialog}
                   disabled={creating}
                 >
-                  Cancel
+                  {i18n.t("common.cancel")}
                 </button>
                 <button
                   type="submit"
                   className="iceq-btn-primary"
                   disabled={creating}
                 >
-                  {creating ? "Creating…" : "Create group"}
+                  {creating ? i18n.t("groups.creating") : i18n.t("groups.create")}
                 </button>
               </div>
             </form>
