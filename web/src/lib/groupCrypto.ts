@@ -19,32 +19,38 @@ export function authenticatedGroupMessageFields(content:GroupContent,_untrustedO
 }
 
 export async function ensureGroupSender(groupId:string,epoch:number,selfUin:number,memberUins:number[],sendDistribution:(uin:number, plaintext:Uint8Array, distribution:SenderKeyDistribution)=>Promise<void>):Promise<SenderState> {
-  return withSenderLock(`${groupId}:${epoch}:${selfUin}`,async()=>{
-    const stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");
-    let local:LocalStored;
-    if (stored) local=stored.state as LocalStored; else { const made=await createSenderState(groupId,epoch,selfUin); local={sender:made.state,distributed_to:[],revision:0}; }
-    const distribution:SenderKeyDistribution = stripPrivate(local.sender);
-    if(!await loadGroupCryptoState(groupId,epoch,selfUin,"receiver",distribution.distribution_id))await saveGroupCryptoState({version:1,kind:"receiver",group_id:groupId,epoch,sender_uin:selfUin,updated_at:Date.now(),state:createReceiverState(distribution)});
-    const roster=[...new Set(memberUins)].filter(u=>u!==selfUin).sort((a,b)=>a-b);
-    for(const uin of roster.filter(u=>!local.distributed_to.includes(u))){await sendDistribution(uin,new TextEncoder().encode(JSON.stringify({kind:GROUP_DISTRIBUTION_KIND,distribution})),distribution);local.distributed_to.push(uin);}
-    await saveGroupCryptoState({version:1,kind:"sender",group_id:groupId,epoch,sender_uin:selfUin,updated_at:Date.now(),state:local});
-    return local.sender;
-  });
+  return withSenderLock(`${groupId}:${epoch}:${selfUin}`,()=>ensureGroupSenderCAS(groupId,epoch,selfUin,memberUins,sendDistribution));
 }
+
+export async function ensureGroupSenderCAS(groupId:string,epoch:number,selfUin:number,memberUins:number[],sendDistribution:(uin:number, plaintext:Uint8Array, distribution:SenderKeyDistribution)=>Promise<void>):Promise<SenderState>{
+  let stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");
+  if(!stored){const made=await createSenderState(groupId,epoch,selfUin);const local:LocalStored={sender:made.state,distributed_to:[],revision:0};const record={version:1 as const,kind:"sender" as const,group_id:groupId,epoch,sender_uin:selfUin,updated_at:Date.now(),state:local};if(await compareAndSwapSenderState(record,null))stored=record;else stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");}
+  if(!stored)throw new Error("sender state reservation failed");
+  let local=stored.state as LocalStored;let distribution=stripPrivate(local.sender);
+  if(!await loadGroupCryptoState(groupId,epoch,selfUin,"receiver",distribution.distribution_id))await saveGroupCryptoState({version:1,kind:"receiver",group_id:groupId,epoch,sender_uin:selfUin,updated_at:Date.now(),state:createReceiverState(distribution)});
+  for(const uin of [...new Set(memberUins)].filter(u=>u!==selfUin).sort((a,b)=>a-b)){
+    let reserved=false,alreadyDistributed=false;
+    for(let attempt=0;attempt<16;attempt++){stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");if(!stored)throw new Error("sender state disappeared");local=stored.state as LocalStored;if(local.distributed_to.includes(uin)){alreadyDistributed=true;break;}const revision=local.revision??0;const next:LocalStored={...local,distributed_to:[...local.distributed_to,uin],revision:revision+1};const record={...stored,updated_at:Date.now(),state:next};if(await compareAndSwapSenderState(record,revision)){local=next;distribution=stripPrivate(local.sender);reserved=true;break;}}
+    if(alreadyDistributed)continue;if(!reserved)throw new Error("sender distribution reservation changed concurrently");
+    try{await sendDistribution(uin,new TextEncoder().encode(JSON.stringify({kind:GROUP_DISTRIBUTION_KIND,distribution})),distribution);}catch(error){await releaseDistributionReservation(groupId,epoch,selfUin,uin);throw error;}
+  }
+  const latest=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");if(!latest)throw new Error("sender state disappeared");return (latest.state as LocalStored).sender;
+}
+
+async function releaseDistributionReservation(groupId:string,epoch:number,selfUin:number,uin:number):Promise<void>{for(let attempt=0;attempt<8;attempt++){const stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");if(!stored)return;const local=stored.state as LocalStored;if(!local.distributed_to.includes(uin))return;const revision=local.revision??0;const next={...local,distributed_to:local.distributed_to.filter(value=>value!==uin),revision:revision+1};if(await compareAndSwapSenderState({...stored,updated_at:Date.now(),state:next},revision))return;}}
 
 export async function sealGroupContent(state:SenderState,content:GroupContent):Promise<SenderKeyCiphertext> {
   const lockKey=`${state.group_id}:${state.epoch}:${state.sender_uin}`;
-  return withSenderLock(lockKey,async()=>{
-    for(let attempt=0;attempt<4;attempt++){
-      const stored=await loadGroupCryptoState(state.group_id,state.epoch,state.sender_uin,"sender");
-      const local=(stored?.state as LocalStored|undefined)??{sender:state,distributed_to:[],revision:0};const revision=local.revision??0;
-      const result=await encryptGroupMessage(local.sender,new TextEncoder().encode(JSON.stringify(content)));
-      const next:LocalStored={...local,sender:result.state,revision:revision+1};
-      const record={version:1 as const,kind:"sender" as const,group_id:state.group_id,epoch:state.epoch,sender_uin:state.sender_uin,created_at:stored?.created_at,updated_at:Date.now(),state:next};
-      if(stored?await compareAndSwapSenderState(record,revision):(await saveGroupCryptoState(record),true))return result.envelope;
-    }
-    throw new Error("sender state changed concurrently");
-  });
+  return withSenderLock(lockKey,()=>sealGroupContentCAS(state,content));
+}
+export async function sealGroupContentCAS(state:SenderState,content:GroupContent):Promise<SenderKeyCiphertext>{
+  for(let attempt=0;attempt<16;attempt++){
+    let stored=await loadGroupCryptoState(state.group_id,state.epoch,state.sender_uin,"sender");
+    if(!stored){const initial:LocalStored={sender:state,distributed_to:[],revision:0};const created={version:1 as const,kind:"sender" as const,group_id:state.group_id,epoch:state.epoch,sender_uin:state.sender_uin,updated_at:Date.now(),state:initial};if(!await compareAndSwapSenderState(created,null))continue;stored=created;}
+    const local=stored.state as LocalStored;const revision=local.revision??0;const result=await encryptGroupMessage(local.sender,new TextEncoder().encode(JSON.stringify(content)));const next:LocalStored={...local,sender:result.state,revision:revision+1};
+    if(await compareAndSwapSenderState({...stored,updated_at:Date.now(),state:next},revision))return result.envelope;
+  }
+  throw new Error("sender state changed concurrently");
 }
 export async function installSenderDistribution(senderUin:number,value:unknown,currentEpoch:number,currentMembers:number[]):Promise<boolean> {
   if(!isObj(value)||value.kind!==GROUP_DISTRIBUTION_KIND||!isObj(value.distribution))return false;

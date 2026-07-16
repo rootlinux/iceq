@@ -13,7 +13,7 @@ export interface AuthenticatedGroupContentRecord {
 const AUTHENTICATED_CONTENT_TTL_MS=86_400_000;
 const distributionIdOf=(record:StoredGroupCryptoState):string|undefined=>record.kind==="receiver"&&typeof record.state==="object"&&record.state!==null&&"distribution_id" in record.state?String((record.state as {distribution_id:unknown}).distribution_id):undefined;
 const keyFor = (g:string,e:number,u:number,k:GroupCryptoKind,distributionId?:string):string => `${g}:${e}:${u}:${k}${k==="receiver"&&distributionId?`:${distributionId}`:""}`;
-export function compareAndSwapSenderState(record:StoredGroupCryptoState,expectedRevision:number):Promise<boolean>{
+export function compareAndSwapSenderState(record:StoredGroupCryptoState,expectedRevision:number|null):Promise<boolean>{
   if(record.kind!=="sender")throw new Error("sender CAS requires sender state");
   return compareAndSwapGroupCryptoRecord(keyFor(record.group_id,record.epoch,record.sender_uin,"sender"),expectedRevision,structuredClone(record));
 }

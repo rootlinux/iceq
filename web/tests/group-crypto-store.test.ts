@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import "fake-indexeddb/auto";
 import { saveAuthenticatedGroupContent, saveGroupCryptoState, loadGroupCryptoState, pruneObsoleteGroupEpochs } from "../src/lib/groupCryptoStore";
-import { authenticatedGroupMessageFields, hydrateSenderKeyInbox, GROUP_CONTENT_KIND, GROUP_DISTRIBUTION_KIND, openGroupContent, processDirectControlMessage, sealGroupContent } from "../src/lib/groupCrypto";
+import { authenticatedGroupMessageFields, ensureGroupSenderCAS, hydrateSenderKeyInbox, GROUP_CONTENT_KIND, GROUP_DISTRIBUTION_KIND, openGroupContent, processDirectControlMessage, sealGroupContent, sealGroupContentCAS } from "../src/lib/groupCrypto";
 import { createReceiverState, createSenderState, encryptGroupMessage } from "../src/lib/senderKeys";
 import { getGroupCryptoRecord } from "../src/lib/indexeddb";
 
@@ -134,4 +134,29 @@ test("concurrent group seals reserve distinct sender iterations",async()=>{
   await saveGroupCryptoState({version:1,kind:"sender",group_id:"concurrent-seal",epoch:1,sender_uin:7,updated_at:1,state:{sender:made.state,distributed_to:[],revision:0}});
   const [a,b]=await Promise.all([sealGroupContent(made.state,{kind:GROUP_CONTENT_KIND,content_type:"text",text:"a"}),sealGroupContent(made.state,{kind:GROUP_CONTENT_KIND,content_type:"text",text:"b"})]);
   assert.deepEqual([a.iteration,b.iteration].sort((x,y)=>x-y),[0,1]);
+});
+
+test("IDB CAS alone serializes simultaneous missing-state creation across realms",async()=>{
+  const a=await createSenderState("cas-create",1,7);const b=await createSenderState("cas-create",1,7);
+  const content={kind:GROUP_CONTENT_KIND,content_type:"text" as const,text:"race"};
+  const [one,two]=await Promise.all([sealGroupContentCAS(a.state,content),sealGroupContentCAS(b.state,content)]);
+  assert.equal(one.distribution_id,two.distribution_id);assert.deepEqual([one.iteration,two.iteration].sort((x,y)=>x-y),[0,1]);
+  const stored=await loadGroupCryptoState("cas-create",1,7,"sender");const local=stored?.state as {revision:number;sender:{iteration:number}};assert.equal(local.revision,2);assert.equal(local.sender.iteration,2);
+});
+
+test("ensure reservation cannot stale-overwrite a concurrent CAS seal",async()=>{
+  const made=await createSenderState("ensure-seal-race",1,7);await saveGroupCryptoState({version:1,kind:"sender",group_id:"ensure-seal-race",epoch:1,sender_uin:7,updated_at:1,state:{sender:made.state,distributed_to:[],revision:0}});
+  let release!:()=>void;const blocked=new Promise<void>(resolve=>{release=resolve;});let reserved!:()=>void;const reservationReached=new Promise<void>(resolve=>{reserved=resolve;});
+  const ensuring=ensureGroupSenderCAS("ensure-seal-race",1,7,[7,9],async()=>{reserved();await blocked;});await reservationReached;
+  const envelope=await sealGroupContentCAS(made.state,{kind:GROUP_CONTENT_KIND,content_type:"text",text:"during ensure"});release();await ensuring;
+  const stored=await loadGroupCryptoState("ensure-seal-race",1,7,"sender");const local=stored?.state as {revision:number;distributed_to:number[];sender:{iteration:number}};
+  assert.equal(envelope.iteration,0);assert.equal(local.revision,2);assert.equal(local.sender.iteration,1);assert.deepEqual(local.distributed_to,[9]);
+});
+
+test("history binds signed inner epoch to stored outer epoch and fails legacy rows closed",async()=>{
+  const old=await createSenderState("history-epoch-bound",2,9);await saveGroupCryptoState({version:1,kind:"receiver",group_id:"history-epoch-bound",epoch:2,sender_uin:9,created_at:Date.now(),updated_at:Date.now(),state:createReceiverState(old.distribution)});
+  const encrypted=await encryptGroupMessage(old.state,new TextEncoder().encode(JSON.stringify({kind:GROUP_CONTENT_KIND,content_type:"text",text:"authentic old"})));
+  await assert.rejects(()=>openGroupContent(encrypted.envelope,3,[7,9],true,Date.now(),{group_id:"history-epoch-bound",sender_uin:9,epoch:3}),/routing context/);
+  await assert.rejects(()=>openGroupContent(encrypted.envelope,3,[7,9],true,Date.now(),{group_id:"history-epoch-bound",sender_uin:9,epoch:0}),/routing context/);
+  assert.equal((await openGroupContent(encrypted.envelope,3,[7,9],true,Date.now(),{group_id:"history-epoch-bound",sender_uin:9,epoch:2})).text,"authentic old");
 });

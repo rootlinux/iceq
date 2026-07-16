@@ -19,6 +19,7 @@ export interface HistoryMessage {
   conversation_id: string;
   sender_uin: number;
   receiver_uin: number;
+  crypto_epoch?: number;
   content_type: "text" | "image" | "file";
   file_url?: string;
   // ISO 8601 timestamp. Server-assigned.
