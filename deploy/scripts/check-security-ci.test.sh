@@ -11,6 +11,8 @@ grep -Fq 'trap ' "$compose_check"
 grep -Fq -- '--env-file "$temp_env"' "$compose_check"
 ! grep -Fq 'cp deploy/.env.example deploy/.env.local' "$workflow"
 grep -Fq './deploy/scripts/check-compose-config.sh' "$workflow"
+grep -Fq './deploy/scripts/check-compose-config.test.sh' "$workflow"
+grep -Fq './deploy/scripts/check-security-ci.test.sh' "$workflow"
 
 ! grep -Fq 'gitleaks/gitleaks-action@' "$workflow"
 grep -Fq 'GITLEAKS_VERSION: 8.24.3' "$workflow"

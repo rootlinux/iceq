@@ -72,7 +72,7 @@ services:
     restart: unless-stopped
     networks: [iceq-net]
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     environment:
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
@@ -288,7 +288,7 @@ services:
     restart: unless-stopped
     networks: [iceq-net]
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     environment:
       MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_URL:-http://localhost:9001}
     volumes:
@@ -323,7 +323,7 @@ services:
       minio:
         condition: service_healthy
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     environment:
       MC_HOST_iceq: "http://${MINIO_ROOT_USER:-minio}:${MINIO_ROOT_PASSWORD:-changeme}@minio:9000"
       # mc needs a writable config dir; default ~/.mc fails on read_only FS.
@@ -366,7 +366,7 @@ services:
     restart: unless-stopped
     networks: [iceq-net]
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     ports:
       - "443:443"
       - "443:443/udp"
@@ -498,7 +498,7 @@ services:
     restart: unless-stopped
     networks: [iceq-net]
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     environment:
       # ICEQ_PG_DSN, ICEQ_ALLOWED_ORIGINS, ICEQ_JWT_SECRET are
       # all loaded from env_file. The previous shell-variable
@@ -540,7 +540,7 @@ services:
     restart: unless-stopped
     networks: [iceq-net]
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     environment:
       ICEQ_REDIS_ADDR: redis:6379
       PORT: 8081
@@ -573,7 +573,7 @@ services:
     restart: unless-stopped
     networks: [iceq-net]
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     environment:
       ICEQ_REDIS_ADDR: redis:6379
       ICEQ_NATS_URL: nats://nats:4222
@@ -609,7 +609,7 @@ services:
     restart: unless-stopped
     networks: [iceq-net]
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     environment:
       ICEQ_NATS_URL: nats://nats:4222
       ICEQ_REDIS_ADDR: redis:6379
@@ -645,7 +645,7 @@ services:
     restart: unless-stopped
     networks: [iceq-net]
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     environment:
       ICEQ_NATS_URL: nats://nats:4222
       ICEQ_SCYLLA_HOSTS: scylla:9042
@@ -687,7 +687,7 @@ services:
     restart: unless-stopped
     networks: [iceq-net]
     env_file:
-      - .env.local
+      - ${ICEQ_ENV_FILE:-.env.local}
     environment:
       ICEQ_MINIO_ENDPOINT: minio:9000
       ICEQ_MINIO_USE_SSL: "false"

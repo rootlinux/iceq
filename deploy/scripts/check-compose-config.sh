@@ -1,22 +1,26 @@
 #!/bin/sh
 set -eu
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+root=${ICEQ_PROJECT_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}
 temp_env=$(mktemp "${TMPDIR:-/tmp}/iceq-compose-env.XXXXXX")
-created_local_env=0
+child_pid=
 
 cleanup() {
-  if [ "$created_local_env" -eq 1 ]; then
-    rm -f -- "$root/deploy/.env.local"
+  if [ -n "$child_pid" ]; then
+    kill "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
   fi
   rm -f -- "$temp_env"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cp -- "$root/deploy/.env.example" "$temp_env"
-if [ ! -e "$root/deploy/.env.local" ]; then
-  ln -s -- "$temp_env" "$root/deploy/.env.local"
-  created_local_env=1
-fi
-
-docker compose --env-file "$temp_env" -f "$root/deploy/docker-compose.yml" config --quiet
+ICEQ_ENV_FILE="$temp_env" docker compose --env-file "$temp_env" -f "$root/deploy/docker-compose.yml" config --quiet &
+child_pid=$!
+wait "$child_pid"
+status=$?
+child_pid=
+exit "$status"

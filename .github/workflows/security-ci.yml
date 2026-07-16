@@ -74,6 +74,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Test security CI and Compose checker contracts
+        run: |
+          ./deploy/scripts/check-security-ci.test.sh
+          ./deploy/scripts/check-compose-config.test.sh
       - name: Scan repository for secrets
         env:
           GITLEAKS_VERSION: 8.24.3
