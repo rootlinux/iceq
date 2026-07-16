@@ -150,7 +150,30 @@ test("ensure reservation cannot stale-overwrite a concurrent CAS seal",async()=>
   const ensuring=ensureGroupSenderCAS("ensure-seal-race",1,7,[7,9],async()=>{reserved();await blocked;});await reservationReached;
   const envelope=await sealGroupContentCAS(made.state,{kind:GROUP_CONTENT_KIND,content_type:"text",text:"during ensure"});release();await ensuring;
   const stored=await loadGroupCryptoState("ensure-seal-race",1,7,"sender");const local=stored?.state as {revision:number;distributed_to:number[];sender:{iteration:number}};
-  assert.equal(envelope.iteration,0);assert.equal(local.revision,2);assert.equal(local.sender.iteration,1);assert.deepEqual(local.distributed_to,[9]);
+  assert.equal(envelope.iteration,0);assert.equal(local.revision,3);assert.equal(local.sender.iteration,1);assert.deepEqual(local.distributed_to,[9]);
+});
+
+test("contending ensure waits for durable delivery completion before content may send",async()=>{
+  const made=await createSenderState("delivery-wait",1,7);await saveGroupCryptoState({version:1,kind:"sender",group_id:"delivery-wait",epoch:1,sender_uin:7,updated_at:1,state:{sender:made.state,distributed_to:[],revision:0}});
+  let entered!:()=>void;const callbackEntered=new Promise<void>(resolve=>{entered=resolve;});let release!:()=>void;const blocked=new Promise<void>(resolve=>{release=resolve;});
+  const first=ensureGroupSenderCAS("delivery-wait",1,7,[7,9],async()=>{entered();await blocked;},{now:()=>0,leaseMs:10_000});await callbackEntered;
+  let secondResolved=false;const second=ensureGroupSenderCAS("delivery-wait",1,7,[7,9],async()=>{throw new Error("must not duplicate");},{now:()=>0,leaseMs:10_000,sleep:async()=>{await new Promise(resolve=>setTimeout(resolve,0));}}).then(()=>{secondResolved=true;});
+  await new Promise(resolve=>setTimeout(resolve,5));assert.equal(secondResolved,false);release();await Promise.all([first,second]);assert.equal(secondResolved,true);
+});
+
+test("failed delivery clears pending state and a later ensure recovers",async()=>{
+  const made=await createSenderState("delivery-fail",1,7);await saveGroupCryptoState({version:1,kind:"sender",group_id:"delivery-fail",epoch:1,sender_uin:7,updated_at:1,state:{sender:made.state,distributed_to:[],revision:0}});const ids:string[]=[];
+  await assert.rejects(()=>ensureGroupSenderCAS("delivery-fail",1,7,[7,9],async(_,__,d)=>{ids.push(d.distribution_id);throw new Error("offline");}),/offline/);
+  await ensureGroupSenderCAS("delivery-fail",1,7,[7,9],async(_,__,d)=>{ids.push(d.distribution_id);});assert.equal(ids.length,2);assert.equal(ids[0],ids[1]);
+});
+
+test("expired pending lease is stolen with the same immutable distribution payload",async()=>{
+  const made=await createSenderState("delivery-crash",1,7);await saveGroupCryptoState({version:1,kind:"sender",group_id:"delivery-crash",epoch:1,sender_uin:7,updated_at:1,state:{sender:made.state,distributed_to:[],revision:0}});let now=0;const ids:string[]=[];
+  let entered!:()=>void;const callbackEntered=new Promise<void>(resolve=>{entered=resolve;});let release!:()=>void;const crashed=new Promise<void>(resolve=>{release=resolve;});
+  const first=ensureGroupSenderCAS("delivery-crash",1,7,[7,9],async(_,__,d)=>{ids.push(d.distribution_id);entered();await crashed;},{now:()=>now,leaseMs:100,token:()=>"owner-a"});await callbackEntered;now=101;
+  await ensureGroupSenderCAS("delivery-crash",1,7,[7,9],async(_,__,d)=>{ids.push(d.distribution_id);},{now:()=>now,leaseMs:100,token:()=>"owner-b"});release();await first;
+  assert.deepEqual(ids,[made.distribution.distribution_id,made.distribution.distribution_id]);
+  let duplicates=0;await ensureGroupSenderCAS("delivery-crash",1,7,[7,9],async()=>{duplicates++;},{now:()=>now});assert.equal(duplicates,0);
 });
 
 test("history binds signed inner epoch to stored outer epoch and fails legacy rows closed",async()=>{

@@ -7,7 +7,9 @@ export const GROUP_CONTENT_KIND = "iceq.group-content.v1";
 export interface GroupContent { kind: typeof GROUP_CONTENT_KIND; content_type:"text"|"image"|"file"; text?:string; attachment?:unknown }
 export interface ExpectedGroupRouting { group_id:string; sender_uin:number; epoch?:number }
 export interface OpaqueSenderKeyInboxItem { epoch?:number; sender_uin:number; ciphertext:string; msg_type:"prekey_message"|"signal_message"; distribution_id?:string; retired_at?:string }
-interface LocalStored { sender: SenderState; distributed_to: number[]; revision?:number }
+type RecipientDelivery={status:"pending";token:string;lease_until:number;attempts:number;distribution:SenderKeyDistribution}|{status:"completed";completed_at:number;attempts:number;distribution:SenderKeyDistribution};
+interface LocalStored { sender: SenderState; distributed_to: number[]; deliveries?:Record<string,RecipientDelivery>; revision?:number }
+export interface SenderDeliveryOptions { now?:()=>number;sleep?:(ms:number)=>Promise<void>;leaseMs?:number;token?:()=>string }
 const localSenderQueues=new Map<string,Promise<void>>();
 async function withSenderLock<T>(key:string,operation:()=>Promise<T>):Promise<T>{
   if(typeof navigator!=="undefined"&&navigator.locks)return navigator.locks.request(`iceq:sender:${key}`,operation);
@@ -22,22 +24,29 @@ export async function ensureGroupSender(groupId:string,epoch:number,selfUin:numb
   return withSenderLock(`${groupId}:${epoch}:${selfUin}`,()=>ensureGroupSenderCAS(groupId,epoch,selfUin,memberUins,sendDistribution));
 }
 
-export async function ensureGroupSenderCAS(groupId:string,epoch:number,selfUin:number,memberUins:number[],sendDistribution:(uin:number, plaintext:Uint8Array, distribution:SenderKeyDistribution)=>Promise<void>):Promise<SenderState>{
+export async function ensureGroupSenderCAS(groupId:string,epoch:number,selfUin:number,memberUins:number[],sendDistribution:(uin:number, plaintext:Uint8Array, distribution:SenderKeyDistribution)=>Promise<void>,options:SenderDeliveryOptions={}):Promise<SenderState>{
+  const now=options.now??Date.now;const sleep=options.sleep??(ms=>new Promise(resolve=>setTimeout(resolve,ms)));const leaseMs=options.leaseMs??30_000;const tokenFactory=options.token??(()=>crypto.randomUUID());
   let stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");
   if(!stored){const made=await createSenderState(groupId,epoch,selfUin);const local:LocalStored={sender:made.state,distributed_to:[],revision:0};const record={version:1 as const,kind:"sender" as const,group_id:groupId,epoch,sender_uin:selfUin,updated_at:Date.now(),state:local};if(await compareAndSwapSenderState(record,null))stored=record;else stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");}
   if(!stored)throw new Error("sender state reservation failed");
   let local=stored.state as LocalStored;let distribution=stripPrivate(local.sender);
   if(!await loadGroupCryptoState(groupId,epoch,selfUin,"receiver",distribution.distribution_id))await saveGroupCryptoState({version:1,kind:"receiver",group_id:groupId,epoch,sender_uin:selfUin,updated_at:Date.now(),state:createReceiverState(distribution)});
-  for(const uin of [...new Set(memberUins)].filter(u=>u!==selfUin).sort((a,b)=>a-b)){
-    let reserved=false,alreadyDistributed=false;
-    for(let attempt=0;attempt<16;attempt++){stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");if(!stored)throw new Error("sender state disappeared");local=stored.state as LocalStored;if(local.distributed_to.includes(uin)){alreadyDistributed=true;break;}const revision=local.revision??0;const next:LocalStored={...local,distributed_to:[...local.distributed_to,uin],revision:revision+1};const record={...stored,updated_at:Date.now(),state:next};if(await compareAndSwapSenderState(record,revision)){local=next;distribution=stripPrivate(local.sender);reserved=true;break;}}
-    if(alreadyDistributed)continue;if(!reserved)throw new Error("sender distribution reservation changed concurrently");
-    try{await sendDistribution(uin,new TextEncoder().encode(JSON.stringify({kind:GROUP_DISTRIBUTION_KIND,distribution})),distribution);}catch(error){await releaseDistributionReservation(groupId,epoch,selfUin,uin);throw error;}
-  }
+  for(const uin of [...new Set(memberUins)].filter(u=>u!==selfUin).sort((a,b)=>a-b))await ensureRecipientDelivery(groupId,epoch,selfUin,uin,sendDistribution,{now,sleep,leaseMs,tokenFactory});
   const latest=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");if(!latest)throw new Error("sender state disappeared");return (latest.state as LocalStored).sender;
 }
-
-async function releaseDistributionReservation(groupId:string,epoch:number,selfUin:number,uin:number):Promise<void>{for(let attempt=0;attempt<8;attempt++){const stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");if(!stored)return;const local=stored.state as LocalStored;if(!local.distributed_to.includes(uin))return;const revision=local.revision??0;const next={...local,distributed_to:local.distributed_to.filter(value=>value!==uin),revision:revision+1};if(await compareAndSwapSenderState({...stored,updated_at:Date.now(),state:next},revision))return;}}
+async function ensureRecipientDelivery(groupId:string,epoch:number,selfUin:number,uin:number,sendDistribution:(uin:number,plaintext:Uint8Array,distribution:SenderKeyDistribution)=>Promise<void>,options:{now:()=>number;sleep:(ms:number)=>Promise<void>;leaseMs:number;tokenFactory:()=>string}):Promise<void>{
+  for(;;){
+    const stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");if(!stored)throw new Error("sender state disappeared");const local=stored.state as LocalStored;const key=String(uin);const delivery=local.deliveries?.[key];
+    if(delivery?.status==="completed"||(!delivery&&local.distributed_to.includes(uin)))return;
+    if(delivery?.status==="pending"&&delivery.lease_until>options.now()){await options.sleep(Math.min(50,Math.max(1,delivery.lease_until-options.now())));continue;}
+    const token=options.tokenFactory();const revision=local.revision??0;const immutableDistribution=delivery?.distribution??stripPrivate(local.sender);const pending:RecipientDelivery={status:"pending",token,lease_until:options.now()+options.leaseMs,attempts:(delivery?.attempts??0)+1,distribution:immutableDistribution};const next:LocalStored={...local,deliveries:{...(local.deliveries??{}),[key]:pending},revision:revision+1};
+    if(!await compareAndSwapSenderState({...stored,updated_at:options.now(),state:next},revision))continue;
+    try{await sendDistribution(uin,new TextEncoder().encode(JSON.stringify({kind:GROUP_DISTRIBUTION_KIND,distribution:immutableDistribution})),immutableDistribution);}catch(error){await clearFailedDelivery(groupId,epoch,selfUin,uin,token,options.now);throw error;}
+    await completeRecipientDelivery(groupId,epoch,selfUin,uin,token,options.now);return;
+  }
+}
+async function clearFailedDelivery(groupId:string,epoch:number,selfUin:number,uin:number,token:string,now:()=>number):Promise<void>{for(let attempt=0;attempt<16;attempt++){const stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");if(!stored)return;const local=stored.state as LocalStored;const delivery=local.deliveries?.[String(uin)];if(delivery?.status!=="pending"||delivery.token!==token)return;const deliveries={...(local.deliveries??{})};delete deliveries[String(uin)];const revision=local.revision??0;if(await compareAndSwapSenderState({...stored,updated_at:now(),state:{...local,deliveries,revision:revision+1}},revision))return;}}
+async function completeRecipientDelivery(groupId:string,epoch:number,selfUin:number,uin:number,token:string,now:()=>number):Promise<void>{for(;;){const stored=await loadGroupCryptoState(groupId,epoch,selfUin,"sender");if(!stored)throw new Error("sender state disappeared");const local=stored.state as LocalStored;const delivery=local.deliveries?.[String(uin)];if(delivery?.status==="completed")return;if(delivery?.status!=="pending"||delivery.token!==token){await new Promise(resolve=>setTimeout(resolve,1));continue;}const revision=local.revision??0;const completed:RecipientDelivery={status:"completed",completed_at:now(),attempts:delivery.attempts,distribution:delivery.distribution};const next={...local,distributed_to:[...new Set([...local.distributed_to,uin])],deliveries:{...(local.deliveries??{}),[String(uin)]:completed},revision:revision+1};if(await compareAndSwapSenderState({...stored,updated_at:now(),state:next},revision))return;}}
 
 export async function sealGroupContent(state:SenderState,content:GroupContent):Promise<SenderKeyCiphertext> {
   const lockKey=`${state.group_id}:${state.epoch}:${state.sender_uin}`;
@@ -56,6 +65,7 @@ export async function installSenderDistribution(senderUin:number,value:unknown,c
   if(!isObj(value)||value.kind!==GROUP_DISTRIBUTION_KIND||!isObj(value.distribution))return false;
   const d=value.distribution as unknown as SenderKeyDistribution;
   if(d.sender_uin!==senderUin||d.epoch!==currentEpoch||!currentMembers.includes(senderUin))throw new Error("unauthorized sender-key distribution");
+  if(await loadGroupCryptoState(d.group_id,d.epoch,d.sender_uin,"receiver",d.distribution_id))return true;
   const receiver=createReceiverState(d);
   await saveGroupCryptoState({version:1,kind:"receiver",group_id:d.group_id,epoch:d.epoch,sender_uin:d.sender_uin,updated_at:Date.now(),state:receiver}); return true;
 }
