@@ -75,7 +75,7 @@ export interface UseWebSocketResult {
   connected: boolean;
   lastEnvelope: Envelope | null;
   // Poll fallback feeds the exact same authenticated envelope dispatch path.
-  consumeExternal: (envelope: Envelope) => boolean;
+  consumeExternal: (envelope: Envelope) => Promise<boolean>;
 }
 
 // ----------------------------------------------------------------------------
@@ -171,7 +171,9 @@ export function useWebSocket(): UseWebSocketResult {
         if (__DEV__) console.warn("[ws] parse error:", result.error);
         return;
       }
-      consumeEnvelope(result.envelope, ws);
+      void consumeEnvelope(result.envelope, ws).catch((error) => {
+        if (__DEV__) console.error("[ws] envelope processing failed", error);
+      });
     };
 
     ws.onerror = () => {
@@ -438,7 +440,7 @@ export function useWebSocket(): UseWebSocketResult {
 
   dispatchRef.current = dispatch;
 
-  const consumeExternal = useCallback((env: Envelope): boolean => {
+  const consumeExternal = useCallback(async (env: Envelope): Promise<boolean> => {
 	// Poll JSON is untrusted network input too. Re-serialize it through the
 	// exact parser used by WebSocket frames before dispatching callbacks.
 	const parsed = parseEnvelope(JSON.stringify(env));
@@ -448,20 +450,22 @@ export function useWebSocket(): UseWebSocketResult {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function consumeEnvelope(env: Envelope, ws: WebSocket | null): boolean {
+  async function consumeEnvelope(env: Envelope, ws: WebSocket | null): Promise<boolean> {
     if (env.type === "message" || env.type === "group_msg") {
       if (inflightPersistentIDsRef.current.has(env.id)) return false;
       inflightPersistentIDsRef.current.add(env.id);
       const seconds = Number((env.payload as { expires_in_seconds?: number } | null)?.expires_in_seconds ?? 0);
       const expiresAt = Number.isFinite(seconds) && seconds > 0 ? env.ts + seconds * 1000 : undefined;
-      void claimTransportEnvelopeID(env.id, expiresAt).then(async (claimed) => {
+      try {
+        const claimed = await claimTransportEnvelopeID(env.id, expiresAt);
 		if (!claimed) {
 		  // A committed duplicate means a prior transport ACK may have been
 		  // lost. Re-ACK it, but never ACK another tab's active processing lease.
-		  if (ws && await isTransportEnvelopeCommitted(env.id)) {
+		  const committed = await isTransportEnvelopeCommitted(env.id);
+		  if (ws && committed) {
 			safeSend(ws, {type: "transport_ack", id: crypto.randomUUID(), ts: Date.now(), payload: {message_ids: [env.id]}});
 		  }
-		  return;
+		  return committed;
 		}
         try {
           setLastEnvelope(env);
@@ -470,14 +474,15 @@ export function useWebSocket(): UseWebSocketResult {
 		  if (ws) {
 			safeSend(ws, {type: "transport_ack", id: crypto.randomUUID(), ts: Date.now(), payload: {message_ids: [env.id]}});
 		  }
+		  return true;
         } catch (error) {
           await releaseTransportEnvelopeID(env.id);
           if (__DEV__) console.error("[ws] persistent dispatch failed", error);
+		  throw error;
         }
-      }).catch((error) => {
-        if (__DEV__) console.error("[ws] persistent dedupe unavailable", error);
-      }).finally(() => inflightPersistentIDsRef.current.delete(env.id));
-      return true;
+      } finally {
+        inflightPersistentIDsRef.current.delete(env.id);
+      }
     }
     if (seenEnvelopeIDsRef.current.has(env.id)) return false;
     seenEnvelopeIDsRef.current.add(env.id);
@@ -487,7 +492,7 @@ export function useWebSocket(): UseWebSocketResult {
       if (oldest) seenEnvelopeIDsRef.current.delete(oldest);
     }
     setLastEnvelope(env);
-    void dispatchRef.current(env, ws);
+    await dispatchRef.current(env, ws);
     return true;
   }
 

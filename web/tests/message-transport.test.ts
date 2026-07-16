@@ -22,7 +22,7 @@ test("transport lifecycle falls back for receive and send then promotes to WS an
 	const coordinator=new MessageTransportCoordinator({
 		poll:async(_cursor,signal)=>{pollSignal=signal;return new Promise(resolve=>{resolvePoll=resolve;});},
 		httpSend:async(env)=>{http.push(env.id);return {type:"ack",id:"ack",ts:2,payload:{}} as never;},
-		wsSend:(env)=>{ws.push(env.id);return true;},consume:(env)=>{consumed.push(env.id);},onSendFailure:()=>{},retryDelayMs:0,
+		wsSend:(env)=>{ws.push(env.id);return true;},consume:async(env)=>{consumed.push(env.id);return true;},onSendFailure:()=>{},retryDelayMs:0,
 	});
 	coordinator.setConnected(false);await Promise.resolve();assert.equal(pollSignal?.aborted,false);
 	coordinator.send({type:"message",id:"fallback",ts:1,payload:{}} as never);await Promise.resolve();await Promise.resolve();assert.deepEqual(http,["fallback"]);assert.deepEqual(consumed,["ack"]);
@@ -46,11 +46,11 @@ test("lost advanced poll response resets an invalid cursor and recovers cursorle
   };
   coordinator = new MessageTransportCoordinator({
     poll: poll as never, httpSend: async()=>page1, wsSend:()=>false,
-	consume: (env) => { if (env.id === page2.id) coordinator.setConnected(true); void (async () => {
-	  if (!await claimTransportEnvelopeID(env.id)) return;
+	consume: async (env) => { if (env.id === page2.id) coordinator.setConnected(true);
+	  if (!await claimTransportEnvelopeID(env.id)) return isTransportEnvelopeCommitted(env.id);
 	  delivered.push(env.id);
 	  await commitTransportEnvelopeID(env.id);
-	})(); },
+	  return true; },
     onSendFailure:()=>{}, retryDelayMs:0,
   });
   coordinator.setConnected(false);
@@ -59,8 +59,48 @@ test("lost advanced poll response resets an invalid cursor and recovers cursorle
   assert.deepEqual(delivered, [page1.id, page2.id]);
 });
 
+test("poll cursor never authorizes server ACK before every page item durably commits", async () => {
+  const calls: Array<string | null> = [];
+  let releaseCommit!: (value: boolean) => void;
+  const durableCommit = new Promise<boolean>((resolve) => { releaseCommit = resolve; });
+  let coordinator!: MessageTransportCoordinator;
+  coordinator = new MessageTransportCoordinator({
+	poll: async (cursor) => {
+	  calls.push(cursor);
+	  if (calls.length === 1) return {cursor:"ack-token", envelopes:[{type:"message",id:"crash-window",ts:1,payload:{}} as never]};
+	  coordinator.setConnected(true);
+	  return new Promise(()=>{});
+	},
+	httpSend: async()=>({} as never), wsSend:()=>false,
+	consume: async()=>durableCommit, onSendFailure:()=>{}, retryDelayMs:0,
+  });
+  coordinator.setConnected(false);
+  await new Promise((resolve)=>setTimeout(resolve, 5));
+  assert.deepEqual(calls, [null], "next poll would ACK before IndexedDB commit");
+  releaseCommit(true);
+  for (let i=0; i<20 && calls.length<2; i++) await new Promise((resolve)=>setTimeout(resolve, 1));
+  assert.deepEqual(calls, [null, "ack-token"]);
+});
+
+test("failed durable page item retains predecessor cursor and retries without ACK", async () => {
+  const calls: Array<string | null> = [];
+  let coordinator!: MessageTransportCoordinator;
+  coordinator = new MessageTransportCoordinator({
+	poll: async (cursor) => {
+	  calls.push(cursor);
+	  if (calls.length === 1) return {cursor:"must-not-ack", envelopes:[{type:"message",id:"failed-item",ts:1,payload:{}} as never]};
+	  coordinator.setConnected(true);
+	  return new Promise(()=>{});
+	},
+	httpSend: async()=>({} as never), wsSend:()=>false, consume:async()=>false, onSendFailure:()=>{}, retryDelayMs:0,
+  });
+  coordinator.setConnected(false);
+  for (let i=0; i<20 && calls.length<2; i++) await new Promise((resolve)=>setTimeout(resolve, 1));
+  assert.deepEqual(calls, [null, null]);
+});
+
 test("transport logout aborts active poll and HTTP failure enters safe retry state",async()=>{
-	let signal:AbortSignal|undefined;let failed="";const coordinator=new MessageTransportCoordinator({poll:async(_c,s)=>{signal=s;return new Promise(()=>{});},httpSend:async()=>{throw new Error("down")},wsSend:()=>false,consume:()=>{},onSendFailure:(env)=>{failed=env.id},retryDelayMs:0});
+	let signal:AbortSignal|undefined;let failed="";const coordinator=new MessageTransportCoordinator({poll:async(_c,s)=>{signal=s;return new Promise(()=>{});},httpSend:async()=>{throw new Error("down")},wsSend:()=>false,consume:async()=>true,onSendFailure:(env)=>{failed=env.id},retryDelayMs:0});
 	coordinator.setConnected(false);await Promise.resolve();coordinator.send({type:"message",id:"retry",ts:1,payload:{}} as never);await Promise.resolve();await Promise.resolve();assert.equal(failed,"retry");coordinator.stop();assert.equal(signal?.aborted,true);
 });
 

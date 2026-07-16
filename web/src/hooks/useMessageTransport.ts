@@ -40,7 +40,7 @@ interface CoordinatorDeps {
   poll: typeof pollEnvelopes;
   httpSend: typeof sendEnvelopeHTTP;
   wsSend: (envelope: Envelope) => boolean;
-  consume: (envelope: Envelope) => void;
+  consume: (envelope: Envelope) => Promise<boolean>;
   onSendFailure: (envelope: Envelope) => void;
   retryDelayMs?: number;
 }
@@ -59,7 +59,7 @@ export class MessageTransportCoordinator {
   }
   send(envelope: Envelope): boolean {
     if (this.connected && this.deps.wsSend(envelope)) return true;
-    void this.deps.httpSend(envelope).then((ack) => this.deps.consume(ack)).catch(() => this.deps.onSendFailure(envelope));
+    void this.deps.httpSend(envelope).then(async (ack) => { await this.deps.consume(ack); }).catch(() => this.deps.onSendFailure(envelope));
     return true;
   }
   stop(): void { this.connected = true; this.stopPolling(); }
@@ -72,7 +72,12 @@ export class MessageTransportCoordinator {
         try {
           const page = await this.deps.poll(this.cursor, controller.signal);
           if (controller.signal.aborted || this.connected || generation !== this.generation) return;
-          this.cursor = page.cursor; for (const envelope of page.envelopes) this.deps.consume(envelope);
+          for (const envelope of page.envelopes) {
+            if (!await this.deps.consume(envelope)) throw new Error("durable envelope processing incomplete");
+          }
+          // Advancing this cursor authorizes the next request to ACK/delete the
+          // whole page server-side, so it must follow every durable local commit.
+          this.cursor = page.cursor;
         } catch (error) {
           if (controller.signal.aborted || (error as { name?: string }).name === "AbortError") return;
 		  if (isInvalidPollCursor(error)) {
@@ -96,7 +101,7 @@ export function useMessageTransport(): UseWebSocketResult {
     coordinatorRef.current = new MessageTransportCoordinator({
       poll: pollEnvelopes, httpSend: sendEnvelopeHTTP,
       wsSend: (envelope) => wsRef.current.send(envelope),
-      consume: (envelope) => { wsRef.current.consumeExternal(envelope); },
+      consume: (envelope) => wsRef.current.consumeExternal(envelope),
       onSendFailure: (envelope) => useChatStore.setState((state) => ({ messagesByConversation: markEnvelopeRetryable(state.messagesByConversation, envelope) })),
     });
   }
