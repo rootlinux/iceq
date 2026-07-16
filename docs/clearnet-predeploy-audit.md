@@ -1,6 +1,6 @@
 # Clearnet Pre-deployment Security Audit
 
-Audit date: 2026-07-16  
+Audit date: 2026-07-16
 Scope: Phase 1-2 repository claims through `2d072d1`; local source, unit tests,
 build, dependency audit, migrations, and Compose rendering only. No VPS access,
 deployment, public smoke mutation, or Tor implementation was performed.
@@ -38,13 +38,36 @@ that the public deployment behaves identically.
 
 ## Commit inventory
 
-The audited security chain is `0665447` (session/CSRF/prekey/WS baseline),
-`952ad45`, `7e4b67e`, `1741700` (panic wipe, indexes, durable marker), `f314dc8`,
-`c1382b8`, `45657a4`, `87cf46a`, `3d7ea61`, `60d29f1`, `3f36617`, `980161a`
-(authorization, presence, file grants, and rate limits), `5ee3065` (atomic
-refresh), and `4ce64cb` plus `2d072d1` (ack-bound cleanup and retry recovery).
-Intermediate test/document-only commits were reviewed through the resulting
-tree rather than treated as independent security claims.
+Every commit from the Phase 1 baseline through the Phase 2 head is mapped below;
+test- and documentation-only commits are included because they establish or
+correct the executable-evidence contract.
+
+| Commit | Claim / evidence contribution |
+|---|---|
+| `0665447` | Hardened sessions, CSRF, prekey bootstrap, panic-wipe baseline, and authenticated WS routing. |
+| `952ad45` | Wired auth-service panic wipe to bounded Scylla ciphertext cleanup. |
+| `7e4b67e` | Added exact Scylla deletion indexes, logged-batch maintenance, migration 004, and cleanup contract tests. |
+| `1741700` | Added durable `wiped_accounts` revocation, JWT/WS checks, and migration 005. |
+| `e19c735` | Documented the required existing-volume durable-revocation migration and fail-closed rollout contract. |
+| `59a8a3d` | Documented executable Scylla deletion-index verification for migration 004. |
+| `f314dc8` | Enforced authenticated ownership/actor scope, private anonymous limiter keys, file-owner registry, Caddy identity minimization, and the initial route audit. |
+| `c1382b8` | Restricted presence reads to self or accepted contacts with uniform unauthorized behavior. |
+| `45657a4` | Added owner-created encrypted-file grants, migration 007, recipient download authorization, and client grant wiring. |
+| `f162d0b` | Added explicit Redis-backed authenticated per-action limits across protected service routes and WS frames. |
+| `87cf46a` | Added authenticated rate limits to authorized presence reads. |
+| `55fb0d9` | Added two-user authorization behavior evidence for key, message, file, and auth actor boundaries. |
+| `dd20cd5` | Added contact and group row-level authorization behavior evidence. |
+| `3d7ea61` | Tightened migrations 006-007, delivery rollback wiring, Caddy log filtering, and evidence wording. |
+| `ab632c0` | Added a failing contract test requiring anonymous public-bundle limiting. |
+| `60d29f1` | Closed remaining contact, group, and file object-authorization test cases and clarified migration rollout. |
+| `3f36617` | Implemented rotating-HMAC Redis limiting before public bundle/OPK consumption. |
+| `980161a` | Added verified-UIN Redis limiting to refresh rotation with behavioral tests. |
+| `097871c` | Aligned refresh limiter behavior and route-audit claims with implementation evidence. |
+| `1a99070` | Reconciled route matrix PASS wording with behavioral versus source-review-only evidence. |
+| `9efb5f6` | Added the concurrent refresh-token reuse regression reproducer. |
+| `4ce64cb` | Bound attachment grants to positive message acknowledgments and failure cleanup in the web client. |
+| `5ee3065` | Atomically consumed refresh rows before replacement-token issuance, making concurrent reuse single-winner. |
+| `2d072d1` | Added bounded grant-revocation retry, exhaustion recovery, idempotence, and ACK-race compensation. |
 
 ## Fresh local verification
 
