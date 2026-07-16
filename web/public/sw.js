@@ -1,15 +1,10 @@
 // Static-only service worker. Authenticated traffic and navigations always use the network.
-const CACHE_NAME = "iceq-static-v2";
-const STATIC_ASSETS = new Set([
-  "/manifest.json",
-  "/icons/icon-192.png",
-  "/icons/icon-512.png",
-  "/icons/apple-touch-icon.png",
-]);
+const CACHE_NAME = "iceq-static-v3";
+const HASHED_ASSET = /^\/assets\/[a-zA-Z0-9_-]+-[a-zA-Z0-9_-]{8,}\.(js|css)$/;
 const SENSITIVE_PREFIXES = ["/api", "/ws", "/auth", "/upload", "/download"];
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll([...STATIC_ASSETS])));
+  event.waitUntil(caches.open(CACHE_NAME));
   self.skipWaiting();
 });
 
@@ -29,9 +24,16 @@ self.addEventListener("fetch", (event) => {
     request.credentials === "include" ||
     request.headers.has("authorization") ||
     SENSITIVE_PREFIXES.some((prefix) => url.pathname === prefix || url.pathname.startsWith(`${prefix}/`)) ||
-    !STATIC_ASSETS.has(url.pathname)
+    url.search !== "" ||
+    !HASHED_ASSET.test(url.pathname)
   ) return;
-  event.respondWith(caches.open(CACHE_NAME).then(async (cache) => (await cache.match(request)) ?? fetch(request)));
+  event.respondWith(caches.open(CACHE_NAME).then(async (cache) => {
+    const cached = await cache.match(request);
+    if (cached) return cached;
+    const response = await fetch(request);
+    if (response.ok) await cache.put(request, response.clone());
+    return response;
+  }));
 });
 
 self.addEventListener("push", (event) => {
