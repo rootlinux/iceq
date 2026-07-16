@@ -68,12 +68,42 @@ func (w *countingDirectWriter) WriteDirect(context.Context, store.DurableDirectW
 type countingDelivery struct {
 	calls     int
 	failFirst bool
+	visible   int
+	seen      map[string]struct{}
 }
 
-func (d *countingDelivery) PublishDelivery(context.Context, string, []byte, string) error {
+type fixedOutboxReader struct{ entries []store.OutboxEntry }
+
+func (r fixedOutboxReader) FetchPending(context.Context, int) ([]store.OutboxEntry, error) {
+	return r.entries, nil
+}
+
+type blockFirstDelivery struct {
+	calls     int
+	completed []string
+}
+
+func (d *blockFirstDelivery) PublishDelivery(ctx context.Context, _ string, _ []byte, id string) error {
+	d.calls++
+	if d.calls == 1 {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	d.completed = append(d.completed, id)
+	return nil
+}
+
+func (d *countingDelivery) PublishDelivery(_ context.Context, _ string, _ []byte, id string) error {
 	d.calls++
 	if d.failFirst && d.calls == 1 {
 		return errors.New("jetstream unavailable")
+	}
+	if d.seen == nil {
+		d.seen = make(map[string]struct{})
+	}
+	if _, ok := d.seen[id]; !ok {
+		d.seen[id] = struct{}{}
+		d.visible++
 	}
 	return nil
 }
@@ -99,8 +129,8 @@ func TestDurableIngestReplayNeverStoresOrDeliversTwice(t *testing.T) {
 			t.Fatalf("ack=%+v err=%v", p, err)
 		}
 	}
-	if writer.writes != 1 || delivery.calls != 1 {
-		t.Fatalf("writes=%d visible deliveries=%d", writer.writes, delivery.calls)
+	if writer.writes != 1 || delivery.visible != 1 {
+		t.Fatalf("writes=%d attempts=%d visible deliveries=%d", writer.writes, delivery.calls, delivery.visible)
 	}
 }
 
@@ -115,12 +145,12 @@ func TestDurableOutboxRetriesAfterStoreThenDeliveryFailure(t *testing.T) {
 	if _, err := processDurableIngest(context.Background(), ingester, delivery, nil, directIngestBody(t)); err != nil {
 		t.Fatal(err)
 	}
-	if writer.writes != 1 || delivery.calls != 2 || backend.record.State != store.IngestDelivered {
+	if writer.writes != 1 || delivery.calls != 2 || backend.record.State != store.IngestStored {
 		t.Fatalf("writes=%d attempts=%d state=%s", writer.writes, delivery.calls, backend.record.State)
 	}
 }
 
-func TestRecoveredOutboxUsesStableMessageIDAndMarksDelivered(t *testing.T) {
+func TestRecoveredOutboxUsesStableMessageIDButWaitsForAcceptanceReceipt(t *testing.T) {
 	backend := &ingestMemoryBackend{}
 	writer := &countingDirectWriter{}
 	ingester := store.NewDurableIngestStore(backend, writer, time.Now, time.Second)
@@ -132,10 +162,42 @@ func TestRecoveredOutboxUsesStableMessageIDAndMarksDelivered(t *testing.T) {
 		CreatedAt: backend.record.CreatedAt, ReceiverUIN: backend.record.ReceiverUIN, Envelope: directIngestBody(t),
 	}
 	delivery := &countingDelivery{}
-	if err := deliverOutboxEntry(context.Background(), ingester, delivery, entry); err != nil {
+	if err := deliverOutboxEntry(context.Background(), delivery, entry); err != nil {
 		t.Fatal(err)
 	}
-	if delivery.calls != 1 || backend.record.State != store.IngestDelivered {
+	if delivery.calls != 1 || backend.record.State != store.IngestStored {
 		t.Fatalf("delivery calls=%d state=%s", delivery.calls, backend.record.State)
+	}
+}
+
+func TestDeliveryReceiptDeletesOutboxOnlyAfterDurableRecipientAcceptance(t *testing.T) {
+	backend := &ingestMemoryBackend{}
+	writer := &countingDirectWriter{}
+	ingester := store.NewDurableIngestStore(backend, writer, time.Now, time.Second)
+	if _, err := processDurableIngest(context.Background(), ingester, &countingDelivery{}, nil, directIngestBody(t)); err != nil {
+		t.Fatal(err)
+	}
+	if backend.record.State != store.IngestStored {
+		t.Fatalf("producer PubAck prematurely marked %s", backend.record.State)
+	}
+	receipt, _ := json.Marshal(deliveryAcceptedPayload{SenderUIN: 7, ClientID: "client-durable", MessageID: backend.record.MessageID.String()})
+	if err := processDeliveryAccepted(context.Background(), ingester, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if backend.record.State != store.IngestDelivered {
+		t.Fatalf("receipt did not mark delivered: %s", backend.record.State)
+	}
+}
+
+func TestBlockedOutboxPublishTimesOutWithoutStarvingLaterEntry(t *testing.T) {
+	first, second := gocql.TimeUUID(), gocql.TimeUUID()
+	reader := fixedOutboxReader{entries: []store.OutboxEntry{
+		{Kind: store.IngestKindDirect, MessageID: first, ReceiverUIN: 42, Envelope: directIngestBody(t)},
+		{Kind: store.IngestKindDirect, MessageID: second, ReceiverUIN: 42, Envelope: directIngestBody(t)},
+	}}
+	delivery := &blockFirstDelivery{}
+	drainPendingOutboxWithTimeout(context.Background(), reader, delivery, 10*time.Millisecond)
+	if delivery.calls != 2 || len(delivery.completed) != 1 || delivery.completed[0] != second.String() {
+		t.Fatalf("calls=%d completed=%v", delivery.calls, delivery.completed)
 	}
 }

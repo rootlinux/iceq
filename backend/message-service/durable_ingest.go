@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	durableIngestSubject = "ingest.message"
-	deliveryStreamName   = "ICEQ_DELIVERY"
+	durableIngestSubject    = "ingest.message"
+	deliveryAcceptedSubject = "delivery.accepted"
+	deliveryStreamName      = "ICEQ_DELIVERY"
 )
 
 type deliveryPublisher interface {
@@ -108,21 +109,13 @@ func processDurableIngest(ctx context.Context, ingester *store.DurableIngestStor
 			publishCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			publishErr := delivery.PublishDelivery(publishCtx, subject, body, result.MessageID.String())
 			cancel()
-			if publishErr == nil {
-				// The durable key is authenticated sender plus client id; recover
-				// sender from the receipt-independent envelope payload.
-				var sender struct {
-					SenderUIN int64 `json:"sender_uin"`
-				}
-				_ = json.Unmarshal(env.Payload, &sender)
-				_ = ingester.MarkDelivered(ctx, store.IngestKey{SenderUIN: sender.SenderUIN, ClientID: clientID}, result.MessageID)
-			}
+			_ = publishErr // PubAck means broker persistence, not recipient acceptance.
 		}
 	}
 	return models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{MessageID: clientID, State: models.AckStatePersisted, RecipientUIN: recipient})
 }
 
-func deliverOutboxEntry(ctx context.Context, ingester *store.DurableIngestStore, delivery deliveryPublisher, entry store.OutboxEntry) error {
+func deliverOutboxEntry(ctx context.Context, delivery deliveryPublisher, entry store.OutboxEntry) error {
 	var env models.Envelope
 	if err := json.Unmarshal(entry.Envelope, &env); err != nil {
 		return err
@@ -141,13 +134,14 @@ func deliverOutboxEntry(ctx context.Context, ingester *store.DurableIngestStore,
 	default:
 		return errors.New("unknown outbox message kind")
 	}
-	if err := delivery.PublishDelivery(ctx, subject, body, entry.MessageID.String()); err != nil {
-		return err
-	}
-	return ingester.MarkDelivered(ctx, entry.Key, entry.MessageID)
+	return delivery.PublishDelivery(ctx, subject, body, entry.MessageID.String())
 }
 
-func drainPendingOutbox(ctx context.Context, reader pendingOutboxReader, ingester *store.DurableIngestStore, delivery deliveryPublisher) {
+func drainPendingOutbox(ctx context.Context, reader pendingOutboxReader, delivery deliveryPublisher) {
+	drainPendingOutboxWithTimeout(ctx, reader, delivery, 3*time.Second)
+}
+
+func drainPendingOutboxWithTimeout(ctx context.Context, reader pendingOutboxReader, delivery deliveryPublisher, entryTimeout time.Duration) {
 	entries, err := reader.FetchPending(ctx, 100)
 	if err != nil {
 		return
@@ -156,12 +150,32 @@ func drainPendingOutbox(ctx context.Context, reader pendingOutboxReader, ingeste
 		if ctx.Err() != nil {
 			return
 		}
-		_ = deliverOutboxEntry(ctx, ingester, delivery, entry)
+		entryCtx, cancel := context.WithTimeout(ctx, entryTimeout)
+		_ = deliverOutboxEntry(entryCtx, delivery, entry)
+		cancel()
 	}
 }
 
-func runOutboxWorker(ctx context.Context, reader pendingOutboxReader, ingester *store.DurableIngestStore, delivery deliveryPublisher) {
-	drainPendingOutbox(ctx, reader, ingester, delivery)
+type deliveryAcceptedPayload struct {
+	SenderUIN int64  `json:"sender_uin"`
+	ClientID  string `json:"client_id"`
+	MessageID string `json:"message_id"`
+}
+
+func processDeliveryAccepted(ctx context.Context, ingester *store.DurableIngestStore, raw []byte) error {
+	var receipt deliveryAcceptedPayload
+	if err := json.Unmarshal(raw, &receipt); err != nil || receipt.SenderUIN <= 0 || receipt.ClientID == "" {
+		return errors.New("invalid delivery acceptance receipt")
+	}
+	id, err := gocql.ParseUUID(receipt.MessageID)
+	if err != nil {
+		return errors.New("invalid delivery acceptance message id")
+	}
+	return ingester.MarkDelivered(ctx, store.IngestKey{SenderUIN: receipt.SenderUIN, ClientID: receipt.ClientID}, id)
+}
+
+func runOutboxWorker(ctx context.Context, reader pendingOutboxReader, delivery deliveryPublisher) {
+	drainPendingOutbox(ctx, reader, delivery)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -169,7 +183,7 @@ func runOutboxWorker(ctx context.Context, reader pendingOutboxReader, ingester *
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			drainPendingOutbox(ctx, reader, ingester, delivery)
+			drainPendingOutbox(ctx, reader, delivery)
 		}
 	}
 }

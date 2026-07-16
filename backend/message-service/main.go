@@ -209,7 +209,7 @@ func main() {
 		log.Fatalf("nats subscribe: %v", err)
 	}
 	outboxCtx, stopOutbox := context.WithCancel(context.Background())
-	go runOutboxWorker(outboxCtx, durableWriter, durableStore, jetStreamDeliveryPublisher{js: js})
+	go runOutboxWorker(outboxCtx, durableWriter, jetStreamDeliveryPublisher{js: js})
 
 	// --- HTTP router ---------------------------------------------------
 	r := chi.NewRouter()
@@ -347,6 +347,17 @@ func startNATSSubscribers(bus *natsclient.Client, ms *store.MessageStore, pg *pg
 		}
 		body, _ := json.Marshal(ack)
 		_ = m.Respond(body)
+	}); err != nil {
+		return err
+	}
+	if _, err := bus.QueueSubscribe(deliveryAcceptedSubject, "message-delivery-receipts", func(m *nats.Msg) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := processDeliveryAccepted(ctx, durable, m.Data)
+		cancel()
+		if err != nil {
+			return
+		}
+		_ = m.Respond([]byte(`{"status":"accepted"}`))
 	}); err != nil {
 		return err
 	}

@@ -266,6 +266,22 @@ func (h *Hub) Send(ctx context.Context, uin int64, envelope []byte) error {
 	return nil
 }
 
+// SendLive notifies currently connected clients without mutating any offline
+// queue. Durable JetStream consumption first commits the envelope to the
+// recipient Redis stream atomically; this method is only the low-latency wakeup.
+func (h *Hub) SendLive(uin int64, envelope []byte) {
+	if uin <= 0 || len(envelope) == 0 {
+		return
+	}
+	raw, ok := h.clients.Load(uin)
+	if !ok {
+		return
+	}
+	for _, c := range raw.([]*client.Client) {
+		c.TrySend(envelope)
+	}
+}
+
 // ----------------------------------------------------------------------------
 // Broadcast. The fan-out primitive for group messages. Walks the
 // provided UIN list and Send's to each. Errors from individual

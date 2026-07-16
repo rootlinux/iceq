@@ -12,8 +12,9 @@ keep JetStream file storage healthy before accepting message traffic.
 2. Start NATS with `--jetstream` and a persistent `/data` volume.
 3. Start message-service. Startup fails closed unless the `ICEQ_DELIVERY`
    stream can be created or reconciled.
-4. Require `/health` to report both `nats: ok` and
-   `jetstream_delivery: ok` before enabling the gateway.
+4. Require message-service `/health` to report `jetstream_delivery: ok` and
+   ws-gateway `/health` to report `jetstream_consumer: ok` before enabling
+   traffic.
 
 ## Recovery behavior
 
@@ -22,21 +23,30 @@ keep JetStream file storage healthy before accepting message traffic.
 - The recovery worker scans 16 bounded outbox buckets and retries no more than
   100 pending direct/group deliveries per pass.
 - JetStream publishes carry the deterministic message ID as `Nats-Msg-Id` and
-  wait for PubAck. Only then is the Scylla receipt marked delivered and its
-  outbox row removed.
+  wait for PubAck, but PubAck never removes the Scylla outbox.
+- The durable `ICEQ_GATEWAY_DELIVERY` consumer atomically writes a scoped seen
+  marker and the envelope to `poll:stream:<uin>`. It then requests a
+  `delivery.accepted` receipt from message-service. Only that receipt marks the
+  Scylla record delivered and deletes the outbox; JetStream is explicitly
+  acknowledged last.
 - Do not delete pending outbox rows manually. Restore Scylla/NATS health and
   allow the worker to retry them.
 
 ## Exactly-once boundary
 
-Scylla and JetStream do not share a transaction. A process can crash after
-JetStream PubAck but before the delivered-state CAS. Re-publishing within the
-configured 24-hour JetStream duplicate window is suppressed. Recovery delayed
-beyond that window may create a second physical bus publish, so gateways and
-clients must retain stable message-ID deduplication. The deterministic Scylla
-primary key still prevents a second logical message row. This is a logical
-no-second-store/no-second-visible-delivery contract, not a physical Core NATS
-exactly-once claim.
+Scylla, JetStream, and Redis do not share a transaction. Their ordering is
+deliberately retry-safe: a crash before Redis acceptance leaves JetStream
+unacked; a crash after Redis acceptance replays into the scoped seen-marker
+no-op; a crash after the message-service receipt repeats an idempotent delivered
+CAS. The producer's 24-hour duplicate window reduces physical bus repeats, but
+recipient correctness does not depend on that window. The persistent recipient
+queue and stable message ID prevent a second visible queue item. This is a
+logical no-second-store/no-second-visible-delivery contract, not a claim that
+every underlying bus operation executes physically once.
 
 Disappearing messages apply their TTL to receipt, row, indexes, and outbox.
 Explicit `off` receipts and outbox rows are durable without an arbitrary TTL.
+The recovery worker continually refreshes broker availability for pending
+outbox rows, while accepted `off` messages make the recipient Redis stream
+persistent. Expiring acceptance markers use the message's remaining TTL and
+never shorten a stream that contains longer-lived or retention-off entries.

@@ -164,6 +164,16 @@ func main() {
 	// --- Hub -----------------------------------------------------------
 	h := hub.New(rdb)
 	pollStore := router.NewRedisPollStore(rdb)
+	acceptanceStore := router.NewRecipientAcceptanceStore(rdb)
+	js, err := nc.Conn().JetStream()
+	if err != nil {
+		log.Fatalf("jetstream context: %v", err)
+	}
+	deliveryCtx, stopDelivery := context.WithCancel(context.Background())
+	if err := startDeliveryConsumer(deliveryCtx, js, acceptanceStore, h, nc, pgGroupMemberLookup{pg: pgPool}); err != nil {
+		stopDelivery()
+		log.Fatalf("durable delivery consumer: %v", err)
+	}
 
 	// --- Shared client deps (passed to every WebSocket) ---------------
 	deps := client.Deps{
@@ -179,13 +189,6 @@ func main() {
 		FrameRateLimiter: middleware.NewAuthenticatedRateLimiter(middleware.AuthenticatedRateLimitConfig{
 			Redis: rdb, Action: "ws:frame", Limit: 30, Window: time.Minute, Timeout: 200 * time.Millisecond,
 		}),
-	}
-
-	// --- NATS subscribers. These run for the lifetime of the process
-	// and translate inbound bus messages into local-client writes
-	// (or undelivered-queue enqueues).
-	if err := startNATSSubscribers(nc, h, pgPool); err != nil {
-		log.Fatalf("nats subscribe: %v", err)
 	}
 
 	// --- HTTP server ---------------------------------------------------
@@ -214,7 +217,7 @@ func main() {
 		Ingester: nc, Groups: router.NewPGGroupSendAuthorizer(pgPool),
 	}).ServeHTTP)
 	// /health: standard 30 s timeout (short-lived probe).
-	r.With(chimw.Timeout(30*time.Second)).Get("/health", newHealthHandler(pgPool, rdb, nc, VERSION))
+	r.With(chimw.Timeout(30*time.Second)).Get("/health", newHealthHandler(pgPool, rdb, nc, js, VERSION))
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -265,6 +268,7 @@ func main() {
 	// connections are not part of the count.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
+	stopDelivery()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("[ws-gateway] graceful shutdown failed: %v", err)
 	}
@@ -394,7 +398,7 @@ func parseTailUIN(subject, prefix string) (int64, bool) {
 // is degraded.
 // ----------------------------------------------------------------------------
 
-func newHealthHandler(pg *pgxpool.Pool, rdb *redis.Client, nc *natsclient.Client, version string) http.HandlerFunc {
+func newHealthHandler(pg *pgxpool.Pool, rdb *redis.Client, nc *natsclient.Client, js nats.JetStreamContext, version string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -424,6 +428,15 @@ func newHealthHandler(pg *pgxpool.Pool, rdb *redis.Client, nc *natsclient.Client
 			allOK = false
 		} else {
 			deps["nats"] = "ok"
+		}
+		if js == nil {
+			deps["jetstream_consumer"] = "degraded"
+			allOK = false
+		} else if _, err := js.ConsumerInfo(deliveryStreamName, deliveryConsumerDurable, nats.Context(ctx)); err != nil {
+			deps["jetstream_consumer"] = "degraded"
+			allOK = false
+		} else {
+			deps["jetstream_consumer"] = "ok"
 		}
 		status := "ok"
 		code := http.StatusOK
