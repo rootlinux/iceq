@@ -112,13 +112,15 @@ Status: partial.
 Implemented:
 - Responsive dark UI exists.
 - WebSocket real-time chat exists.
+- Authenticated long-polling and HTTP send provide a bounded fallback when WebSocket transport is unavailable, and the client returns to WebSocket transport after recovery.
+- Presence, typing, delivered receipts, and read receipts are independently controlled by privacy settings; presence subscriptions are opt-in on the gateway.
+- Disappearing-message choices are enforced per message. Explicit `off` has no server-side expiry, while enabled durations are capped at 30 days.
 - Direct-message encrypted attachment upload/download is wired.
 - Panic-wipe settings UI exists.
 - Automatic direct-message one-time-prekey replenishment runs during authenticated app bootstrap.
 - Local decrypted chat state is kept in memory rather than persisted.
 
 Remaining:
-- Long-polling fallback for Tor-hostile WebSocket paths is not complete.
 - Full Turkish/English i18n is not complete.
 - QR-based safety verification is not complete.
 - Group attachments are not complete.
@@ -126,6 +128,7 @@ Remaining:
 
 Tradeoff:
 - The app remains JavaScript-first because Signal Protocol and IndexedDB key storage require client-side crypto. A no-JS fallback can only support limited account/help flows, not true E2EE messaging.
+- Transport idempotency records are retained for 30 days, matching the maximum disappearing-message duration. Clients must not automatically retry older `off` messages indefinitely; doing so would require indefinite server-side correlation metadata. Expiry removes server ciphertext and indexes but cannot erase copies already delivered to recipient devices or backups.
 
 ## 6. Delivery
 
@@ -155,12 +158,12 @@ docker compose -f deploy/docker-compose.yml config --quiet
 
 ## Existing-volume rollout prerequisite
 
-Docker initdb mounts execute only for fresh volumes. Existing deployments must apply and verify Scylla migration `004_panic_wipe_message_indexes.cql` before starting the updated message-service, because its writes require both deletion-index tables. Separately, apply and verify PostgreSQL migration `005_wiped_accounts.sql` before starting the updated auth-service or ws-gateway. The README section “Existing database volumes: required security migrations” provides exact idempotent apply commands plus PostgreSQL and Scylla checks; the Scylla check exits non-zero if either required table is missing. Until `wiped_accounts` exists, authenticated REST and WebSocket checks deliberately fail closed rather than accepting a token whose durable wipe status cannot be established.
+Docker initdb mounts execute only for fresh volumes. Existing deployments must apply and verify Scylla migrations `004_panic_wipe_message_indexes.cql` and `011_disappearing_messages.cql` before starting the updated message-service, because its writes require the deletion-index tables and expiry columns. Separately, apply and verify PostgreSQL migration `005_wiped_accounts.sql` before starting the updated auth-service or ws-gateway. The README section “Existing database volumes: required security migrations” provides exact idempotent apply commands plus PostgreSQL and Scylla checks; the Scylla check exits non-zero if either required table is missing. Until `wiped_accounts` exists, authenticated REST and WebSocket checks deliberately fail closed rather than accepting a token whose durable wipe status cannot be established.
 
 ## Highest Priority Next Work
 
 1. Finish safety-number UI with QR comparison.
-2. Add a read-only message-retention indicator before offering user-controlled disappearing-message settings.
+2. Add a read-only message-retention indicator that exposes the active per-conversation expiry choice without revealing message content.
 3. Design group E2EE with Sender Keys or MLS before implementing group attachments.
-4. Add long-polling fallback for WebSocket-hostile paths.
+4. Exercise WebSocket-to-long-poll recovery against the deployed edge under realistic network interruption.
 5. Add dedicated route-level behavior tests for the source-review-only rows identified in `docs/security-route-audit.md` and repeat the audit against the deployed edge.

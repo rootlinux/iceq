@@ -94,7 +94,6 @@ type config struct {
 	RedisAddr       string
 	RedisPassword   string
 	JWTSecret       string
-	MessageTTL      time.Duration
 	ShutdownTimeout time.Duration
 }
 
@@ -108,7 +107,6 @@ func loadConfig() config {
 		RedisAddr:       envOr("ICEQ_REDIS_ADDR", "redis:6379"),
 		RedisPassword:   envOr("ICEQ_REDIS_PASSWORD", ""),
 		JWTSecret:       envOr("ICEQ_JWT_SECRET", ""),
-		MessageTTL:      envDurationSeconds("ICEQ_MESSAGE_TTL_SECONDS", 0),
 		ShutdownTimeout: 10 * time.Second,
 	}
 }
@@ -118,18 +116,6 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-func envDurationSeconds(name string, fallback time.Duration) time.Duration {
-	raw := strings.TrimSpace(envOr(name, ""))
-	if raw == "" {
-		return fallback
-	}
-	seconds, err := strconv.Atoi(raw)
-	if err != nil || seconds <= 0 {
-		return fallback
-	}
-	return time.Duration(seconds) * time.Second
 }
 
 // ----------------------------------------------------------------------------
@@ -192,10 +178,7 @@ func main() {
 	defer scyllaSession.Close()
 	log.Printf("[message-service] scylla: connected to %s keyspace=%s", cfg.ScyllaHosts, cfg.ScyllaKeyspace)
 
-	msgStore := store.New(scyllaSession).WithTTL(cfg.MessageTTL)
-	if cfg.MessageTTL > 0 {
-		log.Printf("[message-service] message TTL enabled seconds=%d", int(cfg.MessageTTL.Seconds()))
-	}
+	msgStore := store.New(scyllaSession)
 
 	// --- JWT manager ---------------------------------------------------
 	mgr, err := jwt.NewManager(cfg.JWTSecret, rdb, pgPool)

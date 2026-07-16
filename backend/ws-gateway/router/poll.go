@@ -14,12 +14,13 @@ import (
 )
 
 const (
-	DefaultPollBatch = 20
-	MaxPollBatch     = 50
-	DefaultPollWait  = 20 * time.Second
-	MaxPollWait      = 25 * time.Second
-	pollStreamTTL    = 7 * 24 * time.Hour
-	pollStreamMaxLen = 1000
+	DefaultPollBatch          = 20
+	MaxPollBatch              = 50
+	DefaultPollWait           = 20 * time.Second
+	MaxPollWait               = 25 * time.Second
+	pollStreamTTL             = 7 * 24 * time.Hour
+	pollStreamMaxLen          = 1000
+	MaxOutstandingPollCursors = 4
 )
 
 var ErrInvalidPollCursor = errors.New("invalid poll cursor")
@@ -109,7 +110,7 @@ func (s *RedisPollStore) Enqueue(ctx context.Context, uin int64, envelope []byte
 func (s *RedisPollStore) Poll(ctx context.Context, req PollRequest) (PollResult, error) {
 	lastID := "0-0"
 	if req.Cursor != "" {
-		value, err := s.rdb.Get(ctx, pollCursorKey(req.UIN, req.Cursor)).Result()
+		value, err := s.rdb.HGet(ctx, pollCursorHashKey(req.UIN), req.Cursor).Result()
 		if errors.Is(err, redis.Nil) {
 			return PollResult{}, ErrInvalidPollCursor
 		}
@@ -133,19 +134,61 @@ func (s *RedisPollStore) Poll(ctx context.Context, req PollRequest) (PollResult,
 			lastID = msg.ID
 		}
 	}
-	token := uuid.NewString()
-	if err := s.rdb.Set(ctx, pollCursorKey(req.UIN, token), lastID, pollStreamTTL).Err(); err != nil {
-		return PollResult{}, err
+	var token string
+	if req.Cursor == "" {
+		token, err = s.issueCursor(ctx, req.UIN, lastID)
+	} else {
+		token, err = s.advanceCursor(ctx, req.UIN, req.Cursor, lastID)
 	}
-	if req.Cursor != "" {
-		// A cursor is single-use. Removing the predecessor keeps per-user
-		// cursor state bounded while duplicate envelopes remain harmless.
-		_ = s.rdb.Del(ctx, pollCursorKey(req.UIN, req.Cursor)).Err()
+	if err != nil {
+		return PollResult{}, err
 	}
 	return PollResult{Cursor: token, Envelopes: envelopes}, nil
 }
 
-func pollStreamKey(uin int64) string { return "poll:stream:" + strconv.FormatInt(uin, 10) }
-func pollCursorKey(uin int64, token string) string {
-	return "poll:cursor:" + strconv.FormatInt(uin, 10) + ":" + token
+func pollStreamKey(uin int64) string      { return "poll:stream:" + strconv.FormatInt(uin, 10) }
+func pollCursorHashKey(uin int64) string  { return "poll:cursors:" + strconv.FormatInt(uin, 10) }
+func pollCursorOrderKey(uin int64) string { return "poll:cursor-order:" + strconv.FormatInt(uin, 10) }
+
+const issueCursorScript = `
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('RPUSH', KEYS[2], ARGV[1])
+while redis.call('LLEN', KEYS[2]) > tonumber(ARGV[3]) do
+  local old = redis.call('LPOP', KEYS[2]); redis.call('HDEL', KEYS[1], old)
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[4]); redis.call('PEXPIRE', KEYS[2], ARGV[4]); return 1`
+
+func (s *RedisPollStore) issueCursor(ctx context.Context, uin int64, streamID string) (string, error) {
+	token := uuid.NewString()
+	err := s.rdb.Eval(ctx, issueCursorScript, []string{pollCursorHashKey(uin), pollCursorOrderKey(uin)}, token, streamID, MaxOutstandingPollCursors, pollStreamTTL.Milliseconds()).Err()
+	return token, err
+}
+func (s *RedisPollStore) consumeCursor(ctx context.Context, uin int64, token string) (string, error) {
+	const script = `local v=redis.call('HGET',KEYS[1],ARGV[1]); if not v then return false end; redis.call('HDEL',KEYS[1],ARGV[1]); redis.call('LREM',KEYS[2],1,ARGV[1]); return v`
+	v, err := s.rdb.Eval(ctx, script, []string{pollCursorHashKey(uin), pollCursorOrderKey(uin)}, token).Text()
+	if errors.Is(err, redis.Nil) {
+		return "", ErrInvalidPollCursor
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
+}
+func (s *RedisPollStore) advanceCursor(ctx context.Context, uin int64, oldToken, streamID string) (string, error) {
+	// Atomically consume the predecessor and issue its bounded successor.
+	newToken := uuid.NewString()
+	const script = `
+local v=redis.call('HGET',KEYS[1],ARGV[1]); if not v then return 0 end
+redis.call('HDEL',KEYS[1],ARGV[1]); redis.call('LREM',KEYS[2],1,ARGV[1])
+redis.call('HSET',KEYS[1],ARGV[2],ARGV[3]); redis.call('RPUSH',KEYS[2],ARGV[2])
+while redis.call('LLEN',KEYS[2]) > tonumber(ARGV[4]) do local old=redis.call('LPOP',KEYS[2]);redis.call('HDEL',KEYS[1],old) end
+redis.call('PEXPIRE',KEYS[1],ARGV[5]);redis.call('PEXPIRE',KEYS[2],ARGV[5]);return 1`
+	n, err := s.rdb.Eval(ctx, script, []string{pollCursorHashKey(uin), pollCursorOrderKey(uin)}, oldToken, newToken, streamID, MaxOutstandingPollCursors, pollStreamTTL.Milliseconds()).Int()
+	if err != nil {
+		return "", err
+	}
+	if n != 1 {
+		return "", ErrInvalidPollCursor
+	}
+	return newToken, nil
 }

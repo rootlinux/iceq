@@ -187,6 +187,7 @@ type Deps struct {
 
 type MessageDeduper interface {
 	Reserve(context.Context, int64, string, string) (string, bool, error)
+	Commit(context.Context, int64, string, string) error
 	Release(context.Context, int64, string, string) error
 }
 
@@ -414,16 +415,18 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 	// only sees the events that target it. The subscription
 	// is torn down in shutdown() — its lifetime is the
 	// connection's lifetime, not the process's.
-	if sub, err := deps.NATS.Subscribe(
-		"presence.notify."+strconv.FormatInt(uin, 10),
-		presenceNotifyHandler(c),
-	); err != nil {
-		// Subscription failure is non-fatal: the user can
-		// still chat, they just won't see presence
-		// updates for contacts. We log it and move on.
-		log.Printf("[ws-gateway] presence notify subscribe: %v", err)
-	} else {
-		c.presenceSub = sub
+	if presenceEnabled {
+		if sub, err := deps.NATS.Subscribe(
+			"presence.notify."+strconv.FormatInt(uin, 10),
+			presenceNotifyHandler(c),
+		); err != nil {
+			// Subscription failure is non-fatal: the user can
+			// still chat, they just won't see presence
+			// updates for contacts. We log it and move on.
+			log.Printf("[ws-gateway] presence notify subscribe: %v", err)
+		} else {
+			c.presenceSub = sub
+		}
 	}
 
 	// 6. Presence: online. We fire-and-forget the publish; if

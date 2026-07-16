@@ -31,8 +31,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -63,7 +66,7 @@ func Dispatch(c *client.Client, env models.Envelope) {
 	case models.EnvelopeTypeGroup:
 		handleGroup(c, deps, env)
 	case models.EnvelopeTypeTyping:
-		handleTyping(deps, env)
+		handleTyping(c, deps, env)
 	case models.EnvelopeTypeRead:
 		handleRead(c, deps, env)
 	case models.EnvelopeTypePresence:
@@ -103,23 +106,14 @@ func Dispatch(c *client.Client, env models.Envelope) {
 // it ourselves — the gateway is a transport router, not a
 // Signal Protocol participant.
 func handleDirect(c *client.Client, deps client.Deps, env models.Envelope) {
-	p, err := parseDirectPayload(env.Payload)
+	p, err := authenticatedOpaqueDirect(env.Payload, c.UIN())
 	if err != nil {
-		sendErrorFrame(c, "INVALID_PAYLOAD", "message payload malformed")
-		return
-	}
-	if err := validateDirectPayload(p); err != nil {
 		sendErrorFrame(c, "INVALID_PAYLOAD", err.Error())
 		return
 	}
 	// Server-side fill: the sender is the authenticated
 	// user, NEVER the client-claimed sender_uin. A tampered
 	// client cannot impersonate another user.
-	p.SenderUIN = c.UIN()
-	if err := authorizeDirectConversation(p, c.UIN()); err != nil {
-		sendErrorFrame(c, "NOT_A_MEMBER", err.Error())
-		return
-	}
 
 	// Truncate timestamp to the minute. The spec mandates
 	// this; it (a) makes timing-correlation attacks against
@@ -182,6 +176,13 @@ func handleDirect(c *client.Client, deps client.Deps, env models.Envelope) {
 		log.Printf("[ws-gateway] publish direct: %v", err)
 		return
 	}
+	commitCtx, commitCancel := context.WithTimeout(context.Background(), time.Second)
+	if err := deps.MessageDeduper.Commit(commitCtx, c.UIN(), p.ClientID, msgID); err != nil {
+		commitCancel()
+		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "message commit failed")
+		return
+	}
+	commitCancel()
 
 	// ACK the sender. The AckPayload.State is "persisted"
 	// from the gateway's perspective: we have accepted
@@ -273,6 +274,29 @@ func validateDirectPayload(p models.DirectMessagePayload) error {
 		return err
 	}
 	return nil
+}
+
+// authenticatedOpaqueDirect is the single direct-message security boundary
+// shared by WebSocket and HTTP fallback transports.
+func authenticatedOpaqueDirect(raw json.RawMessage, actor int64) (models.DirectMessagePayload, error) {
+	p, err := parseDirectPayload(raw)
+	if err != nil {
+		return models.DirectMessagePayload{}, errors.New("message payload malformed")
+	}
+	p.SenderUIN = actor
+	if p.ClientID == "" {
+		return models.DirectMessagePayload{}, errors.New("client_id is required")
+	}
+	if p.Content != "" || len(p.Ciphertext) == 0 {
+		return models.DirectMessagePayload{}, errors.New("opaque ciphertext is required")
+	}
+	if err := validateDirectPayload(p); err != nil {
+		return models.DirectMessagePayload{}, err
+	}
+	if err := authorizeDirectConversation(p, actor); err != nil {
+		return models.DirectMessagePayload{}, err
+	}
+	return p, nil
 }
 
 func validateDisappearingSeconds(seconds int64) error {
@@ -416,6 +440,13 @@ func handleGroup(c *client.Client, deps client.Deps, env models.Envelope) {
 		log.Printf("[ws-gateway] publish group: %v", err)
 		return
 	}
+	commitCtx, commitCancel := context.WithTimeout(context.Background(), time.Second)
+	if err := deps.MessageDeduper.Commit(commitCtx, c.UIN(), p.ClientID, msgID); err != nil {
+		commitCancel()
+		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "message commit failed")
+		return
+	}
+	commitCancel()
 	ack, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{
 		MessageID: ackMessageID(msgID, p.ClientID),
 		State:     models.AckStatePersisted,
@@ -486,6 +517,9 @@ func validateGroupPayload(p models.GroupMessagePayload) error {
 	if p.CryptoVersion != 1 || p.CryptoEpoch < 1 || p.MsgType != "group_ciphertext" {
 		return fmt.Errorf("versioned group ciphertext is required")
 	}
+	if p.ClientID == "" {
+		return fmt.Errorf("client_id is required")
+	}
 	if err := validateDisappearingSeconds(p.ExpiresInSeconds); err != nil {
 		return err
 	}
@@ -501,7 +535,7 @@ func validateGroupPayload(p models.GroupMessagePayload) error {
 // uses the indicator to update a per-conversation typing
 // TTL; once the TTL expires the indicator is implicitly
 // retracted.
-func handleTyping(deps client.Deps, env models.Envelope) {
+func handleTyping(c *client.Client, deps client.Deps, env models.Envelope) {
 	var p models.TypingPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		// Typing indicators are best-effort; an
@@ -509,24 +543,46 @@ func handleTyping(deps client.Deps, env models.Envelope) {
 		// notification to the sender.
 		return
 	}
+	p.SenderUIN = c.UIN()
+	env.Payload = mustMarshalRaw(p)
 	data, err := json.Marshal(env)
 	if err != nil {
 		return
 	}
 	if p.IsGroup && p.GroupID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		var one int
+		if err := deps.PG.QueryRow(ctx, `SELECT 1 FROM group_members WHERE group_id=$1 AND uin=$2`, p.GroupID, c.UIN()).Scan(&one); err != nil {
+			return
+		}
 		_ = deps.NATS.Publish("msg.group."+p.GroupID, data)
 		return
 	}
-	if p.ConversationID != "" {
-		// ConversationID is the same value used as the
-		// Scylla partition key; we re-derive the
-		// receiver from it for the NATS subject. The
-		// gateway is intentionally not parsing the
-		// conversation_id into (sender, receiver) — the
-		// message-service does that. For typing we just
-		// forward the envelope as-is.
-		_ = deps.NATS.Publish("msg.direct."+p.ConversationID, data)
+	peer, err := directTypingPeer(p.ConversationID, c.UIN())
+	if err != nil {
+		return
 	}
+	_ = deps.NATS.Publish("msg.direct."+strconv.FormatInt(peer, 10), data)
+}
+
+func directTypingPeer(conversationID string, actor int64) (int64, error) {
+	parts := strings.Split(conversationID, ":")
+	if len(parts) != 3 || parts[0] != "dm" {
+		return 0, errors.New("invalid direct conversation")
+	}
+	a, errA := strconv.ParseInt(parts[1], 10, 64)
+	b, errB := strconv.ParseInt(parts[2], 10, 64)
+	if errA != nil || errB != nil || a <= 0 || b <= 0 || a >= b {
+		return 0, errors.New("invalid direct conversation")
+	}
+	if actor == a {
+		return b, nil
+	}
+	if actor == b {
+		return a, nil
+	}
+	return 0, errors.New("actor is not a member")
 }
 
 // ----------------------------------------------------------------------------

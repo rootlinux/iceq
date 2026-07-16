@@ -41,6 +41,9 @@ func TestHTTPSendBindsActorAndPublishesOpaqueEnvelopeOnce(t *testing.T) {
 	if pub.calls != 1 || pub.subject != "msg.direct.42" {
 		t.Fatalf("publish=%d subject=%q", pub.calls, pub.subject)
 	}
+	if dedupe.commits != 1 {
+		t.Fatalf("ack returned before idempotency commit; commits=%d", dedupe.commits)
+	}
 	var forwarded models.Envelope
 	if err := json.Unmarshal(pub.body, &forwarded); err != nil {
 		t.Fatal(err)
@@ -84,5 +87,16 @@ func TestHTTPSendRequiresAuthAndRejectsPlaintext(t *testing.T) {
 		if rr.Code != tc.want {
 			t.Fatalf("auth=%v status=%d", tc.auth, rr.Code)
 		}
+	}
+}
+
+func TestHTTPSendRejectsTrailingJSONValues(t *testing.T) {
+	body := `{"type":"message","id":"x","ts":1,"payload":{"conversation_id":"dm:7:42","to_uin":42,"ciphertext":"YQ","msg_type":"signal_message","client_id":"c"}} {}`
+	req := httptest.NewRequest(http.MethodPost, "/send", strings.NewReader(body))
+	req = req.WithContext(middleware.WithUIN(req.Context(), 7))
+	rr := httptest.NewRecorder()
+	NewSendHandler(SendDeps{Publisher: &publisherStub{}, Deduper: &deduperStub{}}).ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d", rr.Code)
 	}
 }

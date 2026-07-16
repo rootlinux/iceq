@@ -36,40 +36,75 @@ export function markEnvelopeRetryable<T extends Record<string, Array<{ id: strin
   return next as T;
 }
 
-/** WebSocket-first receive transport with cancellable long-poll fallback. */
-export function useMessageTransport(): UseWebSocketResult {
-  const ws = useWebSocket();
-  const cursorRef = useRef<string | null>(null);
+interface CoordinatorDeps {
+  poll: typeof pollEnvelopes;
+  httpSend: typeof sendEnvelopeHTTP;
+  wsSend: (envelope: Envelope) => boolean;
+  consume: (envelope: Envelope) => void;
+  onSendFailure: (envelope: Envelope) => void;
+  retryDelayMs?: number;
+}
 
-  useEffect(() => {
-    if (ws.connected) return;
-    const controller = new AbortController();
-    let stopped = false;
+export class MessageTransportCoordinator {
+  private controller: AbortController | null = null;
+  private cursor: string | null = null;
+  private connected = true;
+  private generation = 0;
+  constructor(private readonly deps: CoordinatorDeps) {}
+
+  setConnected(connected: boolean): void {
+    this.connected = connected;
+    if (connected) { this.stopPolling(); return; }
+    this.startPolling();
+  }
+  send(envelope: Envelope): boolean {
+    if (this.connected && this.deps.wsSend(envelope)) return true;
+    void this.deps.httpSend(envelope).then((ack) => this.deps.consume(ack)).catch(() => this.deps.onSendFailure(envelope));
+    return true;
+  }
+  stop(): void { this.connected = true; this.stopPolling(); }
+  private stopPolling(): void { this.generation += 1; this.controller?.abort(); this.controller = null; }
+  private startPolling(): void {
+    if (this.controller) return;
+    const controller = new AbortController(); this.controller = controller; const generation = ++this.generation;
     const run = async (): Promise<void> => {
-      while (!stopped && !controller.signal.aborted) {
+      while (!controller.signal.aborted && !this.connected && generation === this.generation) {
         try {
-          const page = await pollEnvelopes(cursorRef.current, controller.signal);
-          cursorRef.current = page.cursor;
-          for (const envelope of page.envelopes) ws.consumeExternal(envelope);
+          const page = await this.deps.poll(this.cursor, controller.signal);
+          if (controller.signal.aborted || this.connected || generation !== this.generation) return;
+          this.cursor = page.cursor; for (const envelope of page.envelopes) this.deps.consume(envelope);
         } catch (error) {
-          if ((error as { name?: string }).name === "AbortError") return;
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+          if (controller.signal.aborted || (error as { name?: string }).name === "AbortError") return;
+          await new Promise((resolve) => setTimeout(resolve, this.deps.retryDelayMs ?? 1000));
         }
       }
     };
     void run();
-    return () => { stopped = true; controller.abort(); };
-  }, [ws.connected, ws.consumeExternal]);
+  }
+}
+
+/** WebSocket-first receive transport with cancellable long-poll fallback. */
+export function useMessageTransport(): UseWebSocketResult {
+  const ws = useWebSocket();
+  const wsRef = useRef(ws); wsRef.current = ws;
+  const coordinatorRef = useRef<MessageTransportCoordinator | null>(null);
+  if (!coordinatorRef.current) {
+    coordinatorRef.current = new MessageTransportCoordinator({
+      poll: pollEnvelopes, httpSend: sendEnvelopeHTTP,
+      wsSend: (envelope) => wsRef.current.send(envelope),
+      consume: (envelope) => { wsRef.current.consumeExternal(envelope); },
+      onSendFailure: (envelope) => useChatStore.setState((state) => ({ messagesByConversation: markEnvelopeRetryable(state.messagesByConversation, envelope) })),
+    });
+  }
+
+  useEffect(() => {
+    coordinatorRef.current?.setConnected(ws.connected);
+    return () => coordinatorRef.current?.stop();
+  }, [ws.connected]);
 
   const send = useCallback((envelope: Envelope): boolean => {
-    if (ws.connected && ws.send(envelope)) return true;
-    void sendEnvelopeHTTP(envelope).then((ack) => {
-      ws.consumeExternal(ack);
-    }).catch(() => {
-      useChatStore.setState((state) => ({ messagesByConversation: markEnvelopeRetryable(state.messagesByConversation, envelope) }));
-    });
-    return true;
-  }, [ws.connected, ws.consumeExternal, ws.send]);
+    return coordinatorRef.current?.send(envelope) ?? false;
+  }, []);
 
   return { ...ws, send };
 }

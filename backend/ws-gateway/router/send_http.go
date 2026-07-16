@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"time"
 
@@ -46,6 +47,11 @@ func NewSendHandler(deps SendDeps) http.Handler {
 			http.Error(w, "invalid envelope", http.StatusBadRequest)
 			return
 		}
+		var trailing any
+		if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+			http.Error(w, "invalid envelope", http.StatusBadRequest)
+			return
+		}
 		ack, err := processHTTPSend(r.Context(), actor, env, deps)
 		if err != nil {
 			status := http.StatusBadRequest
@@ -71,19 +77,8 @@ func processHTTPSend(ctx context.Context, actor int64, env models.Envelope, deps
 	var payload any
 	switch env.Type {
 	case models.EnvelopeTypeDirect:
-		p, err := parseDirectPayload(env.Payload)
+		p, err := authenticatedOpaqueDirect(env.Payload, actor)
 		if err != nil {
-			return models.Envelope{}, err
-		}
-		// HTTP fallback is E2EE-only; it never accepts legacy plaintext.
-		if len(p.Ciphertext) == 0 || p.Content != "" {
-			return models.Envelope{}, errors.New("opaque ciphertext is required")
-		}
-		p.SenderUIN = actor
-		if err := authorizeDirectConversation(p, actor); err != nil {
-			return models.Envelope{}, err
-		}
-		if err := validateDirectPayload(p); err != nil {
 			return models.Envelope{}, err
 		}
 		clientID = p.ClientID
@@ -130,6 +125,9 @@ func processHTTPSend(ctx context.Context, actor int64, env models.Envelope, deps
 		}
 		if err := deps.Publisher.Publish(subject, data); err != nil {
 			_ = deps.Deduper.Release(ctx, actor, clientID, serverID)
+			return models.Envelope{}, errSendUnavailable
+		}
+		if err := deps.Deduper.Commit(ctx, actor, clientID, serverID); err != nil {
 			return models.Envelope{}, errSendUnavailable
 		}
 	}

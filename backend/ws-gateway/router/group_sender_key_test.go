@@ -6,7 +6,7 @@ import (
 )
 
 func TestGroupCiphertextRequiresVersionedCurrentEpochFields(t *testing.T) {
-	good := models.GroupMessagePayload{GroupID: "7f0300f2-0494-4f61-9f41-7c198f73b2fa", CryptoVersion: 1, CryptoEpoch: 4, Ciphertext: []byte("opaque"), MsgType: "group_ciphertext", ContentType: "text"}
+	good := models.GroupMessagePayload{GroupID: "7f0300f2-0494-4f61-9f41-7c198f73b2fa", ClientID: "client-1", CryptoVersion: 1, CryptoEpoch: 4, Ciphertext: []byte("opaque"), MsgType: "group_ciphertext", ContentType: "text"}
 	if err := validateGroupPayload(good); err != nil {
 		t.Fatalf("valid sender key payload rejected: %v", err)
 	}

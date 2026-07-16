@@ -50,12 +50,12 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
   // Fetch + decrypt history on mount / peer change.
   useEffect(() => {
     if (!convId) return;
-	if (!permitsPrivacySignal("readReceipts")) return;
     markConversationRead(convId);
   }, [convId, markConversationRead]);
 
   useEffect(() => {
     if (!convId) return;
+	const sendReceipts = permitsPrivacySignal("readReceipts");
     const unreadIncoming = messages.filter((message) =>
       !message.is_outgoing && message.state !== "read",
     );
@@ -63,6 +63,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
     markConversationRead(convId);
     unreadIncoming.forEach((message) => {
       markRead(message.id, message.conversation_id);
+	  if (!sendReceipts) return;
       send({
         type: "read",
         id: cryptoRandomId(),

@@ -646,7 +646,6 @@ services:
       ICEQ_NATS_URL: nats://nats:4222
       ICEQ_SCYLLA_HOSTS: scylla:9042
       ICEQ_SCYLLA_KEYSPACE: iceq
-      ICEQ_MESSAGE_TTL_SECONDS: ${ICEQ_MESSAGE_TTL_SECONDS:-0}
       ICEQ_REDIS_ADDR: redis:6379
       PORT: 8080
     depends_on:

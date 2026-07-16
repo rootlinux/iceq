@@ -12,6 +12,15 @@ func TestParseAuthToken_AcceptsLegacyFrame(t *testing.T) {
 	}
 }
 
+func TestPresenceIsOptInAtAuthentication(t *testing.T) {
+	if parsePresenceEnabled([]byte(`{"type":"auth","payload":{"access_token":"x"}}`)) {
+		t.Fatal("presence defaulted on")
+	}
+	if !parsePresenceEnabled([]byte(`{"type":"auth","payload":{"access_token":"x","presence_enabled":true}}`)) {
+		t.Fatal("presence opt-in ignored")
+	}
+}
+
 func TestParseAuthToken_AcceptsEnvelopePayload(t *testing.T) {
 	token, err := parseAuthToken([]byte(`{"type":"auth","id":"1","ts":123,"payload":{"access_token":"payload-token"}}`))
 	if err != nil {

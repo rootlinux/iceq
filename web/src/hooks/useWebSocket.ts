@@ -49,7 +49,7 @@ import { parseEnvelope } from "../types/envelope";
 import { useGroupStore } from "../store/groupStore";
 import { authenticatedGroupMessageFields, decodeGroupCiphertext, openGroupContent, processDirectControlMessage } from "../lib/groupCrypto";
 import { getGroupMembersWithEpoch } from "../api/groups";
-import { permitsPrivacySignal } from "../lib/privacySettings";
+import { permitsPrivacySignal, shouldProcessPrivacyEnvelope } from "../lib/privacySettings";
 
 // ----------------------------------------------------------------------------
 // Backoff schedule. Reset on a successful auth_ok. The 5th
@@ -121,6 +121,12 @@ export function useWebSocket(): UseWebSocketResult {
     // response doesn't restart the connection.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accessToken]);
+
+  useEffect(() => {
+    const reconnectForPrivacy = (): void => { wsRef.current?.close(4001, "privacy_changed"); };
+    window.addEventListener("iceq:privacy-changed", reconnectForPrivacy);
+    return () => window.removeEventListener("iceq:privacy-changed", reconnectForPrivacy);
+  }, []);
 
   // ----------------------------------------------------------------------------
   // connect — open a fresh socket. The only place that
@@ -230,6 +236,8 @@ export function useWebSocket(): UseWebSocketResult {
   // `connected` flag.
   // ----------------------------------------------------------------------------
   async function dispatch(env: Envelope, ws: WebSocket | null): Promise<void> {
+    const privacyState = env.type === "ack" ? (env.payload as Partial<AckPayload>).state : undefined;
+    if (!shouldProcessPrivacyEnvelope(env.type, privacyState)) return;
     switch (env.type) {
       case "auth": {
         // The server is asking us to (re-)authenticate.
@@ -307,7 +315,6 @@ export function useWebSocket(): UseWebSocketResult {
           return;
         }
         attachmentGrantLifecycle.ack(p.message_id, p.state);
-        if ((p.state === "delivered" || p.state === "read") && !permitsPrivacySignal("deliveryReceipts")) return;
         // Ack frames don't carry a conversation_id; we
         // locate the message in the local store and
         // pick its conversation. The list scan is O(n)
@@ -390,7 +397,7 @@ export function useWebSocket(): UseWebSocketResult {
             if (isActiveConversation) {
               chatState.markRead(message.id, message.conversation_id);
               chatState.markConversationRead(message.conversation_id);
-              sendReadReceipt(ws, message);
+              if (permitsPrivacySignal("readReceipts")) sendReadReceipt(ws, message);
             } else {
               chatState.incrementUnread(message.conversation_id);
             }

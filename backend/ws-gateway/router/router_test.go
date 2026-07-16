@@ -2,6 +2,7 @@ package router
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"testing"
 
 	"github.com/iceq/iceq/shared/models"
@@ -99,6 +100,25 @@ func TestValidateDirectPayloadRejectsMissingBody(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedOpaqueDirectRejectsPlaintextAndBindsActor(t *testing.T) {
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"conversation_id":"dm:7:42","to_uin":42,"content":"plaintext","client_id":"c"}`),
+		json.RawMessage(`{"conversation_id":"dm:7:42","to_uin":42,"ciphertext":"YQ","msg_type":"bad","client_id":"c"}`),
+		json.RawMessage(`{"conversation_id":"dm:7:42","to_uin":42,"msg_type":"signal_message","client_id":"c"}`),
+	} {
+		if _, err := authenticatedOpaqueDirect(raw, 7); err == nil {
+			t.Fatalf("accepted non-opaque payload %s", raw)
+		}
+	}
+	got, err := authenticatedOpaqueDirect(json.RawMessage(`{"conversation_id":"dm:7:42","sender_uin":999,"to_uin":42,"ciphertext":"YQ","msg_type":"signal_message","client_id":"c"}`), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SenderUIN != 7 {
+		t.Fatalf("sender=%d", got.SenderUIN)
+	}
+}
+
 func TestDisappearingPolicyAcceptsOffAndBoundedDurationsOnly(t *testing.T) {
 	allowed := []int64{0, 3600, 86400, 604800, 2592000}
 	for _, seconds := range allowed {
@@ -190,6 +210,18 @@ func TestEnvelopeTypesMatchWebWireContract(t *testing.T) {
 	}
 	if models.EnvelopeTypeGroup != "group_msg" {
 		t.Fatalf("EnvelopeTypeGroup mismatch: got %q want %q", models.EnvelopeTypeGroup, "group_msg")
+	}
+}
+
+func TestDirectTypingDestinationIsNumericPeerAndActorBound(t *testing.T) {
+	peer, err := directTypingPeer("dm:7:42", 7)
+	if err != nil || peer != 42 {
+		t.Fatalf("peer=%d err=%v", peer, err)
+	}
+	for _, conv := range []string{"dm:42:99", "dm:42:7", "group:x"} {
+		if _, err := directTypingPeer(conv, 7); err == nil {
+			t.Fatalf("accepted %q", conv)
+		}
 	}
 }
 

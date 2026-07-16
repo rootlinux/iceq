@@ -5,14 +5,14 @@ import (
 	"time"
 )
 
-func TestEffectiveMessageTTLUsesPerMessagePolicyAndGlobalFallback(t *testing.T) {
-	if got := effectiveMessageTTL(24*time.Hour, 3600); got != time.Hour {
+func TestEffectiveMessageTTLUsesExplicitPerMessagePolicy(t *testing.T) {
+	if got := effectiveMessageTTL(3600); got != time.Hour {
 		t.Fatalf("per-message ttl=%s", got)
 	}
-	if got := effectiveMessageTTL(24*time.Hour, 0); got != 24*time.Hour {
-		t.Fatalf("fallback ttl=%s", got)
+	if got := effectiveMessageTTL(0); got != 0 {
+		t.Fatalf("explicit off ttl=%s", got)
 	}
-	if got := effectiveMessageTTL(0, 0); got != 0 {
+	if got := effectiveMessageTTL(0); got != 0 {
 		t.Fatalf("off ttl=%s", got)
 	}
 }

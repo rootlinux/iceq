@@ -17,8 +17,19 @@ export function loadPrivacySettings(): PrivacySettings {
   try { return { ...defaultPrivacySettings, ...JSON.parse(localStorage.getItem(KEY) ?? "{}") as Partial<PrivacySettings> }; }
   catch { return { ...defaultPrivacySettings }; }
 }
-export function savePrivacySettings(value: PrivacySettings): void { localStorage.setItem(KEY, JSON.stringify(value)); }
+export function savePrivacySettings(value: PrivacySettings): void {
+  localStorage.setItem(KEY, JSON.stringify(value));
+  globalThis.dispatchEvent?.(new CustomEvent("iceq:privacy-changed"));
+}
 export function permitsPrivacySignal(signal: PrivacySignal, value = loadPrivacySettings()): boolean { return value[signal]; }
+export function shouldProcessPrivacyEnvelope(type: string, state?: string, value = loadPrivacySettings()): boolean {
+  if (type === "presence") return value.presence;
+  if (type === "typing") return value.typing;
+  if (type === "read") return value.readReceipts;
+  if (type === "ack" && state === "delivered") return value.deliveryReceipts;
+  if (type === "ack" && state === "read") return value.readReceipts;
+  return true;
+}
 export function loadDisappearingSeconds(): number {
   const n = Number(localStorage.getItem(EXPIRY_KEY) ?? 0);
   return [0, 3600, 86400, 604800, 2592000].includes(n) ? n : 0;

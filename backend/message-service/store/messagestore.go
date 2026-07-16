@@ -198,7 +198,6 @@ var ErrInvalidLimit = errors.New("store: history limit must be positive")
 // here hold no mutable state.
 type MessageStore struct {
 	session *gocql.Session
-	ttl     time.Duration
 }
 
 // New constructs a MessageStore. The caller owns the
@@ -212,20 +211,13 @@ func New(s *gocql.Session) *MessageStore {
 	return &MessageStore{session: s}
 }
 
-func (m *MessageStore) WithTTL(ttl time.Duration) *MessageStore {
-	if ttl <= 0 {
-		m.ttl = 0
-		return m
-	}
-	m.ttl = ttl
-	return m
-}
-
-func effectiveMessageTTL(global time.Duration, requestedSeconds int64) time.Duration {
+func effectiveMessageTTL(requestedSeconds int64) time.Duration {
 	if requestedSeconds > 0 {
 		return time.Duration(requestedSeconds) * time.Second
 	}
-	return global
+	// Zero is the explicit public "off" policy. A deployment-wide legacy TTL
+	// must never silently override the sender's visible choice.
+	return 0
 }
 
 func expiryAt(created time.Time, ttl time.Duration) time.Time {
@@ -257,7 +249,7 @@ func expiryAt(created time.Time, ttl time.Duration) time.Time {
 // the returned error wraps the gocql error and is the only
 // signal the handler layer sees.
 func (m *MessageStore) SaveMessage(ctx context.Context, req SaveRequest) error {
-	ttl := effectiveMessageTTL(m.ttl, req.ExpiresInSeconds)
+	ttl := effectiveMessageTTL(req.ExpiresInSeconds)
 	expiresAt := expiryAt(req.CreatedAt, ttl)
 	batch := m.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	batch.SetConsistency(gocql.Quorum)
@@ -313,7 +305,7 @@ func (m *MessageStore) SaveMessage(ctx context.Context, req SaveRequest) error {
 // iceq.messages for each member (TODO future step: confirm
 // fan-out coverage).
 func (m *MessageStore) SaveGroupMessage(ctx context.Context, req SaveGroupRequest) error {
-	ttl := effectiveMessageTTL(m.ttl, req.ExpiresInSeconds)
+	ttl := effectiveMessageTTL(req.ExpiresInSeconds)
 	expiresAt := expiryAt(req.CreatedAt, ttl)
 	batch := m.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	batch.SetConsistency(gocql.Quorum)
