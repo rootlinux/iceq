@@ -89,6 +89,15 @@ const (
 		WHERE token_hash = $1
 	`
 
+	// qConsumeRefreshTokenByHash is the rotation compare-and-delete. PostgreSQL
+	// serializes concurrent DELETEs of the same row; RETURNING therefore gives
+	// exactly one caller the consumed token metadata and all losers ErrNoRows.
+	qConsumeRefreshTokenByHash = `
+		DELETE FROM refresh_tokens
+		WHERE token_hash = $1
+		RETURNING uin, expires_at
+	`
+
 	// ------------------------------------------------------------------------
 	// Security-settings + panic-wipe queries (added by the
 	// panic-wipe addendum).

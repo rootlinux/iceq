@@ -13,7 +13,7 @@ import (
 	"github.com/iceq/iceq/shared/jwt"
 	"github.com/iceq/iceq/shared/middleware"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -24,10 +24,9 @@ import (
 // is the OAuth 2.0 BCP recommendation because a stolen refresh
 // token's next legitimate use will fail, alerting the user.
 //
-// The DB row is deleted BEFORE the new pair is persisted. If the
-// DB write fails after the delete, the user is logged out
-// (worst case) rather than silently retaining a session (worst
-// case) — a deliberate fail-loud trade-off.
+// The old row is conditionally deleted and the new row inserted in one
+// transaction. PostgreSQL's row locking makes the conditional delete the
+// single-winner gate for concurrent requests.
 // ----------------------------------------------------------------------------
 
 type RefreshTokenManager interface {
@@ -38,6 +37,11 @@ type RefreshTokenManager interface {
 
 type RefreshRateLimiter interface {
 	Allow(context.Context, int64, string) (bool, error)
+}
+
+type RefreshDB interface {
+	Begin(context.Context) (pgx.Tx, error)
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }
 
 type RedisRefreshRateLimiter struct {
@@ -62,7 +66,7 @@ func (l *RedisRefreshRateLimiter) Allow(ctx context.Context, uin int64, action s
 }
 
 type RefreshDeps struct {
-	Pool    *pgxpool.Pool
+	Pool    RefreshDB
 	Manager RefreshTokenManager
 	Limiter RefreshRateLimiter
 }
@@ -110,7 +114,7 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 		}
 
 		// ------------------------------------------------------------
-		// 2. Look up the refresh token row by hash. This is a
+		// 2. Atomically consume the refresh token row by hash. This is a
 		// belt-and-suspenders check: even if the JWT itself is
 		// valid, the token must also exist in our DB and not
 		// be past its DB-stored expires_at.
@@ -132,19 +136,33 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 			dbUIN       int64
 			dbExpiresAt time.Time
 		)
-		err = deps.Pool.QueryRow(ctx, qSelectRefreshTokenByHash, tokenHash).
+		tx, err := deps.Pool.Begin(ctx)
+		if err != nil {
+			writeDBError(w, err, "refresh: begin rotation")
+			return
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+
+		err = tx.QueryRow(ctx, qConsumeRefreshTokenByHash, tokenHash).
 			Scan(&dbUIN, &dbExpiresAt)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				// The JWT verified but the row is gone —
-				// either it was already consumed (rotated)
-				// or manually revoked. Either way, the
-				// token is no longer usable.
+				// A verified JWT with no consumable row is reuse or revocation.
+				// Fail closed by invalidating the user's epoch and wiping any
+				// remaining refresh rows; critically, do not mint anything.
+				_ = tx.Rollback(ctx)
+				if bumpErr := deps.Manager.BumpSessionEpoch(ctx, claims.UIN); bumpErr != nil {
+					log.Printf("[auth-service] epoch bump on refresh reuse failed (non-fatal): %v", bumpErr)
+				}
+				if _, delErr := deps.Pool.Exec(ctx, qWipeRefreshTokens, claims.UIN); delErr != nil {
+					log.Printf("[auth-service] delete refresh tokens on reuse failed (non-fatal): %v", delErr)
+				}
 				clearSessionCookies(w)
-				writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED", "refresh token has been revoked or already used")
+				writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED",
+					"refresh token reuse detected; all sessions have been revoked, please log in again")
 				return
 			}
-			writeDBError(w, err, "refresh: select refresh token")
+			writeDBError(w, err, "refresh: consume refresh token")
 			return
 		}
 
@@ -156,7 +174,10 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 		if time.Now().UTC().After(dbExpiresAt) {
 			// Clean up the stale row so the next refresh
 			// attempt also fails fast at the DB level.
-			_, _ = deps.Pool.Exec(ctx, qDeleteRefreshTokenByHash, tokenHash)
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				writeDBError(w, commitErr, "refresh: commit expired token consume")
+				return
+			}
 			clearSessionCookies(w)
 			writeError(w, http.StatusUnauthorized, "REFRESH_EXPIRED", "refresh token has expired")
 			return
@@ -200,8 +221,8 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 			// Nuke every refresh row for this user. The
 			// epoch bump has already made them useless at
 			// the JWT layer; this is cleanup.
-			if _, delErr := deps.Pool.Exec(ctx,
-				`DELETE FROM refresh_tokens WHERE uin = $1`, claims.UIN); delErr != nil {
+			_ = tx.Rollback(ctx)
+			if _, delErr := deps.Pool.Exec(ctx, qWipeRefreshTokens, claims.UIN); delErr != nil {
 				log.Printf("[auth-service] delete refresh tokens on reuse failed (non-fatal): %v", delErr)
 			}
 			writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED",
@@ -210,25 +231,7 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 		}
 
 		// ------------------------------------------------------------
-		// 4. Consume the old refresh token. We delete the
-		// row before issuing the new one so a crash between
-		// the two operations leaves the user logged out
-		// (safe) rather than with two valid refresh tokens
-		// (unsafe).
-		// ------------------------------------------------------------
-		if _, err := deps.Pool.Exec(ctx, qDeleteRefreshTokenByHash, tokenHash); err != nil {
-			// If the delete failed because the row is
-			// already gone (e.g. a concurrent refresh won
-			// the race), treat that as a successful consume.
-			// Any other DB error is a 500.
-			if !errors.Is(err, pgx.ErrNoRows) {
-				writeDBError(w, err, "refresh: delete old refresh token")
-				return
-			}
-		}
-
-		// ------------------------------------------------------------
-		// 5. Mint a fresh pair. Same secret, same signing
+		// 4. Mint a fresh pair. Same secret, same signing
 		// path as login, new JTIs.
 		// ------------------------------------------------------------
 		access, err := deps.Manager.Sign(claims.UIN, jwt.TokenTypeAccess)
@@ -245,17 +248,19 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 		}
 
 		// ------------------------------------------------------------
-		// 6. Persist the new refresh token's hash.
+		// 5. Persist the new refresh token's hash in the same transaction.
 		// ------------------------------------------------------------
 		newHash := sha256Hex(refresh.Token)
 		newExpires := time.Now().UTC().Add(jwt.RefreshTokenTTL)
-		if _, err := deps.Pool.Exec(ctx, qInsertRefreshToken, claims.UIN, newHash, newExpires); err != nil {
-			// The new pair is signed but the refresh half
-			// won't be persisted. The access token still
-			// works for 15 minutes; the user can re-refresh
-			// once that expires by logging in again.
+		if _, err := tx.Exec(ctx, qInsertRefreshToken, claims.UIN, newHash, newExpires); err != nil {
+			// Neither token is returned, and rollback restores the old
+			// database row so the failed rotation does not strand the user.
 			log.Printf("[auth-service] refresh: insert new refresh token: %v", err)
 			writeError(w, http.StatusInternalServerError, "DB_ERROR", "could not persist new refresh token")
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			writeDBError(w, err, "refresh: commit rotation")
 			return
 		}
 

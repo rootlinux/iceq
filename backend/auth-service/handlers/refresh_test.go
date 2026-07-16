@@ -120,6 +120,12 @@ type atomicRefreshDB struct {
 	present bool
 }
 
+type alwaysAllowRefreshLimiter struct{}
+
+func (alwaysAllowRefreshLimiter) Allow(context.Context, int64, string) (bool, error) {
+	return true, nil
+}
+
 func (d *atomicRefreshDB) Begin(context.Context) (pgx.Tx, error) {
 	return &atomicRefreshTx{db: d}, nil
 }
@@ -178,7 +184,7 @@ func TestRefreshConcurrentUseAtomicallyMintsExactlyOnePair(t *testing.T) {
 	h := NewRefreshHandler(RefreshDeps{
 		Pool:    db,
 		Manager: manager,
-		Limiter: &refreshLimiterStub{allow: true},
+		Limiter: alwaysAllowRefreshLimiter{},
 	})
 
 	statuses := make(chan int, 2)
