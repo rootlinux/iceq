@@ -176,6 +176,29 @@ test("expired pending lease is stolen with the same immutable distribution paylo
   let duplicates=0;await ensureGroupSenderCAS("delivery-crash",1,7,[7,9],async()=>{duplicates++;},{now:()=>now});assert.equal(duplicates,0);
 });
 
+test("stolen owner completes boundedly after stealing callback fails and clears",async()=>{
+  const made=await createSenderState("stolen-fails",1,7);await saveGroupCryptoState({version:1,kind:"sender",group_id:"stolen-fails",epoch:1,sender_uin:7,updated_at:1,state:{sender:made.state,distributed_to:[],revision:0}});let now=0;
+  let aEntered!:()=>void;const enteredA=new Promise<void>(resolve=>{aEntered=resolve;});let releaseA!:()=>void;const blockA=new Promise<void>(resolve=>{releaseA=resolve;});
+  const a=ensureGroupSenderCAS("stolen-fails",1,7,[7,9],async()=>{aEntered();await blockA;},{now:()=>now,leaseMs:100,token:()=>"a"});await enteredA;now=101;
+  await assert.rejects(()=>ensureGroupSenderCAS("stolen-fails",1,7,[7,9],async()=>{throw new Error("b failed");},{now:()=>now,leaseMs:100,token:()=>"b"}),/b failed/);
+  releaseA();await Promise.race([a,new Promise((_,reject)=>setTimeout(()=>reject(new Error("deadlock")),100))]);
+  const stored=await loadGroupCryptoState("stolen-fails",1,7,"sender");assert.equal((stored?.state as {deliveries:Record<string,{status:string}>}).deliveries["9"]?.status,"completed");
+});
+
+test("stolen owner completes while stealing callback remains pending on same payload",async()=>{
+  const made=await createSenderState("stolen-pending",1,7);await saveGroupCryptoState({version:1,kind:"sender",group_id:"stolen-pending",epoch:1,sender_uin:7,updated_at:1,state:{sender:made.state,distributed_to:[],revision:0}});let now=0;
+  let aEntered!:()=>void;const enteredA=new Promise<void>(resolve=>{aEntered=resolve;});let releaseA!:()=>void;const blockA=new Promise<void>(resolve=>{releaseA=resolve;});const a=ensureGroupSenderCAS("stolen-pending",1,7,[7,9],async()=>{aEntered();await blockA;},{now:()=>now,leaseMs:100,token:()=>"a"});await enteredA;now=101;
+  let bEntered!:()=>void;const enteredB=new Promise<void>(resolve=>{bEntered=resolve;});let releaseB!:()=>void;const blockB=new Promise<void>(resolve=>{releaseB=resolve;});const b=ensureGroupSenderCAS("stolen-pending",1,7,[7,9],async()=>{bEntered();await blockB;},{now:()=>now,leaseMs:100,token:()=>"b"});await enteredB;
+  releaseA();await Promise.race([a,new Promise((_,reject)=>setTimeout(()=>reject(new Error("deadlock")),100))]);releaseB();await b;
+});
+
+test("corrupt future and backward-clock leases cannot cause permanent wait",async()=>{
+  for(const [group,reservedAt,leaseUntil,now] of [["future-lease",0,999_999_999,10],["backward-lease",1_000,1_100,500]] as const){
+    const made=await createSenderState(group,1,7);const distribution={...made.distribution};await saveGroupCryptoState({version:1,kind:"sender",group_id:group,epoch:1,sender_uin:7,updated_at:1,state:{sender:made.state,distributed_to:[],revision:1,deliveries:{"9":{status:"pending",token:"corrupt",reserved_at:reservedAt,lease_until:leaseUntil,attempts:1,distribution}}}});let calls=0;
+    await Promise.race([ensureGroupSenderCAS(group,1,7,[7,9],async()=>{calls++;},{now:()=>now,leaseMs:100,token:()=>"repair"}),new Promise((_,reject)=>setTimeout(()=>reject(new Error("permanent wait")),100))]);assert.equal(calls,1);
+  }
+});
+
 test("history binds signed inner epoch to stored outer epoch and fails legacy rows closed",async()=>{
   const old=await createSenderState("history-epoch-bound",2,9);await saveGroupCryptoState({version:1,kind:"receiver",group_id:"history-epoch-bound",epoch:2,sender_uin:9,created_at:Date.now(),updated_at:Date.now(),state:createReceiverState(old.distribution)});
   const encrypted=await encryptGroupMessage(old.state,new TextEncoder().encode(JSON.stringify({kind:GROUP_CONTENT_KIND,content_type:"text",text:"authentic old"})));
