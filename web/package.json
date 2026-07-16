@@ -16,6 +16,7 @@
     "@privacyresearch/libsignal-protocol-protobuf-ts": "0.0.9",
     "@privacyresearch/libsignal-protocol-typescript": "^0.0.16",
     "jsqr": "^1.4.0",
+    "protobufjs": "7.6.5",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
