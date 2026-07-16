@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import "fake-indexeddb/auto";
-import { saveGroupCryptoState, loadGroupCryptoState, pruneObsoleteGroupEpochs } from "../src/lib/groupCryptoStore";
-import { hydrateSenderKeyInbox, GROUP_CONTENT_KIND, GROUP_DISTRIBUTION_KIND, openGroupContent, sealGroupContent } from "../src/lib/groupCrypto";
-import { createReceiverState, createSenderState } from "../src/lib/senderKeys";
+import { saveAuthenticatedGroupContent, saveGroupCryptoState, loadGroupCryptoState, pruneObsoleteGroupEpochs } from "../src/lib/groupCryptoStore";
+import { authenticatedGroupMessageFields, hydrateSenderKeyInbox, GROUP_CONTENT_KIND, GROUP_DISTRIBUTION_KIND, openGroupContent, sealGroupContent } from "../src/lib/groupCrypto";
+import { createReceiverState, createSenderState, encryptGroupMessage } from "../src/lib/senderKeys";
+import { getGroupCryptoRecord } from "../src/lib/indexeddb";
 
 test("group state is versioned and keyed by group, epoch, and sender", async () => {
   indexedDB.deleteDatabase("iceq");
@@ -30,6 +31,26 @@ test("multiple same-epoch distribution ids retain and install only newest sender
   const latest=make("new","AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM");const old=make("old","AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE");
   await hydrateSenderKeyInbox("multi",2,[7,9],async()=>[{sender_uin:9,ciphertext:"new",msg_type:"signal_message",distribution_id:"new"},{sender_uin:9,ciphertext:"old",msg_type:"signal_message",distribution_id:"old"}],async(_,cipher)=>new TextEncoder().encode(JSON.stringify(cipher==="new"?latest:old)));
   const stored=await loadGroupCryptoState("multi",2,9,"receiver");assert.equal((stored?.state as {distribution_id:string}).distribution_id,"new");
+  assert.equal((await loadGroupCryptoState("multi",2,9,"receiver","old"))?.state && ((await loadGroupCryptoState("multi",2,9,"receiver","old"))!.state as {distribution_id:string}).distribution_id,"old");
+});
+
+test("hydrating an older distribution cannot downgrade a preinstalled newest state",async()=>{
+  const newest={version:1 as const,distribution_id:"already-new",group_id:"no-downgrade",epoch:2,sender_uin:9,chain_key:"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",iteration:0,signing_public_key:"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"};
+  const old={version:1 as const,distribution_id:"late-old",group_id:"no-downgrade",epoch:2,sender_uin:9,chain_key:"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",iteration:0,signing_public_key:"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"};
+  await saveGroupCryptoState({version:1,kind:"receiver",group_id:"no-downgrade",epoch:2,sender_uin:9,updated_at:1,state:createReceiverState(newest)});
+  await hydrateSenderKeyInbox("no-downgrade",2,[7,9],async()=>[{sender_uin:9,ciphertext:"old",msg_type:"signal_message",distribution_id:"late-old"}],async()=>new TextEncoder().encode(JSON.stringify({kind:GROUP_DISTRIBUTION_KIND,distribution:old})));
+  assert.equal(((await loadGroupCryptoState("no-downgrade",2,9,"receiver"))?.state as {distribution_id:string}).distribution_id,"already-new");
+  assert.equal(((await loadGroupCryptoState("no-downgrade",2,9,"receiver","late-old"))?.state as {distribution_id:string}).distribution_id,"late-old");
+});
+
+test("exact distribution state decrypts old and new same-epoch ciphertext",async()=>{
+  const old=await createSenderState("multi-decrypt",2,9);const newest=await createSenderState("multi-decrypt",2,9);
+  await saveGroupCryptoState({version:1,kind:"receiver",group_id:"multi-decrypt",epoch:2,sender_uin:9,updated_at:1,state:createReceiverState(newest.distribution)});
+  await saveGroupCryptoState({version:1,kind:"receiver",group_id:"multi-decrypt",epoch:2,sender_uin:9,updated_at:2,state:createReceiverState(old.distribution)});
+  const encode=(text:string)=>new TextEncoder().encode(JSON.stringify({kind:GROUP_CONTENT_KIND,content_type:"text",text}));
+  const oldCipher=await encryptGroupMessage(old.state,encode("old"));const newCipher=await encryptGroupMessage(newest.state,encode("new"));
+  assert.equal((await openGroupContent(oldCipher.envelope,2,[9])).text,"old");
+  assert.equal((await openGroupContent(newCipher.envelope,2,[9])).text,"new");
 });
 
 test("bounded inbox grace installs an obsolete epoch for history decrypt only",async()=>{
@@ -59,4 +80,24 @@ test("authenticated live group content can be rendered from history cache withou
   assert.equal((await openGroupContent(envelope,1,[5])).text,"cached");
   await assert.rejects(()=>openGroupContent(envelope,1,[5]),/replay/);
   assert.equal((await openGroupContent(envelope,1,[5],true)).text,"cached");
+});
+
+test("authenticated plaintext cache expires at its immutable creation deadline",async()=>{
+  const made=await createSenderState("cache-expiry",1,5);await saveGroupCryptoState({version:1,kind:"receiver",group_id:"cache-expiry",epoch:1,sender_uin:5,updated_at:1,state:createReceiverState(made.distribution)});
+  const encrypted=await encryptGroupMessage(made.state,new TextEncoder().encode(JSON.stringify({kind:GROUP_CONTENT_KIND,content_type:"text",text:"brief"})));
+  await openGroupContent(encrypted.envelope,1,[5],false,1_000);
+  assert.equal((await openGroupContent(encrypted.envelope,1,[5],true,2_000)).text,"brief");
+  await assert.rejects(()=>openGroupContent(encrypted.envelope,1,[5],true,86_401_000),/replay/);
+});
+
+test("authenticated cache metadata binds context and cannot extend expiry",async()=>{
+  await saveAuthenticatedGroupContent("immutable-cache","cache-group",7,{text:"one"},1_000,5_000);
+  await saveAuthenticatedGroupContent("immutable-cache","cache-group",7,{text:"two"},4_000,50_000);
+  const record=await getGroupCryptoRecord<{group_id:string;epoch:number;created_at:number;expires_at:number}>("content:immutable-cache");
+  assert.deepEqual(record&&{group_id:record.group_id,epoch:record.epoch,created_at:record.created_at,expires_at:record.expires_at},{group_id:"cache-group",epoch:7,created_at:1_000,expires_at:6_000});
+});
+
+test("authenticated group content type wins over conflicting outer metadata both ways",()=>{
+  assert.deepEqual(authenticatedGroupMessageFields({kind:GROUP_CONTENT_KIND,content_type:"text",text:"hello"},"file"),{plaintext:"hello",content_type:"text"});
+  assert.deepEqual(authenticatedGroupMessageFields({kind:GROUP_CONTENT_KIND,content_type:"file",attachment:{id:"x"}},"text"),{plaintext:JSON.stringify({id:"x"}),content_type:"file"});
 });

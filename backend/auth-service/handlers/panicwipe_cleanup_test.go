@@ -59,7 +59,7 @@ func TestCleanupScyllaUsesIndependentBoundedContext(t *testing.T) {
 
 func TestPanicWipeRotatesAndRepairsAffectedGroupsInsideWipeTransaction(t *testing.T) {
 	q := strings.ToUpper(qWipeGroupMemberships)
-	for _, required := range []string{"FOR UPDATE", "DELETE FROM GROUP_MEMBERS", "CRYPTO_EPOCH=CRYPTO_EPOCH+1", "ORDER BY JOINED_AT,UIN", "DELETE FROM GROUPS"} {
+	for _, required := range []string{"FOR UPDATE", "DELETE FROM GROUP_MEMBERS", "CRYPTO_EPOCH=CRYPTO_EPOCH+1", "ORDER BY JOINED_AT,UIN", "UPDATE GROUP_MEMBERS", "SET ROLE='ADMIN'", "DELETE FROM GROUPS"} {
 		if !strings.Contains(q, required) {
 			t.Fatalf("panic wipe group mutation missing %s", required)
 		}

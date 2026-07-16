@@ -47,7 +47,7 @@ import type {
 import type { Message } from "../types/models";
 import { parseEnvelope } from "../types/envelope";
 import { useGroupStore } from "../store/groupStore";
-import { decodeGroupCiphertext, installSenderDistribution, openGroupContent } from "../lib/groupCrypto";
+import { authenticatedGroupMessageFields, decodeGroupCiphertext, installSenderDistribution, openGroupContent } from "../lib/groupCrypto";
 import { getGroupMembersWithEpoch } from "../api/groups";
 
 // ----------------------------------------------------------------------------
@@ -341,6 +341,7 @@ export function useWebSocket(): UseWebSocketResult {
         try {
           const decoder = new TextDecoder();
           let plaintext:string;
+          let authenticatedContentType=p.content_type;
           if (isGroupMessage) {
             const gp=p as GroupMessagePayload;
             if(selfUin!==null&&senderUin===selfUin&&gp.client_id&&useChatStore.getState().messagesByConversation[`group:${gp.group_id}`]?.some(m=>m.id===gp.client_id)) return;
@@ -348,7 +349,7 @@ export function useWebSocket(): UseWebSocketResult {
             const members=(useGroupStore.getState().members[gp.group_id]??[]).map(m=>m.uin);
             if(!group)throw new Error("group routing state is unavailable");
             const content=await openGroupContent(decodeGroupCiphertext(gp.ciphertext??""),group.crypto_epoch,members);
-            plaintext=content.content_type==="file"?JSON.stringify(content.attachment??null):(content.text??"");
+            ({plaintext,content_type:authenticatedContentType}=authenticatedGroupMessageFields(content,p.content_type));
           } else {
             const bytes=await decryptMessage(senderUin,p.ciphertext??"",p.msg_type as "prekey_message"|"signal_message");
             plaintext=decoder.decode(bytes);
@@ -374,7 +375,7 @@ export function useWebSocket(): UseWebSocketResult {
             sender_uin: senderUin,
             receiver_uin: env.type === "message" ? (p as MessagePayload).receiver_uin : 0,
             plaintext,
-            content_type: p.content_type,
+            content_type: authenticatedContentType,
             ...(p.file_url ? { file_url: p.file_url } : {}),
             created_at: new Date(env.ts).toISOString(),
             state: "delivered",

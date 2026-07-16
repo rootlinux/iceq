@@ -112,6 +112,8 @@ const (
 		 AND ($2=$3 OR EXISTS (SELECT 1 FROM actor WHERE role='admin')) RETURNING uin
 		), remaining AS (SELECT COUNT(*)::BIGINT AS n FROM group_members WHERE group_id=$1 AND uin<>$3),
 		successor AS (SELECT uin FROM group_members WHERE group_id=$1 AND uin<>$3 ORDER BY joined_at,uin LIMIT 1),
+		promoted AS (UPDATE group_members m SET role='admin' FROM successor s, locked l
+		 WHERE m.group_id=$1 AND m.uin=s.uin AND l.owner_uin=$3 AND EXISTS(SELECT 1 FROM removed) RETURNING 1),
 		updated AS (UPDATE groups SET crypto_epoch=crypto_epoch+1,
 		 owner_uin=CASE WHEN owner_uin=$3 THEN (SELECT uin FROM successor) ELSE owner_uin END
 		 WHERE id=$1 AND EXISTS(SELECT 1 FROM removed) AND (SELECT n FROM remaining)>0 RETURNING 1),

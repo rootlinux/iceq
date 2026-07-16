@@ -147,14 +147,15 @@ const (
 	// session even if they still hold a valid access token.
 	qWipeRefreshTokens = `DELETE FROM refresh_tokens WHERE uin = $1`
 
-	// qWipeGroupMemberships removes the user from every group
-	// they were a member of. Group ownership is NOT transferred
-	// here; an orphaned group is left in place (a separate
-	// cleanup pass in the future could prune empty groups).
+	// qWipeGroupMemberships removes the user from every group,
+	// promotes the deterministic successor when the owner is wiped,
+	// and deletes groups that have no surviving member.
 	qWipeGroupMemberships = `
 	 WITH affected AS (SELECT g.id,g.owner_uin FROM groups g JOIN group_members m ON m.group_id=g.id WHERE m.uin=$1 FOR UPDATE),
 	 removed AS (DELETE FROM group_members WHERE uin=$1 RETURNING group_id),
 	 survivors AS (SELECT a.id,(SELECT uin FROM group_members WHERE group_id=a.id AND uin<>$1 ORDER BY joined_at,uin LIMIT 1) successor FROM affected a),
+	 promoted AS (UPDATE group_members m SET role='admin' FROM affected a, survivors s
+	   WHERE m.group_id=a.id AND m.uin=s.successor AND a.owner_uin=$1 RETURNING 1),
 	 updated AS (UPDATE groups g SET crypto_epoch=crypto_epoch+1,
 	   owner_uin=CASE WHEN g.owner_uin=$1 THEN s.successor ELSE g.owner_uin END
 	   FROM survivors s WHERE g.id=s.id AND s.successor IS NOT NULL RETURNING g.id),

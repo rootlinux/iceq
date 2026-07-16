@@ -45,3 +45,10 @@ test("message input can send group_msg frames with group conversation ids", () =
   assert.match(input, /conversation_id: `group:\$\{groupId\}`/);
   assert.match(input, /type: "group_msg"/);
 });
+
+test("live group messages trust authenticated inner content type instead of routing metadata",()=>{
+  const socket=read("src/hooks/useWebSocket.ts");
+  assert.match(socket,/authenticatedGroupMessageFields\(content,p\.content_type\)/);
+  assert.match(socket,/content_type: authenticatedContentType/);
+  assert.doesNotMatch(socket,/content_type: p\.content_type/);
+});
