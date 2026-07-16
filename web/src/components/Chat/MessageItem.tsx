@@ -13,7 +13,7 @@
 
 import { useState } from "react";
 import { downloadEncryptedFile } from "../../api/files";
-import { isEncryptedFileManifest, withObjectUrl } from "../../lib/fileCrypto";
+import { assertSafeDownloadMetadata, isEncryptedFileManifest, withObjectUrl } from "../../lib/fileCrypto";
 import type { Message, MessageAttachment } from "../../types/models";
 
 interface MessageItemProps {
@@ -69,6 +69,7 @@ export function MessageItem({ message }: MessageItemProps): JSX.Element {
     setDownloading(true);
     setDownloadError(null);
     try {
+      assertSafeDownloadMetadata(attachment.object_key, attachment.name);
       const blob = await downloadEncryptedFile(attachment.object_key, attachment.manifest);
       await withObjectUrl(blob, (url) => {
         const a = document.createElement("a");

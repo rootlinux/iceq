@@ -3,6 +3,10 @@ import QRCode from "qrcode";
 import jsQR from "jsqr";
 
 export interface SafetyQrPayload { version: 1; fingerprint: string }
+const MAX_QR_UPLOAD_BYTES = 2_000_000;
+const MAX_QR_DIMENSION = 4096;
+const MAX_QR_PIXELS = 4_194_304;
+const MAX_QR_CANVAS_DIMENSION = 1024;
 
 export function createSafetyQrPayload(fingerprint: string): string {
   const canonical = fingerprint.replace(/\s/g, "").toUpperCase();
@@ -48,6 +52,13 @@ export function createSafetyQrPixels(payload: string): { data: Uint8ClampedArray
   return { data, width, height: width };
 }
 
+export function assertQrUploadBounds(bytes: number, width: number, height: number): void {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > MAX_QR_UPLOAD_BYTES) throw new Error("QR image is too large");
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1
+      || width > MAX_QR_DIMENSION || height > MAX_QR_DIMENSION) throw new Error("QR image dimensions are invalid");
+  if (width * height > MAX_QR_PIXELS) throw new Error("QR image has too many pixels");
+}
+
 export function SafetyQr({ fingerprint }: { fingerprint: string }): JSX.Element {
   const [comparison, setComparison] = useState<"idle" | "match" | "mismatch" | "invalid">("idle");
   const [svg, setSvg] = useState("");
@@ -66,21 +77,25 @@ export function SafetyQr({ fingerprint }: { fingerprint: string }): JSX.Element 
   };
 
   const decodeImage = async (file: File): Promise<void> => {
-    const bitmap = await createImageBitmap(file);
+    let bitmap: ImageBitmap | null = null;
     try {
+      assertQrUploadBounds(file.size, 1, 1);
+      bitmap = await createImageBitmap(file);
+      assertQrUploadBounds(file.size, bitmap.width, bitmap.height);
+      const ratio = Math.min(1, MAX_QR_CANVAS_DIMENSION / Math.max(bitmap.width, bitmap.height));
       const canvas = document.createElement("canvas");
-      canvas.width = bitmap.width; canvas.height = bitmap.height;
+      canvas.width = Math.max(1, Math.round(bitmap.width * ratio)); canvas.height = Math.max(1, Math.round(bitmap.height * ratio));
       const context = canvas.getContext("2d", { willReadFrequently: true });
       if (!context) throw new Error("Image decoding is unavailable");
-      context.drawImage(bitmap, 0, 0);
-      const pixels = context.getImageData(0, 0, bitmap.width, bitmap.height);
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
       compare(decodeSafetyQrPixels(pixels.data, pixels.width, pixels.height));
-    } catch { setComparison("invalid"); } finally { bitmap.close(); }
+    } catch { setComparison("invalid"); } finally { bitmap?.close(); }
   };
   return (
     <div className="iceq-settings-status">
       <strong>Safety QR</strong>
-      {svg && <div aria-label="Your scannable safety QR code" role="img" dangerouslySetInnerHTML={{ __html: svg }} />}
+      {svg && <img aria-label="Your scannable safety QR code" src={`data:image/svg+xml,${encodeURIComponent(svg)}`} />}
       <details><summary>Accessible text payload</summary><textarea readOnly aria-label="Your safety QR payload" value={payload} rows={3} /></details>
       <label>Scan from image<input aria-label="Contact safety QR image" type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void decodeImage(file); }} /></label>
       <label>

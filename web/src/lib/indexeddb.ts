@@ -212,8 +212,46 @@ export async function resetPeerSignalState(peerUin: number): Promise<void> {
   db.close();
 }
 
+export async function acceptPendingPeerIdentity(peerUin: number, fingerprint: string): Promise<void> {
+  const db = await openDB();
+  const tx = db.transaction([STORE_PEER_TRUST, STORE_SESSIONS, STORE_PEER_IDENTITIES], "readwrite");
+  const done = transactionDone(tx);
+  try {
+    const trustStore = tx.objectStore(STORE_PEER_TRUST);
+    const existing = await requestResult<StoredPeerTrust>(trustStore.get(peerUin));
+    if (!existing || existing.pendingFingerprint !== fingerprint) throw new Error("fingerprint does not match the current pending identity");
+    const now = Date.now();
+    trustStore.put({ ...existing, fingerprint, verified: false, pendingFingerprint: undefined, updatedAt: now } satisfies StoredPeerTrust, peerUin);
+    for (const address of [String(peerUin), `${peerUin}.1`]) {
+      tx.objectStore(STORE_SESSIONS).delete(address);
+      tx.objectStore(STORE_PEER_IDENTITIES).delete(address);
+    }
+    await done;
+  } catch (error) {
+    try { tx.abort(); } catch { /* already aborted */ }
+    await done.catch(() => undefined);
+    throw error;
+  } finally { db.close(); }
+}
+
+export async function assertInboundIdentityTrusted(peerUin: number, identityKey: ArrayBuffer): Promise<void> {
+  const db = await openDB();
+  const qualified = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, `${peerUin}.1`);
+  const bare = qualified ?? await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, String(peerUin));
+  const trust = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, peerUin);
+  const incomingFingerprint = signalIdentityToWire(identityKey);
+  if (bare && !arrayBufferEquals(bare.publicKey, identityKey)) {
+    db.close(); await persistInboundIdentityChange(String(peerUin), bare.publicKey, identityKey); throw new Error("peer identity changed");
+  }
+  if (trust && (trust.pendingFingerprint !== undefined || trust.fingerprint !== incomingFingerprint)) {
+    await idbPut(db, STORE_PEER_TRUST, { ...trust, pendingFingerprint: incomingFingerprint, updatedAt: Date.now() } satisfies StoredPeerTrust, peerUin);
+    db.close(); throw new Error("peer identity changed");
+  }
+  db.close();
+}
+
 async function persistInboundIdentityChange(identifier: string, oldKey: ArrayBuffer, newKey: ArrayBuffer): Promise<void> {
-  const match = /^(\d+)\.\d+$/.exec(identifier);
+  const match = /^(\d+)(?:\.\d+)?$/.exec(identifier);
   if (!match) return;
   const peerUin = Number(match[1]);
   if (!Number.isSafeInteger(peerUin) || peerUin <= 0) return;
@@ -234,6 +272,14 @@ async function persistInboundIdentityChange(identifier: string, oldKey: ArrayBuf
     updatedAt: now,
   } satisfies StoredPeerTrust, peerUin);
   db.close();
+}
+
+function requestResult<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+}
+
+function transactionDone(tx: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error ?? new Error("identity acceptance transaction aborted")); });
 }
 
 function signalIdentityToWire(key: ArrayBuffer): string {

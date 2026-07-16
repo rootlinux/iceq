@@ -29,7 +29,7 @@ export function assertAcceptableFileSize(size: number): void {
 
 export async function encryptFileBlob(blob: Blob, displayName: string | undefined, objectKey: string): Promise<EncryptedFileBlob> {
   assertAcceptableFileSize(blob.size);
-  if (!objectKey.trim()) throw new Error("object key is required");
+  assertCanonicalObjectKey(objectKey);
   const mimeType = normalizeMimeType(blob.type);
   const name = sanitizeDisplayName(displayName);
   const key = await globalThis.crypto.subtle.generateKey(
@@ -67,6 +67,7 @@ export async function decryptFileBlob(
   manifest: EncryptedFileManifest,
   objectKey: string,
 ): Promise<Blob> {
+  assertCanonicalObjectKey(objectKey);
   if (!isEncryptedFileManifest(manifest)) {
     throw new Error("invalid encrypted file manifest");
   }
@@ -101,12 +102,24 @@ export function isEncryptedFileManifest(value: unknown): value is EncryptedFileM
     && typeof m.nonce === "string"
     && b64UrlByteLength(m.nonce) === NONCE_LENGTH_BYTES
     && typeof m.mime_type === "string"
-    && m.mime_type.length > 0
+    && isStrictMimeType(m.mime_type)
     && typeof m.size === "number"
     && Number.isSafeInteger(m.size)
     && m.size >= 0
     && m.size <= MAX_ENCRYPTED_FILE_BYTES
     && (m.name === undefined || (typeof m.name === "string" && sanitizeDisplayName(m.name) === m.name));
+}
+
+export function assertCanonicalObjectKey(value: string): void {
+  if (value.length < 3 || value.length > 512 || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)
+      || value.includes("//") || value.split("/").some((part) => part === "." || part === ".." || part.length === 0)) {
+    throw new Error("invalid object key");
+  }
+}
+
+export function assertSafeDownloadMetadata(objectKey: string, name: string): void {
+  assertCanonicalObjectKey(objectKey);
+  if (sanitizeDisplayName(name) !== name) throw new Error("invalid file name");
 }
 
 export function serializeEncryptedFileManifest(manifest: EncryptedFileManifest): string {
@@ -126,7 +139,7 @@ export function parseEncryptedFileManifest(raw: string): EncryptedFileManifest {
 
 function normalizeMimeType(type: string): string {
   const trimmed = type.trim().toLowerCase();
-  if (!trimmed || trimmed.length > 127 || /[\r\n;]/.test(trimmed)) {
+  if (!isStrictMimeType(trimmed)) {
     return FALLBACK_MIME;
   }
   return trimmed;
@@ -134,9 +147,18 @@ function normalizeMimeType(type: string): string {
 
 function sanitizeDisplayName(name?: string): string | undefined {
   if (!name) return undefined;
-  const normalized = name.replace(/\\/g, "/").split("/").filter(Boolean).pop()?.trim();
+  const normalized = name.replace(/\\/g, "/").split("/").filter(Boolean).pop()?.trim()
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "")
+    .replace(/[. ]+$/g, "");
   if (!normalized || normalized === "." || normalized === "..") return undefined;
-  return normalized.slice(0, 120);
+  const bounded = normalized.slice(0, 120);
+  const stem = bounded.split(".")[0]!.toUpperCase();
+  if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stem)) return undefined;
+  return bounded;
+}
+
+function isStrictMimeType(value: string): boolean {
+  return value.length <= 127 && /^[a-z0-9][a-z0-9!#$&^_.+-]{0,62}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,62}$/.test(value);
 }
 
 function manifestAAD(objectKey: string, mimeType: string, size: number, name?: string): ArrayBuffer {

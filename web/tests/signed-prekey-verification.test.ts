@@ -42,3 +42,15 @@ test("session bootstrap verifies the signed prekey before constructing SessionBu
   assert.ok(seed.indexOf("await verifySignedPreKeyBundle(remote)") >= 0);
   assert.ok(seed.indexOf("await verifySignedPreKeyBundle(remote)") < seed.indexOf("new runtime.SessionBuilder"));
 });
+
+test("rejects malformed and non-canonical signed-prekey fields before curve verification", async () => {
+  const valid = await bundle();
+  const cases = [
+    { ...valid, identity_key: valid.identity_key + "=" },
+    { ...valid, identity_key: "AA" },
+    { ...valid, signed_pre_key: { ...valid.signed_pre_key, public_key: "AA" } },
+    { ...valid, signed_pre_key: { ...valid.signed_pre_key, signature: "AA" } },
+    { ...valid, signed_pre_key: { ...valid.signed_pre_key, signature: valid.signed_pre_key.signature + "AAAA" } },
+  ];
+  for (const candidate of cases) await assert.rejects(() => verifySignedPreKeyBundle(candidate), /signed prekey/i);
+});

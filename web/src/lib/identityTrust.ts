@@ -1,4 +1,4 @@
-import { loadPeerTrust, resetPeerSignalState, savePeerTrust, type StoredPeerTrust } from "./indexeddb";
+import { acceptPendingPeerIdentity, loadPeerTrust, savePeerTrust, type StoredPeerTrust } from "./indexeddb";
 
 const RAW_KEY_BYTES = 32;
 
@@ -27,10 +27,7 @@ export async function assessPeerIdentity(peerUin: number, fingerprint: string): 
 
 export async function acceptPeerIdentity(peerUin: number, fingerprint: string): Promise<void> {
   validate(peerUin, fingerprint);
-  const existing = await loadPeerTrust(peerUin);
-  const now = Date.now();
-  await savePeerTrust({ version: 1, peerUin, fingerprint, verified: false, firstSeenAt: existing?.firstSeenAt ?? now, updatedAt: now });
-  await resetPeerSignalState(peerUin);
+  await acceptPendingPeerIdentity(peerUin, fingerprint);
 }
 
 export async function verifyPeerIdentity(peerUin: number, fingerprint: string): Promise<void> {

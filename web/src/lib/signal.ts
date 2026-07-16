@@ -41,6 +41,8 @@ import {
   type StoredIdentity,
 } from "./indexeddb";
 import { assessPeerIdentity, isPeerSendAllowed } from "./identityTrust";
+import { assertInboundIdentityTrusted } from "./indexeddb";
+import { PreKeyWhisperMessage } from "@privacyresearch/libsignal-protocol-protobuf-ts";
 
 // ============================================================================
 // Library bootstrap.
@@ -462,6 +464,11 @@ export async function encryptMessage(
 }
 
 export async function verifySignedPreKeyBundle(remote: Pick<RemotePreKeyBundle, "identity_key" | "signed_pre_key">): Promise<true> {
+  try {
+    assertCanonicalB64Url(remote.identity_key, 32);
+    assertCanonicalB64Url(remote.signed_pre_key.public_key, 32);
+    assertCanonicalB64Url(remote.signed_pre_key.signature, 64);
+  } catch (cause) { throw new SignalError("signed prekey verification failed", cause); }
   const { curve } = await ensureBoot();
   let valid = false;
   try {
@@ -506,6 +513,14 @@ export async function decryptMessage(
   try {
     let plain: ArrayBuffer;
     if (msgType === "prekey_message") {
+      const wire = new Uint8Array(bytes);
+      if (wire.length < 2 || wire[0] !== 0x33) throw new SignalError("invalid inbound prekey message");
+      const proto = PreKeyWhisperMessage.decode(wire.slice(1));
+      const inboundIdentity = uint8ToArrayBuffer(proto.identityKey);
+      if (proto.identityKey.length !== SIGNAL_PUBLIC_KEY_LENGTH || proto.identityKey[0] !== SIGNAL_PUBLIC_KEY_PREFIX) {
+        throw new SignalError("invalid inbound identity key");
+      }
+      await assertInboundIdentityTrusted(senderUin, inboundIdentity);
       // First message from a peer. The SessionBuilder runs
       // X3DH against our stored prekey/signed-prekey and
       // sets up the ratchet state.
@@ -516,8 +531,16 @@ export async function decryptMessage(
     }
     return new Uint8Array(plain);
   } catch (e) {
+    if (e instanceof SignalError) throw e;
+    if ((e as Error).message === "peer identity changed") throw new SignalError("peer identity changed; decrypt blocked", e);
     throw new SignalError(`decrypt failed from uin=${senderUin}`, e);
   }
+}
+
+function assertCanonicalB64Url(value: string, expectedBytes: number): void {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("non-canonical base64url");
+  const decoded = b64UrlToArrayBuffer(value);
+  if (decoded.byteLength !== expectedBytes || arrayBufferToB64Url(decoded) !== value) throw new Error("invalid base64url length or encoding");
 }
 
 // ============================================================================

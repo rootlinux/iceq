@@ -7,6 +7,7 @@ import {
   decryptFileBlob,
   encryptFileBlob,
   isEncryptedFileManifest,
+  assertSafeDownloadMetadata,
   MAX_ENCRYPTED_FILE_BYTES,
   withObjectUrl,
 } from "../src/lib/fileCrypto.ts";
@@ -49,4 +50,19 @@ test("rejects unsafe received names and oversized manifest metadata", () => {
   const base = { version: 1 as const, algorithm: "AES-256-GCM" as const, key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", nonce: "AAAAAAAAAAAAAAAA", mime_type: "text/plain", size: 1 };
   assert.equal(isEncryptedFileManifest({ ...base, name: "../escape.txt" }), false);
   assert.equal(isEncryptedFileManifest({ ...base, size: MAX_ENCRYPTED_FILE_BYTES + 1 }), false);
+  assert.equal(isEncryptedFileManifest({ ...base, mime_type: "text/plain\nX: y" }), false);
+  assert.equal(isEncryptedFileManifest({ ...base, name: "safe\u202Etxt.exe" }), false);
+  assert.equal(isEncryptedFileManifest({ ...base, name: "CON" }), false);
+});
+
+test("rejects non-canonical or traversal-looking object keys", async () => {
+  for (const key of ["../secret", "/absolute", "a//b", "a\\b", "a\u0000b", "a/./b", "a/../b", "a".repeat(513)]) {
+    await assert.rejects(() => encryptFileBlob(new Blob(["x"]), "x.txt", key), /object key/i);
+  }
+});
+
+test("download metadata validation rejects unsafe direct attachment names", () => {
+  assert.throws(() => assertSafeDownloadMetadata("uin/7/file", "safe\u202Etxt.exe"), /file name/i);
+  assert.throws(() => assertSafeDownloadMetadata("../file", "safe.txt"), /object key/i);
+  assert.doesNotThrow(() => assertSafeDownloadMetadata("uin/7/file", "safe.txt"));
 });
