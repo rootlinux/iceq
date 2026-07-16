@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -59,11 +60,33 @@ func TestSenderKeyInboxGetRequiresCurrentRecipientMembershipAndEpoch(t *testing.
 		t.Fatal("bounded decrypt-only grace missing")
 	}
 	query := strings.ToUpper(db.calls[1].sql)
-	if !strings.Contains(query, "ROW_NUMBER() OVER (PARTITION BY SENDER_UIN") || !strings.Contains(query, "SENDER_RANK") {
+	if !strings.Contains(query, "ROW_NUMBER() OVER (PARTITION BY SENDER_UIN,EPOCH") || !strings.Contains(query, "SENDER_EPOCH_RANK") {
 		t.Fatalf("per-sender fair selection missing: %s", query)
 	}
 	if !strings.Contains(query, "OFFSET $5") {
 		t.Fatalf("bounded paging missing: %s", query)
+	}
+}
+
+func TestSenderKeyInboxGetPreservesCurrentAndRetiredEpochQuota(t *testing.T) {
+	retiredAt := time.Now().Add(-time.Hour)
+	rows := make([][]any, 0, 8)
+	for i := 0; i < 4; i++ {
+		rows = append(rows, []any{int64(5), int64(100), "b3BhcXVl", "signal_message", "current-" + strconv.Itoa(i), (*time.Time)(nil)})
+	}
+	for i := 0; i < 4; i++ {
+		rows = append(rows, []any{int64(4), int64(100), "b3BhcXVl", "signal_message", "retired-" + strconv.Itoa(i), &retiredAt})
+	}
+	db := &groupFakeDB{rowQueue: [][]any{{int64(5)}}, rowsQueue: [][][]any{rows}}
+	rr := httptest.NewRecorder()
+	NewGetSenderKeyDistributionsHandler(GroupsDeps{PG: db})(rr, groupRequest(http.MethodGet, "/api/groups/"+behaviorGroupID+"/sender-key-distributions", "", 200))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	for _, id := range []string{"current-0", "current-3", "retired-0", "retired-3"} {
+		if !strings.Contains(rr.Body.String(), `"distribution_id":"`+id+`"`) {
+			t.Fatalf("current+grace distribution %q missing: %s", id, rr.Body.String())
+		}
 	}
 }
 

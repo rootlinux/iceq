@@ -79,14 +79,14 @@ const qGetSenderKeyDistributions = `
 	    AND retired_at IS NOT NULL AND retired_at < NOW()-INTERVAL '24 hours'
 	), ranked AS (
 	  SELECT epoch,sender_uin,ciphertext,msg_type,distribution_id,retired_at,created_at,
-	    ROW_NUMBER() OVER (PARTITION BY sender_uin ORDER BY epoch DESC,created_at DESC,distribution_id DESC) AS sender_rank
+	    ROW_NUMBER() OVER (PARTITION BY sender_uin,epoch ORDER BY created_at DESC,distribution_id DESC) AS sender_epoch_rank
 	  FROM sender_key_distributions
 	  WHERE group_id=$1 AND recipient_uin=$2
 	    AND (epoch=$3 OR retired_at > NOW()-INTERVAL '24 hours')
 	)
 	SELECT epoch,sender_uin,ciphertext,msg_type,distribution_id,retired_at
-	FROM ranked WHERE sender_rank <= ` + "4" + `
-	ORDER BY sender_rank,epoch DESC,sender_uin,created_at DESC,distribution_id DESC
+	FROM ranked WHERE sender_epoch_rank <= ` + "4" + `
+	ORDER BY sender_epoch_rank,epoch DESC,sender_uin,created_at DESC,distribution_id DESC
 	LIMIT $4 OFFSET $5`
 
 func NewPutSenderKeyDistributionHandler(deps GroupsDeps) http.HandlerFunc {
