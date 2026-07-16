@@ -149,7 +149,7 @@ docker compose -f deploy/docker-compose.yml --profile tor up -d
 ./deploy/scripts/onion-address.sh
 ```
 
-The script polls the Tor container until the v3 keypair has been generated and published to the Tor directory consensus (typically 30–60s on first boot), then prints a URL like:
+The script polls the Tor container until its locally generated v3 keypair has produced a `hostname` file, then prints a URL like:
 
 ```
 http://iceq...abc...xyz.onion
@@ -158,6 +158,8 @@ http://iceq...abc...xyz.onion
 It also prints the exact `ICEQ_ONION_LOCATION=http://...onion` line to add to `deploy/.env.local`. Keep this value on the v3 onion URL; do not point Onion-Location at a clearnet domain.
 
 Open that address in a Tor-capable browser (Tor Browser, Brave with private window + Tor, etc.) to use IceQ over the Tor network.
+
+The local `hostname` file proves only key/address generation. It does not prove Tor directory consensus publication or external reachability; those require a separate Tor-network connectivity test during the later Tor integration phase.
 
 ### Backup your .onion keypair (CRITICAL)
 

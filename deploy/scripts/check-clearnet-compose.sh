@@ -4,6 +4,7 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 compose_file="$repo_root/deploy/docker-compose.yml"
 caddyfile="$repo_root/deploy/Caddyfile"
+onion_script="$repo_root/deploy/scripts/onion-address.sh"
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -28,19 +29,47 @@ printf '%s\n' "$default_config" | grep -Eq '^[[:space:]]+tor:$' &&
 printf '%s\n' "$default_config" | grep -Eq 'condition:.*tor|tor:.*condition' &&
   fail "a default service depends on Tor"
 
-grep -Eq '^iceq\.space, www\.iceq\.space \{' "$caddyfile" ||
+clearnet_site=$(sed -n '/^iceq\.space, www\.iceq\.space {$/,/^}$/p' "$caddyfile")
+route_snippet=$(sed -n '/^(iceq_routes) {$/,/^# ── Optional Tor hidden-service target/p' "$caddyfile")
+security_snippet=$(sed -n '/^(security_headers) {$/,/^# ── Upstream forwarding headers/p' "$caddyfile")
+
+printf '%s\n' "$clearnet_site" | grep -Eq '^iceq\.space, www\.iceq\.space \{' ||
   fail "Caddyfile must expose the iceq.space clearnet hosts"
-grep -Eq "@hasOnionLocation expression .*ICEQ_ONION_LOCATION.*!= ''" "$caddyfile" ||
+printf '%s\n' "$clearnet_site" | grep -Fq 'import iceq_routes' ||
+  fail "the clearnet hosts must import the shared IceQ route snippet"
+printf '%s\n' "$clearnet_site" | grep -Eq "@hasOnionLocation expression .*ICEQ_ONION_LOCATION.*!= ''" ||
   fail "Onion-Location must be guarded by a non-empty environment variable"
-grep -Eq 'header @hasOnionLocation Onion-Location "\{\$ICEQ_ONION_LOCATION\}"' "$caddyfile" ||
+printf '%s\n' "$clearnet_site" | grep -Eq 'header @hasOnionLocation Onion-Location "\{\$ICEQ_ONION_LOCATION\}"' ||
   fail "guarded Onion-Location response header is missing"
+if printf '%s\n' "$clearnet_site" | grep -Eq '^[[:space:]]*header[[:space:]]+Onion-Location'; then
+  fail "clearnet must not contain an unguarded Onion-Location directive"
+fi
 
 for route in '/api/auth/' '/api/contacts/' '/api/keys/' '/api/messages/' '/api/groups' '/api/presence/' '/api/files/' '/ws'; do
-  grep -Fq "$route" "$caddyfile" || fail "Caddy route is missing: $route"
+  printf '%s\n' "$route_snippet" | grep -Fq "$route" ||
+    fail "shared Caddy route snippet is missing: $route"
 done
 
 for header in Strict-Transport-Security Content-Security-Policy X-Content-Type-Options X-Frame-Options Referrer-Policy Permissions-Policy; do
-  grep -Fq "$header" "$caddyfile" || fail "Caddy security header is missing: $header"
+  printf '%s\n' "$security_snippet" | grep -Fq "$header" ||
+    fail "shared Caddy security snippet is missing: $header"
 done
+
+printf '%s\n' "$route_snippet" | grep -Fq 'import security_headers' ||
+  fail "shared routes must import the shared security-header snippet"
+
+grep -Eq 'docker compose .*--profile tor .*logs tor' "$onion_script" ||
+  fail "Tor diagnostic command must explicitly enable the tor profile"
+
+if docker image inspect iceq/caddy:dev >/dev/null 2>&1; then
+  docker run --rm \
+    -e ICEQ_ONION_LOCATION= \
+    -v "$caddyfile:/etc/caddy/Caddyfile:ro" \
+    iceq/caddy:dev caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
+    fail "Caddy failed to validate the clearnet configuration"
+  printf 'PASS: Caddy runtime syntax validation completed with iceq/caddy:dev.\n'
+else
+  printf 'SKIP: iceq/caddy:dev is unavailable; runtime Caddy validation was not performed.\n'
+fi
 
 printf 'PASS: default Compose is clearnet-only; Tor is opt-in and Caddy clearnet policy is present.\n'

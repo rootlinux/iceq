@@ -26,7 +26,7 @@ Status: deferred; repository assets retained as opt-in.
 Implemented:
 - Docker Compose retains a Tor v3 hidden-service container behind the explicit `tor` profile; the default clearnet stack excludes it.
 - The `.onion` key material is generated automatically and persisted in the `tor_keys` volume.
-- `deploy/scripts/onion-address.sh` prints the generated onion address and `ICEQ_ONION_LOCATION` value.
+- `deploy/scripts/onion-address.sh` prints the locally generated onion address and `ICEQ_ONION_LOCATION` value; this is not claimed as consensus-publication or reachability proof.
 - Caddy can serve clearnet and onion traffic from the same route set.
 - `Onion-Location` is enabled only when a non-empty `ICEQ_ONION_LOCATION` is configured; the default clearnet response does not advertise it.
 - `deploy/scripts/check-clearnet-compose.sh` verifies default exclusion, explicit profile inclusion, clearnet hosts/routes, and required security headers.

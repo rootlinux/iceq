@@ -1,11 +1,11 @@
 #!/bin/sh
-# Print the IceQ .onion address once the Tor hidden-service keypair is
-# generated and registered with the directory authorities.
+# Print the locally generated IceQ .onion address once the Tor hidden-service
+# keypair and hostname file exist.
 #
-# The Tor container writes the v3 onion address to its hostname file
-# only after consensus publication, which can take 30-60s on first boot.
-# This script polls the file (via `docker exec`) for up to 60s and prints
-# the address as soon as it appears.
+# The Tor container writes the locally generated v3 onion address to its
+# hostname file. This script polls that local file (via `docker exec`) for up
+# to 60s and prints the address as soon as it appears. A hostname file does
+# not prove Tor consensus publication or external onion reachability.
 #
 # Usage:
 #   ./deploy/scripts/onion-address.sh
@@ -13,7 +13,7 @@
 # Exit codes:
 #   0 — address found and printed
 #   1 — timed out waiting for the address (container still booting or
-#       not running; check `docker compose logs tor`)
+#       not running; check `docker compose --profile tor logs tor`)
 
 set -eu
 
@@ -30,7 +30,7 @@ fi
 # Sanity check: is the container running?
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "Error: container '$CONTAINER' is not running." >&2
-    echo "Start the stack first: docker compose -f deploy/docker-compose.yml up -d" >&2
+    echo "Start the stack first: docker compose -f deploy/docker-compose.yml --profile tor up -d" >&2
     exit 1
 fi
 
@@ -71,7 +71,7 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
 done
 
 echo ""
-echo "Timeout: Tor container did not publish a hostname within" >&2
+echo "Timeout: Tor container did not create a local hostname file within" >&2
 echo "$((MAX_ATTEMPTS * SLEEP_SECONDS))s. Diagnose with:" >&2
-echo "  docker compose -f deploy/docker-compose.yml logs tor" >&2
+echo "  docker compose -f deploy/docker-compose.yml --profile tor logs tor" >&2
 exit 1
