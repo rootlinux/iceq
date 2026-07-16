@@ -91,11 +91,18 @@ func processDurableIngest(ctx context.Context, ingester *store.DurableIngestStor
 			return models.Envelope{}, store.ErrInvalidIngest
 		}
 		groupID, parseErr := gocql.ParseUUID(payload.GroupID)
-		if parseErr != nil || pg == nil || authorizeGroupMessageEpoch(ctx, pg, payload.GroupID, payload.SenderUIN, payload.CryptoEpoch) != nil {
+		recipients, snapshotErr := snapshotGroupRecipients(ctx, pg, payload.GroupID, payload.SenderUIN, payload.CryptoEpoch)
+		if parseErr != nil || snapshotErr != nil {
 			return models.Envelope{}, errors.New("group authorization failed")
 		}
+		payload.RecipientUINs = recipients
+		env.Payload = mustJSONRaw(payload)
+		raw, err = json.Marshal(env)
+		if err != nil {
+			return models.Envelope{}, err
+		}
 		clientID, subject = payload.ClientID, "msg.group."+payload.GroupID
-		result, err = ingester.PersistGroup(ctx, store.DurableGroupRequest{SenderUIN: payload.SenderUIN, ClientID: payload.ClientID, GroupID: groupID, CryptoEpoch: payload.CryptoEpoch, Envelope: raw, Ciphertext: payload.Ciphertext, MsgType: payload.MsgType, ExpiresInSeconds: payload.ExpiresInSeconds})
+		result, err = ingester.PersistGroup(ctx, store.DurableGroupRequest{SenderUIN: payload.SenderUIN, ClientID: payload.ClientID, GroupID: groupID, CryptoEpoch: payload.CryptoEpoch, RecipientUINs: recipients, Envelope: raw, Ciphertext: payload.Ciphertext, MsgType: payload.MsgType, ExpiresInSeconds: payload.ExpiresInSeconds})
 	default:
 		return models.Envelope{}, errors.New("unsupported durable ingest type")
 	}
@@ -113,6 +120,36 @@ func processDurableIngest(ctx context.Context, ingester *store.DurableIngestStor
 		}
 	}
 	return models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{MessageID: clientID, State: models.AckStatePersisted, RecipientUIN: recipient})
+}
+
+func mustJSONRaw(value any) json.RawMessage { body, _ := json.Marshal(value); return body }
+
+func snapshotGroupRecipients(ctx context.Context, pg *pgxpool.Pool, groupID string, sender, epoch int64) ([]int64, error) {
+	if pg == nil {
+		return nil, errors.New("group database unavailable")
+	}
+	rows, err := pg.Query(ctx, `SELECT m.uin FROM group_members m JOIN groups g ON g.id=m.group_id WHERE m.group_id=$1 AND g.crypto_epoch=$2 ORDER BY m.uin`, groupID, epoch)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var recipients []int64
+	senderPresent := false
+	for rows.Next() {
+		var uin int64
+		if err := rows.Scan(&uin); err != nil {
+			return nil, err
+		}
+		recipients = append(recipients, uin)
+		senderPresent = senderPresent || uin == sender
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if !senderPresent || len(recipients) == 0 {
+		return nil, errors.New("sender is not in exact epoch snapshot")
+	}
+	return recipients, nil
 }
 
 func deliverOutboxEntry(ctx context.Context, delivery deliveryPublisher, entry store.OutboxEntry) error {

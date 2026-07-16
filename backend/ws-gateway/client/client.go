@@ -174,15 +174,21 @@ func parseAuthToken(raw []byte) (string, error) {
 // for the *Client type), so the wire is a function set in
 // main.go after both packages are constructed.
 type Deps struct {
-	NATS               *natsclient.Client
-	Hub                HubRegister
-	Redis              *redis.Client
-	Manager            *jwt.Manager
-	PG                 *pgxpool.Pool
-	Dispatch           func(c *Client, env models.Envelope)
-	ConnectRateLimiter *middleware.AuthenticatedRateLimiter
-	FrameRateLimiter   *middleware.AuthenticatedRateLimiter
-	MessageDeduper     MessageDeduper
+	NATS                *natsclient.Client
+	Hub                 HubRegister
+	Redis               *redis.Client
+	Manager             *jwt.Manager
+	PG                  *pgxpool.Pool
+	Dispatch            func(c *Client, env models.Envelope)
+	ConnectRateLimiter  *middleware.AuthenticatedRateLimiter
+	FrameRateLimiter    *middleware.AuthenticatedRateLimiter
+	MessageDeduper      MessageDeduper
+	RecipientQueueAcker RecipientQueueAcker
+	WakeAccepted        func(context.Context, int64) error
+}
+
+type RecipientQueueAcker interface {
+	AckRecipient(context.Context, int64, []string) (int64, error)
 }
 
 type MessageDeduper interface {
@@ -405,6 +411,25 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 	})
 	if err == nil {
 		_ = wsjson.Write(r.Context(), ws, authOK)
+	}
+	if deps.WakeAccepted != nil {
+		wakeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = deps.WakeAccepted(wakeCtx, uin)
+		cancel()
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-c.done:
+					return
+				case <-ticker.C:
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					_ = deps.WakeAccepted(ctx, uin)
+					cancel()
+				}
+			}
+		}()
 	}
 
 	// 5b. Per-connection presence-notify subscription.

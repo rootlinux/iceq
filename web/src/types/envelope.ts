@@ -41,6 +41,7 @@ export type EnvelopeType =
   // Server-to-client ack for a previously-sent message. State
   // is one of "delivered" | "read" | "persisted".
   | "ack"
+	| "transport_ack"
   // Presence change (online / away / dnd / offline).
   | "presence"
   // Transient typing indicator. The server does not persist it.

@@ -118,6 +118,9 @@ docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T
 
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
   cqlsh < deploy/init/migrations/012_durable_message_ingest.cql
+
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
+  cqlsh < deploy/init/migrations/013_group_recipient_snapshot.cql
 ```
 
 Credentials expand only inside the containers and passwords are not printed. Both commands are safe to retry because the migrations use `CREATE TABLE IF NOT EXISTS`. Verify PostgreSQL before restarting authenticated services:
@@ -136,7 +139,7 @@ docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T
 
 Rollout ordering is service-specific:
 
-1. Apply and verify migrations `004_panic_wipe_message_indexes.cql`, `011_disappearing_messages.cql`, and `012_durable_message_ingest.cql` **before starting the updated message-service**; otherwise it fails closed because durable receipts/outbox or required message metadata are unavailable.
+1. Apply and verify migrations `004_panic_wipe_message_indexes.cql`, `011_disappearing_messages.cql`, `012_durable_message_ingest.cql`, and `013_group_recipient_snapshot.cql` **before starting the updated message-service**; otherwise it fails closed because durable receipts/outbox, immutable group recipient snapshots, or required message metadata are unavailable.
 2. Apply and verify migration `005_wiped_accounts.sql` **before starting the updated auth-service or ws-gateway**. Until 005 exists, JWT validation cannot prove durable revocation and fails closed, so authenticated REST requests and WebSocket authentication/message checks are rejected.
 
 ## Optional Tor Hidden Service

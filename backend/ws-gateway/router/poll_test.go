@@ -8,12 +8,49 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/iceq/iceq/shared/middleware"
+	"github.com/redis/go-redis/v9"
 )
 
 type pollStoreStub struct {
 	result PollResult
 	req    PollRequest
+}
+
+func TestPollReadsNonDestructivelyAndNextCursorAcknowledgesPreviousPage(t *testing.T) {
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	store := NewRedisPollStore(rdb)
+	ctx := context.Background()
+	first := []byte(`{"type":"message","id":"00000000-0000-4000-8000-000000000001","ts":1,"payload":{}}`)
+	second := []byte(`{"type":"message","id":"00000000-0000-4000-8000-000000000002","ts":2,"payload":{}}`)
+	if err := store.Enqueue(ctx, 42, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Enqueue(ctx, 42, second); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := store.Poll(ctx, PollRequest{UIN: 42, Limit: 1})
+	if err != nil || len(page.Envelopes) != 1 {
+		t.Fatalf("first poll=%+v err=%v", page, err)
+	}
+	scope, _ := DirectRecipientScope(42)
+	items, _ := store.acceptance.ReadAcceptedAfter(ctx, scope, "", 10)
+	if len(items) != 2 {
+		t.Fatalf("poll must be non-destructive, items=%d", len(items))
+	}
+
+	next, err := store.Poll(ctx, PollRequest{UIN: 42, Cursor: page.Cursor, Limit: 1})
+	if err != nil || len(next.Envelopes) != 1 {
+		t.Fatalf("next poll=%+v err=%v", next, err)
+	}
+	items, _ = store.acceptance.ReadAcceptedAfter(ctx, scope, "", 10)
+	if len(items) != 1 || items[0].MessageID != "00000000-0000-4000-8000-000000000002" {
+		t.Fatalf("previous page was not acknowledged exactly: %#v", items)
+	}
 }
 
 func (s *pollStoreStub) Poll(_ context.Context, req PollRequest) (PollResult, error) {

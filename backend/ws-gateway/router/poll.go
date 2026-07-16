@@ -86,29 +86,53 @@ func boundedInt(raw string, fallback, max int) int {
 	return n
 }
 
-type RedisPollStore struct{ rdb *redis.Client }
+type RedisPollStore struct {
+	rdb        *redis.Client
+	acceptance *RecipientAcceptanceStore
+}
 
 func NewRedisPollStore(rdb *redis.Client) *RedisPollStore {
 	if rdb == nil {
 		panic("poll redis is nil")
 	}
-	return &RedisPollStore{rdb: rdb}
+	return &RedisPollStore{rdb: rdb, acceptance: NewRecipientAcceptanceStore(rdb)}
 }
 
 func (s *RedisPollStore) Enqueue(ctx context.Context, uin int64, envelope []byte) error {
 	if uin <= 0 || len(envelope) == 0 || !json.Valid(envelope) {
 		return errors.New("invalid poll envelope")
 	}
-	key := pollStreamKey(uin)
-	pipe := s.rdb.Pipeline()
-	pipe.XAdd(ctx, &redis.XAddArgs{Stream: key, MaxLen: pollStreamMaxLen, Approx: true, Values: map[string]any{"envelope": envelope}})
-	pipe.Expire(ctx, key, pollStreamTTL)
-	_, err := pipe.Exec(ctx)
+	var wire struct {
+		ID      string          `json:"id"`
+		TS      int64           `json:"ts"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(envelope, &wire); err != nil || wire.ID == "" {
+		return errors.New("invalid poll envelope")
+	}
+	var expiry *time.Time
+	var payload struct {
+		ExpiresInSeconds int64 `json:"expires_in_seconds"`
+	}
+	if json.Unmarshal(wire.Payload, &payload) == nil && payload.ExpiresInSeconds > 0 {
+		value := time.UnixMilli(wire.TS).Add(time.Duration(payload.ExpiresInSeconds) * time.Second)
+		expiry = &value
+	}
+	scope, err := DirectRecipientScope(uin)
+	if err != nil {
+		return err
+	}
+	_, err = s.acceptance.Accept(ctx, RecipientAcceptance{Scope: scope, MessageID: wire.ID, Envelope: envelope, ExpiresAt: expiry})
 	return err
 }
 
+type pollCursorState struct {
+	After      string   `json:"after,omitempty"`
+	MessageIDs []string `json:"message_ids,omitempty"`
+}
+
 func (s *RedisPollStore) Poll(ctx context.Context, req PollRequest) (PollResult, error) {
-	lastID := "0-0"
+	state := pollCursorState{}
 	if req.Cursor != "" {
 		value, err := s.rdb.HGet(ctx, pollCursorHashKey(req.UIN), req.Cursor).Result()
 		if errors.Is(err, redis.Nil) {
@@ -117,28 +141,57 @@ func (s *RedisPollStore) Poll(ctx context.Context, req PollRequest) (PollResult,
 		if err != nil {
 			return PollResult{}, err
 		}
-		lastID = value
+		if json.Unmarshal([]byte(value), &state) != nil {
+			return PollResult{}, ErrInvalidPollCursor
+		}
+		if _, err := s.acceptance.AckRecipient(ctx, req.UIN, state.MessageIDs); err != nil {
+			return PollResult{}, err
+		}
 	}
-	streams, err := s.rdb.XRead(ctx, &redis.XReadArgs{Streams: []string{pollStreamKey(req.UIN), lastID}, Count: int64(req.Limit), Block: req.Wait}).Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
+	scope, err := DirectRecipientScope(req.UIN)
+	if err != nil {
+		return PollResult{}, err
+	}
+	deadline := time.NewTimer(req.Wait)
+	defer deadline.Stop()
+	var items []AcceptedEnvelope
+	for {
+		items, err = s.acceptance.ReadAcceptedAfter(ctx, scope, state.After, int64(req.Limit))
+		if err != nil || len(items) > 0 || req.Wait <= 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return PollResult{}, ctx.Err()
+		case <-deadline.C:
+			goto ready
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+ready:
+	if err != nil {
 		return PollResult{}, err
 	}
 	envelopes := make([]json.RawMessage, 0, req.Limit)
-	for _, stream := range streams {
-		for _, msg := range stream.Messages {
-			raw, ok := msg.Values["envelope"].(string)
-			if !ok || !json.Valid([]byte(raw)) {
-				continue
-			}
-			envelopes = append(envelopes, json.RawMessage(raw))
-			lastID = msg.ID
+	messageIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		if !json.Valid(item.Envelope) {
+			continue
 		}
+		envelopes = append(envelopes, json.RawMessage(item.Envelope))
+		messageIDs = append(messageIDs, item.MessageID)
+		state.After = item.StreamID
+	}
+	state.MessageIDs = messageIDs
+	encodedState, err := json.Marshal(state)
+	if err != nil {
+		return PollResult{}, err
 	}
 	var token string
 	if req.Cursor == "" {
-		token, err = s.issueCursor(ctx, req.UIN, lastID)
+		token, err = s.issueCursor(ctx, req.UIN, string(encodedState))
 	} else {
-		token, err = s.advanceCursor(ctx, req.UIN, req.Cursor, lastID)
+		token, err = s.advanceCursor(ctx, req.UIN, req.Cursor, string(encodedState))
 	}
 	if err != nil {
 		return PollResult{}, err
@@ -146,7 +199,6 @@ func (s *RedisPollStore) Poll(ctx context.Context, req PollRequest) (PollResult,
 	return PollResult{Cursor: token, Envelopes: envelopes}, nil
 }
 
-func pollStreamKey(uin int64) string      { return "poll:stream:" + strconv.FormatInt(uin, 10) }
 func pollCursorHashKey(uin int64) string  { return "poll:cursors:" + strconv.FormatInt(uin, 10) }
 func pollCursorOrderKey(uin int64) string { return "poll:cursor-order:" + strconv.FormatInt(uin, 10) }
 

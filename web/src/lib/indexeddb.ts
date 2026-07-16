@@ -58,7 +58,7 @@
 // Schema v3: adds metadata for the replenishment prekey-id cursor.
 
 export const ICEQ_INDEXEDDB_NAME = "iceq";
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 const STORE_IDENTITY = "identity";
 const STORE_SESSIONS = "sessions";
@@ -69,6 +69,7 @@ const STORE_MESSAGES = "messages";
 const STORE_METADATA = "metadata";
 const STORE_PEER_TRUST = "peer_trust";
 const STORE_GROUP_CRYPTO = "group_crypto";
+const STORE_TRANSPORT_SEEN = "transport_seen";
 
 const SELF_KEY = "self";
 const NEXT_PREKEY_ID_KEY = "next_prekey_id";
@@ -394,10 +395,72 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_GROUP_CRYPTO)) {
         db.createObjectStore(STORE_GROUP_CRYPTO);
       }
+      if (!db.objectStoreNames.contains(STORE_TRANSPORT_SEEN)) {
+        db.createObjectStore(STORE_TRANSPORT_SEEN);
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error ?? new Error("idb open failed"));
   });
+}
+
+interface TransportSeenRecord { status: "processing" | "seen"; claimedAt: number; leaseUntil?: number; expiresAt?: number }
+
+/** Atomically claims a stable transport id across tabs and page reloads. */
+export async function claimTransportEnvelopeID(id: string, expiresAt?: number): Promise<boolean> {
+  if (!id) return false;
+  const db = await openDB();
+  try {
+    return await new Promise<boolean>((resolve, reject) => {
+      const tx = db.transaction(STORE_TRANSPORT_SEEN, "readwrite");
+      const store = tx.objectStore(STORE_TRANSPORT_SEEN);
+      const get = store.get(id);
+      let claimed = false;
+      get.onsuccess = () => {
+        const current = get.result as TransportSeenRecord | undefined;
+        const now = Date.now();
+        const currentValid = current && (current.expiresAt === undefined || current.expiresAt > now);
+        if (currentValid && (current.status === "seen" || (current.leaseUntil ?? 0) > now)) return;
+        store.put({ status: "processing", claimedAt: now, leaseUntil: now + 60_000, ...(expiresAt !== undefined ? { expiresAt } : {}) } satisfies TransportSeenRecord, id);
+        claimed = true;
+      };
+      tx.oncomplete = () => resolve(claimed);
+      tx.onerror = () => reject(tx.error ?? new Error("transport seen claim failed"));
+      tx.onabort = () => reject(tx.error ?? new Error("transport seen claim aborted"));
+    });
+  } finally { db.close(); }
+}
+
+/** Commits a previously claimed id only after dispatch completed. */
+export async function commitTransportEnvelopeID(id: string): Promise<void> {
+  const db = await openDB();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_TRANSPORT_SEEN, "readwrite");
+      const store = tx.objectStore(STORE_TRANSPORT_SEEN);
+      const get = store.get(id);
+      get.onsuccess = () => {
+        const current = get.result as TransportSeenRecord | undefined;
+        if (current?.status === "processing") store.put({ ...current, status: "seen", leaseUntil: undefined } satisfies TransportSeenRecord, id);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("transport seen commit failed"));
+    });
+  } finally { db.close(); }
+}
+
+/** True only after dispatch and the durable seen commit completed. */
+export async function isTransportEnvelopeCommitted(id: string): Promise<boolean> {
+  const db = await openDB();
+  try {
+    const current = await idbGet<TransportSeenRecord>(db, STORE_TRANSPORT_SEEN, id);
+    return current?.status === "seen" && (current.expiresAt === undefined || current.expiresAt > Date.now());
+  } finally { db.close(); }
+}
+
+export async function releaseTransportEnvelopeID(id: string): Promise<void> {
+  const db = await openDB();
+  try { await idbDelete(db, STORE_TRANSPORT_SEEN, id); } finally { db.close(); }
 }
 
 function idbPut(db: IDBDatabase, store: string, value: unknown, key: IDBValidKey): Promise<void> {

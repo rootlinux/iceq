@@ -66,6 +66,10 @@ const (
 	// its delivery state (delivered, persisted, read).
 	EnvelopeTypeAck = "ack"
 
+	// EnvelopeTypeTransportAck confirms the authenticated recipient has
+	// durably committed received envelope IDs locally.
+	EnvelopeTypeTransportAck = "transport_ack"
+
 	// EnvelopeTypeError is a server-to-client error message. The
 	// client should display it and increment any retry counters.
 	EnvelopeTypeError = "error"
@@ -192,6 +196,10 @@ func NewEnvelope(envelopeType string, payload any) (Envelope, error) {
 // removing a field requires a coordinated client/server rollout.
 // ----------------------------------------------------------------------------
 
+type TransportAckPayload struct {
+	MessageIDs []string `json:"message_ids"`
+}
+
 // DirectMessagePayload is the body of a 1:1 chat message. ToUIN is the
 // public client contract; ReceiverUIN is kept as the persisted/server
 // alias for older clients and service-internal records.
@@ -245,6 +253,9 @@ type GroupMessagePayload struct {
 	CryptoVersion    int    `json:"crypto_version"`
 	CryptoEpoch      int64  `json:"crypto_epoch"`
 	ExpiresInSeconds int64  `json:"expires_in_seconds,omitempty"`
+	// RecipientUINs is a server-generated immutable membership snapshot for
+	// the exact crypto epoch. Gateways must never trust a client-supplied list.
+	RecipientUINs []int64 `json:"recipient_uins,omitempty"`
 }
 
 // TypingPayload is a transient indicator. The server-side presence

@@ -47,6 +47,25 @@ func TestRecipientAcceptanceMixedOffAndExpiringRecordsExpireIndependently(t *tes
 	}
 }
 
+func TestAckRecipientRemovesPayloadAndFreesCapacityButKeepsDedupe(t *testing.T) {
+	_, store, scope := acceptanceTestStore(t)
+	ctx := context.Background()
+	if ok, err := store.Accept(ctx, RecipientAcceptance{Scope: scope, MessageID: "ack-me", Envelope: []byte("wire")}); err != nil || !ok {
+		t.Fatalf("accept=(%v,%v)", ok, err)
+	}
+	removed, err := store.AckRecipient(ctx, 42, []string{"ack-me"})
+	if err != nil || removed != 1 {
+		t.Fatalf("ack=(%d,%v)", removed, err)
+	}
+	items, err := store.ReadAcceptedAfter(ctx, scope, "", 10)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("items=%#v err=%v", items, err)
+	}
+	if ok, err := store.Accept(ctx, RecipientAcceptance{Scope: scope, MessageID: "ack-me", Envelope: []byte("wire")}); err != nil || ok {
+		t.Fatalf("dedupe after ack=(%v,%v)", ok, err)
+	}
+}
+
 func TestRecipientAcceptanceExpiresWithoutPollOrBackgroundWorker(t *testing.T) {
 	server, store, scope := acceptanceTestStore(t)
 	expires := time.Now().Add(time.Hour)

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import "fake-indexeddb/auto";
 
 import { MessageTransportCoordinator, TransportInbox, markEnvelopeRetryable } from "../src/hooks/useMessageTransport.ts";
+import { claimTransportEnvelopeID, commitTransportEnvelopeID, isTransportEnvelopeCommitted } from "../src/lib/indexeddb.ts";
 
 const raw = (id: string) => JSON.stringify({ type: "message", id, ts: 1, payload: { ciphertext: "opaque" } });
 
@@ -52,4 +54,27 @@ test("dedupe memory is bounded and evicts oldest IDs", () => {
   inbox.consume(raw("one"), "ws"); inbox.consume(raw("two"), "poll"); inbox.consume(raw("three"), "poll");
   assert.equal(inbox.consume(raw("one"), "ws"), true);
   assert.deepEqual(delivered, ["one", "two", "three", "one"]);
+});
+
+test("persistent transport seen survives a browser inbox reload", async () => {
+  const id = `reload-${Date.now()}-${Math.random()}`;
+  assert.equal(await claimTransportEnvelopeID(id), true);
+  await commitTransportEnvelopeID(id);
+	assert.equal(await isTransportEnvelopeCommitted(id), true);
+  // A newly-created receive boundary uses the same IndexedDB claim.
+  assert.equal(await claimTransportEnvelopeID(id), false);
+});
+
+test("concurrent WS and poll claims dispatch one stable message id", async () => {
+  const id = `race-${Date.now()}-${Math.random()}`;
+  const claims = await Promise.all([claimTransportEnvelopeID(id), claimTransportEnvelopeID(id)]);
+  assert.equal(claims.filter(Boolean).length, 1);
+});
+
+test("expired persistent seen records are reclaimed", async () => {
+  const id = `expires-${Date.now()}-${Math.random()}`;
+  assert.equal(await claimTransportEnvelopeID(id, Date.now() + 5), true);
+  await commitTransportEnvelopeID(id);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(await claimTransportEnvelopeID(id, Date.now() + 1000), true);
 });

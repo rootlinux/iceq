@@ -9,7 +9,6 @@ import (
 
 	"github.com/iceq/iceq/shared/models"
 	"github.com/iceq/iceq/ws-gateway/router"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 )
 
@@ -21,41 +20,34 @@ const (
 
 type recipientAccepter interface {
 	Accept(context.Context, router.RecipientAcceptance) (bool, error)
+	ReadAcceptedAfter(context.Context, router.RecipientAcceptanceScope, string, int64) ([]router.AcceptedEnvelope, error)
 }
 type liveDeliveryNotifier interface{ SendLive(int64, []byte) }
 type deliveryReceiptRequester interface {
 	Request(string, []byte, time.Duration) ([]byte, error)
 }
-type groupMemberLookup interface {
-	Members(context.Context, string) ([]int64, error)
-}
-
-type pgGroupMemberLookup struct{ pg *pgxpool.Pool }
-
-func (l pgGroupMemberLookup) Members(ctx context.Context, groupID string) ([]int64, error) {
-	rows, err := l.pg.Query(ctx, `SELECT uin FROM group_members WHERE group_id = $1`, groupID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []int64
-	for rows.Next() {
-		var uin int64
-		if err := rows.Scan(&uin); err != nil {
-			return nil, err
-		}
-		result = append(result, uin)
-	}
-	return result, rows.Err()
-}
-
 type deliveryReceipt struct {
 	SenderUIN int64  `json:"sender_uin"`
 	ClientID  string `json:"client_id"`
 	MessageID string `json:"message_id"`
 }
 
-func acceptDelivery(ctx context.Context, accepter recipientAccepter, live liveDeliveryNotifier, receipts deliveryReceiptRequester, groups groupMemberLookup, subject string, body []byte) error {
+func replayAccepted(ctx context.Context, queue recipientAccepter, live liveDeliveryNotifier, recipientUIN int64) error {
+	scope, err := router.DirectRecipientScope(recipientUIN)
+	if err != nil {
+		return err
+	}
+	items, err := queue.ReadAcceptedAfter(ctx, scope, "", 1000)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		live.SendLive(recipientUIN, item.Envelope)
+	}
+	return nil
+}
+
+func acceptDelivery(ctx context.Context, accepter recipientAccepter, live liveDeliveryNotifier, receipts deliveryReceiptRequester, subject string, body []byte) error {
 	var env models.Envelope
 	if err := json.Unmarshal(body, &env); err != nil || env.ID == "" {
 		return errors.New("invalid delivery envelope")
@@ -88,15 +80,11 @@ func acceptDelivery(ctx context.Context, accepter recipientAccepter, live liveDe
 		if err := json.Unmarshal(env.Payload, &payload); err != nil || payload.SenderUIN <= 0 || payload.GroupID == "" || payload.ClientID == "" {
 			return errors.New("invalid group delivery")
 		}
-		if subject != "msg.group."+payload.GroupID || groups == nil {
+		if subject != "msg.group."+payload.GroupID || len(payload.RecipientUINs) == 0 {
 			return errors.New("group subject mismatch")
 		}
-		members, err := groups.Members(ctx, payload.GroupID)
-		if err != nil || len(members) == 0 {
-			return errors.New("group members unavailable")
-		}
-		sender, clientID, recipients = payload.SenderUIN, payload.ClientID, members
-		for _, uin := range members {
+		sender, clientID, recipients = payload.SenderUIN, payload.ClientID, payload.RecipientUINs
+		for _, uin := range payload.RecipientUINs {
 			scope, err := router.GroupMemberScope(payload.GroupID, uin)
 			if err != nil {
 				return err
@@ -111,12 +99,14 @@ func acceptDelivery(ctx context.Context, accepter recipientAccepter, live liveDe
 		return errors.New("unsupported delivery type")
 	}
 	for i, scope := range scopes {
-		accepted, err := accepter.Accept(ctx, router.RecipientAcceptance{Scope: scope, MessageID: env.ID, Envelope: body, ExpiresAt: expiresAt})
+		_, err := accepter.Accept(ctx, router.RecipientAcceptance{Scope: scope, MessageID: env.ID, Envelope: body, ExpiresAt: expiresAt})
 		if err != nil {
 			return err
 		}
-		if accepted {
-			live.SendLive(recipients[i], body)
+		// Delivery is always replayed from the durable recipient queue. This
+		// also repairs a crash between Accept and the prior wake-up attempt.
+		if err := replayAccepted(ctx, accepter, live, recipients[i]); err != nil {
+			return err
 		}
 	}
 	receiptBody, _ := json.Marshal(deliveryReceipt{SenderUIN: sender, ClientID: clientID, MessageID: env.ID})
@@ -143,7 +133,7 @@ func ensureDeliveryConsumer(js nats.JetStreamContext) error {
 	return nil
 }
 
-func startDeliveryConsumer(ctx context.Context, js nats.JetStreamContext, accepter recipientAccepter, live liveDeliveryNotifier, receipts deliveryReceiptRequester, groups groupMemberLookup) error {
+func startDeliveryConsumer(ctx context.Context, js nats.JetStreamContext, accepter recipientAccepter, live liveDeliveryNotifier, receipts deliveryReceiptRequester) error {
 	if err := ensureDeliveryConsumer(js); err != nil {
 		return err
 	}
@@ -159,7 +149,7 @@ func startDeliveryConsumer(ctx context.Context, js nats.JetStreamContext, accept
 			}
 			for _, msg := range msgs {
 				entryCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-				err := acceptDelivery(entryCtx, accepter, live, receipts, groups, msg.Subject, msg.Data)
+				err := acceptDelivery(entryCtx, accepter, live, receipts, msg.Subject, msg.Data)
 				cancel()
 				if err != nil {
 					_ = msg.NakWithDelay(time.Second)

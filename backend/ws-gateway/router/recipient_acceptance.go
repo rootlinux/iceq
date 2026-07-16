@@ -155,6 +155,43 @@ func (s *RecipientAcceptanceStore) DrainAccepted(ctx context.Context, scope Reci
 	return s.readOrDrain(ctx, scope, after, count, true)
 }
 
+var ackAcceptedScript = redis.NewScript(`
+local wanted = {}
+for i=1,#ARGV do wanted[ARGV[i]] = true end
+local refs = redis.call('ZRANGE', KEYS[1], 0, -1)
+local removed = 0
+for _, ref in ipairs(refs) do
+  if redis.call('EXISTS', ref) == 0 then
+    redis.call('ZREM', KEYS[1], ref)
+  else
+    local id = redis.call('HGET', ref, 'message_id')
+    if wanted[id] then
+      redis.call('ZREM', KEYS[1], ref)
+      redis.call('DEL', ref)
+      removed = removed + 1
+    end
+  end
+end
+return removed
+`)
+
+// AckRecipient removes only payload records the authenticated recipient has
+// durably processed. Seen markers remain, so producer redelivery is a no-op.
+func (s *RecipientAcceptanceStore) AckRecipient(ctx context.Context, recipientUIN int64, messageIDs []string) (int64, error) {
+	scope, err := DirectRecipientScope(recipientUIN)
+	if err != nil || len(messageIDs) == 0 {
+		return 0, err
+	}
+	args := make([]any, 0, len(messageIDs))
+	for _, id := range messageIDs {
+		if strings.TrimSpace(id) == "" {
+			return 0, ErrInvalidAcceptance
+		}
+		args = append(args, id)
+	}
+	return ackAcceptedScript.Run(ctx, s.rdb, []string{AcceptanceQueueKey(scope)}, args...).Int64()
+}
+
 // ReadAccepted preserves the older poll-facing shape. start is a sequence cursor;
 // "-" and an empty string mean the beginning. stop is retained for compatibility.
 func (s *RecipientAcceptanceStore) ReadAccepted(ctx context.Context, scope RecipientAcceptanceScope, start, _ string, count int64) ([]AcceptedEnvelope, error) {

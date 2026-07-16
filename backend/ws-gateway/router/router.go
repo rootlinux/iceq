@@ -71,6 +71,8 @@ func Dispatch(c *client.Client, env models.Envelope) {
 		handleRead(c, deps, env)
 	case models.EnvelopeTypePresence:
 		handlePresence(deps, env)
+	case models.EnvelopeTypeTransportAck:
+		handleTransportAck(c, deps, env)
 	case "ping":
 		handlePing(c, env)
 	default:
@@ -82,6 +84,29 @@ func Dispatch(c *client.Client, env models.Envelope) {
 			Message: "envelope type not recognized",
 		})
 		c.TrySend(mustMarshal(errEnv))
+	}
+}
+
+func handleTransportAck(c *client.Client, deps client.Deps, env models.Envelope) {
+	if deps.RecipientQueueAcker == nil {
+		sendErrorFrame(c, "TRANSPORT_ACK_UNAVAILABLE", "recipient queue unavailable")
+		return
+	}
+	var payload models.TransportAckPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil || len(payload.MessageIDs) == 0 || len(payload.MessageIDs) > 100 {
+		sendErrorFrame(c, "INVALID_PAYLOAD", "message_ids must contain 1 to 100 ids")
+		return
+	}
+	for _, id := range payload.MessageIDs {
+		if _, err := uuid.Parse(id); err != nil {
+			sendErrorFrame(c, "INVALID_PAYLOAD", "message_ids must be UUIDs")
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := deps.RecipientQueueAcker.AckRecipient(ctx, c.UIN(), payload.MessageIDs); err != nil {
+		sendErrorFrame(c, "TRANSPORT_ACK_FAILED", "recipient queue unavailable")
 	}
 }
 

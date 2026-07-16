@@ -46,6 +46,7 @@ import type {
 } from "../types/envelope";
 import type { Message } from "../types/models";
 import { parseEnvelope } from "../types/envelope";
+import { claimTransportEnvelopeID, commitTransportEnvelopeID, isTransportEnvelopeCommitted, releaseTransportEnvelopeID } from "../lib/indexeddb";
 import { useGroupStore } from "../store/groupStore";
 import { authenticatedGroupMessageFields, decodeGroupCiphertext, openGroupContent, processDirectControlMessage } from "../lib/groupCrypto";
 import { getGroupMembersWithEpoch } from "../api/groups";
@@ -96,6 +97,7 @@ export function useWebSocket(): UseWebSocketResult {
   const authInflightRef = useRef(false);
   const seenEnvelopeIDsRef = useRef<Set<string>>(new Set());
   const seenEnvelopeOrderRef = useRef<string[]>([]);
+  const inflightPersistentIDsRef = useRef<Set<string>>(new Set());
   const dispatchRef = useRef<(env: Envelope, ws: WebSocket | null) => Promise<void>>(async () => undefined);
 
   const accessToken = useAuthStore((s) => s.accessToken);
@@ -419,6 +421,10 @@ export function useWebSocket(): UseWebSocketResult {
         if (__DEV__) console.error("[ws] error frame:", p);
         return;
       }
+	  case "transport_ack": {
+		// Client-to-server only. Ignore a reflected frame defensively.
+		return;
+	  }
       default: {
         // Exhaustiveness guard. If a new EnvelopeType is
         // added, TypeScript will flag this `default`
@@ -443,6 +449,36 @@ export function useWebSocket(): UseWebSocketResult {
   }, []);
 
   function consumeEnvelope(env: Envelope, ws: WebSocket | null): boolean {
+    if (env.type === "message" || env.type === "group_msg") {
+      if (inflightPersistentIDsRef.current.has(env.id)) return false;
+      inflightPersistentIDsRef.current.add(env.id);
+      const seconds = Number((env.payload as { expires_in_seconds?: number } | null)?.expires_in_seconds ?? 0);
+      const expiresAt = Number.isFinite(seconds) && seconds > 0 ? env.ts + seconds * 1000 : undefined;
+      void claimTransportEnvelopeID(env.id, expiresAt).then(async (claimed) => {
+		if (!claimed) {
+		  // A committed duplicate means a prior transport ACK may have been
+		  // lost. Re-ACK it, but never ACK another tab's active processing lease.
+		  if (ws && await isTransportEnvelopeCommitted(env.id)) {
+			safeSend(ws, {type: "transport_ack", id: crypto.randomUUID(), ts: Date.now(), payload: {message_ids: [env.id]}});
+		  }
+		  return;
+		}
+        try {
+          setLastEnvelope(env);
+          await dispatchRef.current(env, ws);
+          await commitTransportEnvelopeID(env.id);
+		  if (ws) {
+			safeSend(ws, {type: "transport_ack", id: crypto.randomUUID(), ts: Date.now(), payload: {message_ids: [env.id]}});
+		  }
+        } catch (error) {
+          await releaseTransportEnvelopeID(env.id);
+          if (__DEV__) console.error("[ws] persistent dispatch failed", error);
+        }
+      }).catch((error) => {
+        if (__DEV__) console.error("[ws] persistent dedupe unavailable", error);
+      }).finally(() => inflightPersistentIDsRef.current.delete(env.id));
+      return true;
+    }
     if (seenEnvelopeIDsRef.current.has(env.id)) return false;
     seenEnvelopeIDsRef.current.add(env.id);
     seenEnvelopeOrderRef.current.push(env.id);

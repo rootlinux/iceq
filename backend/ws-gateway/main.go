@@ -170,19 +170,23 @@ func main() {
 		log.Fatalf("jetstream context: %v", err)
 	}
 	deliveryCtx, stopDelivery := context.WithCancel(context.Background())
-	if err := startDeliveryConsumer(deliveryCtx, js, acceptanceStore, h, nc, pgGroupMemberLookup{pg: pgPool}); err != nil {
+	if err := startDeliveryConsumer(deliveryCtx, js, acceptanceStore, h, nc); err != nil {
 		stopDelivery()
 		log.Fatalf("durable delivery consumer: %v", err)
 	}
 
 	// --- Shared client deps (passed to every WebSocket) ---------------
 	deps := client.Deps{
-		NATS:     nc,
-		Hub:      h,
-		Redis:    rdb,
-		Manager:  mgr,
-		PG:       pgPool,
-		Dispatch: router.Dispatch,
+		NATS:                nc,
+		Hub:                 h,
+		Redis:               rdb,
+		Manager:             mgr,
+		PG:                  pgPool,
+		Dispatch:            router.Dispatch,
+		RecipientQueueAcker: acceptanceStore,
+		WakeAccepted: func(ctx context.Context, uin int64) error {
+			return replayAccepted(ctx, acceptanceStore, h, uin)
+		},
 		ConnectRateLimiter: middleware.NewAuthenticatedRateLimiter(middleware.AuthenticatedRateLimitConfig{
 			Redis: rdb, Action: "ws:connect", Limit: 20, Window: time.Minute,
 		}),
