@@ -95,7 +95,11 @@ persist only HMAC buckets, never the raw identity or User-Agent.
 ## Open findings and limits
 - Public key-bundle discovery is required for asynchronous Signal session
   setup and is intentionally not treated as private object access.
-- File grants and WebSocket delivery are separate services, so rollback covers
-  encryption and synchronous send submission failures, not a later negative or
-  missing delivery acknowledgment. Durable ack-coupled grant cleanup remains a
-  future cross-service transaction/outbox concern.
+- File grants and WebSocket delivery are separate services, so they are not a
+  single cross-service transaction. The client keeps each grant pending until a
+  persisted/delivered/read acknowledgment, revokes it when the caller reports
+  failure or on timeout, socket close, logout, or local send failure, retries transient revoke
+  failures, and preserves exhausted failures for a later `revokeAll` attempt.
+  This is durable only for the lifetime of the in-memory web session; a browser
+  crash or process termination before cleanup still needs a server-side
+  transaction/outbox or lease-expiry design.

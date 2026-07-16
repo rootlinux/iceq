@@ -1,6 +1,6 @@
 # IceQ Security Status
 
-Last reviewed: 2026-07-12
+Last reviewed: 2026-07-16
 
 This report maps the requested IceQ security and anonymity checklist to the current codebase state. It is intentionally conservative: items are marked complete only when the repository contains implementation and local verification evidence.
 
@@ -76,9 +76,9 @@ Implemented:
 - CI security workflow now runs backend tests, web tests/build, npm audit, and Compose config validation.
 
 Remaining:
-- IDOR and tenant isolation need a route-by-route audit.
+- The repository route surface has a route-by-route authentication, object-authorization, uniform-failure, and rate-limit audit in `docs/security-route-audit.md`. Rows distinguish behavioral tests from source-review-only evidence; this is repository evidence, not a production penetration-test claim.
 - Database at-rest encryption is an operator/storage-layer task and is not fully automated here.
-- Rate limiting is primarily edge-level; service-level abuse controls should be expanded.
+- Redis-backed, authenticated per-action rate limits cover auth/session mutation, contacts, key mutation/count, message/group reads and mutations, presence, file URLs/grants, and WebSocket connect/frame paths. Login, registration, and public bundle lookup use rotating-HMAC anonymous buckets behind the edge. Some route mounts remain source-review-only rather than dedicated behavior tests, as recorded in the route audit.
 - Ciphertext written before migration `004_panic_wipe_message_indexes.cql` has no deletion-index row. Operators must handle that legacy data with a bounded offline migration or retention expiry; the online panic-wipe path intentionally never performs a cluster-wide scan.
 
 Tradeoff:
@@ -162,4 +162,4 @@ Docker initdb mounts execute only for fresh volumes. Existing deployments must a
 2. Add a read-only message-retention indicator before offering user-controlled disappearing-message settings.
 3. Design group E2EE with Sender Keys or MLS before implementing group attachments.
 4. Add long-polling fallback for WebSocket-hostile paths.
-5. Complete route-by-route IDOR and tenant-isolation audit.
+5. Add dedicated route-level behavior tests for the source-review-only rows identified in `docs/security-route-audit.md` and repeat the audit against the deployed edge.
