@@ -76,9 +76,59 @@ func TestRecipientAcceptanceExpiresWithoutPollOrBackgroundWorker(t *testing.T) {
 	if !server.Exists(recordKey) {
 		t.Fatal("record not created")
 	}
+	if ttl := server.TTL(AcceptanceQueueKey(scope)); ttl <= 0 || ttl > time.Hour {
+		t.Fatalf("expiring-only index TTL=%s", ttl)
+	}
+	if ttl := server.TTL(acceptanceSequenceKey(scope)); ttl <= 0 || ttl > time.Hour {
+		t.Fatalf("expiring-only sequence TTL=%s", ttl)
+	}
 	server.FastForward(time.Hour + time.Millisecond)
 	if server.Exists(recordKey) {
 		t.Fatal("ciphertext record survived expires_at without a poll")
+	}
+	if server.Exists(AcceptanceQueueKey(scope)) || server.Exists(acceptanceSequenceKey(scope)) {
+		t.Fatal("dormant expiring-only queue metadata survived maximum item expiry")
+	}
+}
+
+func TestAckLastOffRecordRecomputesMetadataTTLFromRemainingExpiringRecords(t *testing.T) {
+	server, store, scope := acceptanceTestStore(t)
+	ctx := context.Background()
+	expires := time.Now().Add(time.Hour)
+	if _, err := store.Accept(ctx, RecipientAcceptance{Scope: scope, MessageID: "timed", Envelope: []byte("timed"), ExpiresAt: &expires}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Accept(ctx, RecipientAcceptance{Scope: scope, MessageID: "off", Envelope: []byte("off")}); err != nil {
+		t.Fatal(err)
+	}
+	if ttl := server.TTL(AcceptanceQueueKey(scope)); ttl != 0 {
+		t.Fatalf("mixed index TTL=%s, want persistent", ttl)
+	}
+	if _, err := store.AckRecipient(ctx, 42, []string{"off"}); err != nil {
+		t.Fatal(err)
+	}
+	if ttl := server.TTL(AcceptanceQueueKey(scope)); ttl <= 0 || ttl > time.Hour {
+		t.Fatalf("post-off index TTL=%s", ttl)
+	}
+	if ttl := server.TTL(acceptanceSequenceKey(scope)); ttl <= 0 || ttl > time.Hour {
+		t.Fatalf("post-off sequence TTL=%s", ttl)
+	}
+	server.FastForward(time.Hour + time.Millisecond)
+	if server.Exists(AcceptanceQueueKey(scope)) || server.Exists(acceptanceSequenceKey(scope)) {
+		t.Fatal("recomputed metadata did not expire")
+	}
+}
+
+func TestAckLastRecordDeletesEmptyQueueMetadata(t *testing.T) {
+	server, store, scope := acceptanceTestStore(t)
+	if _, err := store.Accept(context.Background(), RecipientAcceptance{Scope: scope, MessageID: "last", Envelope: []byte("wire")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AckRecipient(context.Background(), 42, []string{"last"}); err != nil {
+		t.Fatal(err)
+	}
+	if server.Exists(AcceptanceQueueKey(scope)) || server.Exists(acceptanceSequenceKey(scope)) {
+		t.Fatal("empty queue metadata retained")
 	}
 }
 

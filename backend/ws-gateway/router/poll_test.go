@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 type pollStoreStub struct {
 	result PollResult
 	req    PollRequest
+	err    error
 }
 
 func TestPollReadsNonDestructivelyAndNextCursorAcknowledgesPreviousPage(t *testing.T) {
@@ -55,7 +57,7 @@ func TestPollReadsNonDestructivelyAndNextCursorAcknowledgesPreviousPage(t *testi
 
 func (s *pollStoreStub) Poll(_ context.Context, req PollRequest) (PollResult, error) {
 	s.req = req
-	return s.result, nil
+	return s.result, s.err
 }
 
 func TestPollRequiresAuthenticatedOwnerAndCapsClientBounds(t *testing.T) {
@@ -110,6 +112,17 @@ func TestPollRejectsMissingAuthAndWrongMethod(t *testing.T) {
 		if rr.Code != tc.want {
 			t.Fatalf("%s auth=%v status=%d want=%d", tc.method, tc.auth, rr.Code, tc.want)
 		}
+	}
+}
+
+func TestPollInvalidCursorHasStableMachineReadableCode(t *testing.T) {
+	store := &pollStoreStub{err: ErrInvalidPollCursor}
+	req := httptest.NewRequest(http.MethodGet, "/poll?cursor=stale", nil)
+	req = req.WithContext(middleware.WithUIN(req.Context(), 42))
+	rr := httptest.NewRecorder()
+	NewPollHandler(store).ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), `"code":"INVALID_POLL_CURSOR"`) {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
 

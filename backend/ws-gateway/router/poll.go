@@ -59,7 +59,10 @@ func NewPollHandler(store PollStore) http.Handler {
 		waitMS := boundedInt(r.URL.Query().Get("wait_ms"), int(DefaultPollWait/time.Millisecond), int(MaxPollWait/time.Millisecond))
 		result, err := store.Poll(r.Context(), PollRequest{UIN: uin, Cursor: r.URL.Query().Get("cursor"), Limit: limit, Wait: time.Duration(waitMS) * time.Millisecond})
 		if errors.Is(err, ErrInvalidPollCursor) {
-			http.Error(w, "invalid cursor", http.StatusBadRequest)
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_POLL_CURSOR", "error": "invalid cursor"})
 			return
 		}
 		if err != nil {

@@ -4,6 +4,7 @@ import "fake-indexeddb/auto";
 
 import { MessageTransportCoordinator, TransportInbox, markEnvelopeRetryable } from "../src/hooks/useMessageTransport.ts";
 import { claimTransportEnvelopeID, commitTransportEnvelopeID, isTransportEnvelopeCommitted } from "../src/lib/indexeddb.ts";
+import { ApiError, ApiNetworkError } from "../src/api/client.ts";
 
 const raw = (id: string) => JSON.stringify({ type: "message", id, ts: 1, payload: { ciphertext: "opaque" } });
 
@@ -27,6 +28,35 @@ test("transport lifecycle falls back for receive and send then promotes to WS an
 	coordinator.send({type:"message",id:"fallback",ts:1,payload:{}} as never);await Promise.resolve();await Promise.resolve();assert.deepEqual(http,["fallback"]);assert.deepEqual(consumed,["ack"]);
 	coordinator.setConnected(true);assert.equal(pollSignal?.aborted,true);coordinator.send({type:"message",id:"live",ts:1,payload:{}} as never);assert.deepEqual(ws,["live"]);
 	resolvePoll({cursor:"next",envelopes:[{type:"message",id:"late",ts:1,payload:{}}]});await Promise.resolve();assert.equal(consumed.includes("late"),false);
+});
+
+test("lost advanced poll response resets an invalid cursor and recovers cursorless without duplicate delivery", async () => {
+  const calls: Array<string | null> = [];
+  const delivered: string[] = [];
+  let coordinator!: MessageTransportCoordinator;
+	const suffix = `${Date.now()}-${Math.random()}`;
+	const page1 = {type:"message", id:`page-1-${suffix}`, ts:1, payload:{}} as never;
+	const page2 = {type:"message", id:`page-2-${suffix}`, ts:2, payload:{}} as never;
+  const poll = async (cursor: string | null): Promise<{cursor:string; envelopes:any[]}> => {
+    calls.push(cursor);
+    if (calls.length === 1) return {cursor:"cursor-1", envelopes:[page1]};
+    if (calls.length === 2) throw new ApiNetworkError("response lost after server advance");
+    if (calls.length === 3) throw new ApiError("invalid", 400, "INVALID_POLL_CURSOR");
+	return {cursor:"cursor-recovered", envelopes:[page1, page2]};
+  };
+  coordinator = new MessageTransportCoordinator({
+    poll: poll as never, httpSend: async()=>page1, wsSend:()=>false,
+	consume: (env) => { if (env.id === page2.id) coordinator.setConnected(true); void (async () => {
+	  if (!await claimTransportEnvelopeID(env.id)) return;
+	  delivered.push(env.id);
+	  await commitTransportEnvelopeID(env.id);
+	})(); },
+    onSendFailure:()=>{}, retryDelayMs:0,
+  });
+  coordinator.setConnected(false);
+  for (let i=0; i<30 && delivered.length<2; i++) await new Promise((resolve)=>setTimeout(resolve, 1));
+  assert.deepEqual(calls.slice(0,4), [null, "cursor-1", "cursor-1", null]);
+  assert.deepEqual(delivered, [page1.id, page2.id]);
 });
 
 test("transport logout aborts active poll and HTTP failure enters safe retry state",async()=>{

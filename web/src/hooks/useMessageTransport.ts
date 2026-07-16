@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import { pollEnvelopes, sendEnvelopeHTTP } from "../api/poll";
+import { isInvalidPollCursor, pollEnvelopes, sendEnvelopeHTTP } from "../api/poll";
 import { parseEnvelope, type Envelope } from "../types/envelope";
 import { useWebSocket, type UseWebSocketResult } from "./useWebSocket";
 import { useChatStore } from "../store/chatStore";
@@ -75,6 +75,10 @@ export class MessageTransportCoordinator {
           this.cursor = page.cursor; for (const envelope of page.envelopes) this.deps.consume(envelope);
         } catch (error) {
           if (controller.signal.aborted || (error as { name?: string }).name === "AbortError") return;
+		  if (isInvalidPollCursor(error)) {
+			this.cursor = null;
+			continue;
+		  }
           await new Promise((resolve) => setTimeout(resolve, this.deps.retryDelayMs ?? 1000));
         }
       }

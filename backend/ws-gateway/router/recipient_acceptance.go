@@ -78,13 +78,27 @@ for _, ref in ipairs(refs) do
 end
 if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[5]) then return -1 end
 local seq = redis.call('INCR', KEYS[4])
-redis.call('HSET', KEYS[3], 'message_id', ARGV[1], 'envelope', ARGV[2], 'scope', ARGV[3], 'seq', seq)
+redis.call('HSET', KEYS[3], 'message_id', ARGV[1], 'envelope', ARGV[2], 'scope', ARGV[3], 'seq', seq, 'expires_at', ARGV[4])
 redis.call('SET', KEYS[2], '1')
 if ARGV[4] ~= 'off' then
   redis.call('PEXPIREAT', KEYS[3], ARGV[4])
   redis.call('PEXPIREAT', KEYS[2], ARGV[4])
 end
 redis.call('ZADD', KEYS[1], seq, KEYS[3])
+local live = redis.call('ZRANGE', KEYS[1], 0, -1)
+local hasOff = false
+local maxExpiry = 0
+for _, ref in ipairs(live) do
+  local expiry = redis.call('HGET', ref, 'expires_at')
+  if not expiry or expiry == 'off' then hasOff = true else maxExpiry = math.max(maxExpiry, tonumber(expiry)) end
+end
+if hasOff then
+  redis.call('PERSIST', KEYS[1]); redis.call('PERSIST', KEYS[4])
+elseif #live == 0 then
+  redis.call('DEL', KEYS[1]); redis.call('DEL', KEYS[4])
+else
+  redis.call('PEXPIREAT', KEYS[1], maxExpiry); redis.call('PEXPIREAT', KEYS[4], maxExpiry)
+end
 return 1
 `)
 
@@ -123,6 +137,8 @@ for _, ref in ipairs(refs) do
     for _, value in ipairs(values) do table.insert(out, value) end
   end
 end
+local live = redis.call('ZRANGE', KEYS[1], 0, -1)
+if #live == 0 then redis.call('DEL', KEYS[1]); redis.call('DEL', KEYS[2]) end
 return out
 `)
 
@@ -140,6 +156,16 @@ for _, ref in ipairs(refs) do
     redis.call('DEL', ref)
   end
 end
+local live = redis.call('ZRANGE', KEYS[1], 0, -1)
+local hasOff = false
+local maxExpiry = 0
+for _, ref in ipairs(live) do
+  local expiry = redis.call('HGET', ref, 'expires_at')
+  if not expiry or expiry == 'off' then hasOff = true else maxExpiry = math.max(maxExpiry, tonumber(expiry)) end
+end
+if hasOff then redis.call('PERSIST', KEYS[1]); redis.call('PERSIST', KEYS[2])
+elseif #live == 0 then redis.call('DEL', KEYS[1]); redis.call('DEL', KEYS[2])
+else redis.call('PEXPIREAT', KEYS[1], maxExpiry); redis.call('PEXPIREAT', KEYS[2], maxExpiry) end
 return out
 `)
 
@@ -172,6 +198,16 @@ for _, ref in ipairs(refs) do
     end
   end
 end
+local live = redis.call('ZRANGE', KEYS[1], 0, -1)
+local hasOff = false
+local maxExpiry = 0
+for _, ref in ipairs(live) do
+  local expiry = redis.call('HGET', ref, 'expires_at')
+  if not expiry or expiry == 'off' then hasOff = true else maxExpiry = math.max(maxExpiry, tonumber(expiry)) end
+end
+if hasOff then redis.call('PERSIST', KEYS[1]); redis.call('PERSIST', KEYS[2])
+elseif #live == 0 then redis.call('DEL', KEYS[1]); redis.call('DEL', KEYS[2])
+else redis.call('PEXPIREAT', KEYS[1], maxExpiry); redis.call('PEXPIREAT', KEYS[2], maxExpiry) end
 return removed
 `)
 
@@ -189,7 +225,7 @@ func (s *RecipientAcceptanceStore) AckRecipient(ctx context.Context, recipientUI
 		}
 		args = append(args, id)
 	}
-	return ackAcceptedScript.Run(ctx, s.rdb, []string{AcceptanceQueueKey(scope)}, args...).Int64()
+	return ackAcceptedScript.Run(ctx, s.rdb, []string{AcceptanceQueueKey(scope), acceptanceSequenceKey(scope)}, args...).Int64()
 }
 
 // ReadAccepted preserves the older poll-facing shape. start is a sequence cursor;
@@ -214,7 +250,7 @@ func (s *RecipientAcceptanceStore) readOrDrain(ctx context.Context, scope Recipi
 	if drain {
 		script = drainAcceptedScript
 	}
-	values, err := script.Run(ctx, s.rdb, []string{AcceptanceQueueKey(scope)}, after, count).Slice()
+	values, err := script.Run(ctx, s.rdb, []string{AcceptanceQueueKey(scope), acceptanceSequenceKey(scope)}, after, count).Slice()
 	if err != nil {
 		return nil, err
 	}
