@@ -23,7 +23,7 @@ Last reviewed: 2026-07-16. “Complete” means the scoped repository implementa
 | `(cd web && npm run typecheck)` | Exit 0. |
 | `(cd web && npm run build)` | Exit 0. Vite still reported curveasm/CommonJS/browser-externalization, ineffective dynamic-import, and over-500 kB chunk warnings. |
 | `(cd web && npm audit --audit-level=high)` | Exit 0 at the High threshold, but reported one Moderate vulnerability: `protobufjs <=7.6.2`, `GHSA-f38q-mgvj-vph7`; npm reports a fix is available via `npm audit fix`. This is not a clean zero-finding audit. |
-| `docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml config --quiet` | Exit 0. Configuration/interpolation validation only; no containers started. |
+| `./deploy/scripts/check-compose-config.sh` | Exit 0. The checker used a temporary non-secret env for interpolation and left the pre-existing `deploy/.env.local` unchanged. Configuration validation only; no containers started. |
 | `./deploy/scripts/check-clearnet-compose.sh` | Exit 0: `STATIC PASS` for the default clearnet-only/Tor-isolation/Caddy-policy source structure; runtime `SKIP` because `iceq/caddy:dev` was unavailable. This is not runtime Caddy proof. |
 | Docker runtime and Caddy/Docker-backed smokes | Not run. Docker CLI was present, but `docker info` could not connect to the Docker daemon socket; the daemon was unavailable. |
 
@@ -37,15 +37,14 @@ Last reviewed: 2026-07-16. “Complete” means the scoped repository implementa
 (cd web && npm run typecheck)
 (cd web && npm run build)
 (cd web && npm audit --audit-level=high)
-cp deploy/.env.example deploy/.env.local
-docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml config --quiet
+./deploy/scripts/check-compose-config.sh
 ```
 
 `docker compose ... config --quiet` validates interpolation/model structure only; it does not start services, parse the custom Caddy image, apply migrations, or prove runtime behavior. If Docker is available, run the clearnet-only structural/runtime checker and relevant smoke tests separately. Do not enable the Tor profile in this phase.
 
 ## Existing-volume prerequisite
 
-Docker init mounts run only for fresh volumes. Apply and verify all applicable idempotent migrations in `deploy/init/migrations/` before starting updated services; exact credential-safe commands and service ordering are maintained in `README.md`. Migration/backup execution, encrypted storage, restore rehearsal, and rollback approval belong to the operator.
+Docker init mounts run only for fresh volumes. Before starting updated services, compare the deployment's recorded migration ledger/schema state with `deploy/init/migrations/`, back up, apply each missing migration in numeric order, and verify the resulting tables/columns. Do not infer completion merely by retrying every file. Statements explicitly guarded by `IF NOT EXISTS`, including migration 013, are retry-safe additions; this is not a blanket idempotency claim for every historical migration, and a guard does not prove the existing object has the expected shape. Exact credential-safe commands and service ordering are maintained in `README.md`; execution, encrypted storage, restore rehearsal, and rollback approval belong to the operator.
 
 ## Release blockers
 

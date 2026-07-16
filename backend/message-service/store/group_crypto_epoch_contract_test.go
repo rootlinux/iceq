@@ -52,3 +52,19 @@ func TestScyllaGroupCryptoEpochMigrationIsNonCollidingAndWired(t *testing.T) {
 		}
 	}
 }
+
+func TestGroupRecipientSnapshotMigrationIsRetrySafe(t *testing.T) {
+	raw, err := os.ReadFile("../../../deploy/init/migrations/013_group_recipient_snapshot.cql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration := string(raw)
+	for _, statement := range []string{
+		"ALTER TABLE iceq.message_ingest ADD IF NOT EXISTS recipient_uins LIST<BIGINT>;",
+		"ALTER TABLE iceq.group_message_outbox ADD IF NOT EXISTS recipient_uins LIST<BIGINT>;",
+	} {
+		if !strings.Contains(migration, statement) {
+			t.Fatalf("migration 013 must be safe to retry; missing %q", statement)
+		}
+	}
+}

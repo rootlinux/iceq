@@ -105,7 +105,7 @@ Direct-message safety numbers are computed client-side from the two users' UINs 
 
 ### Existing database volumes: required security migrations
 
-Docker initdb mounts run only when a fresh, empty volume is created. Before deploying this revision onto existing PostgreSQL or Scylla volumes, run these idempotent commands from the repository root:
+Docker initdb mounts run only when a fresh, empty volume is created. Before deploying this revision onto existing PostgreSQL or Scylla volumes, compare a recorded migration ledger and the live schema with `deploy/init/migrations/`, take an encrypted backup, and run each missing migration below in numeric order. Migration 013 and the other guarded additive statements use retry-safe `IF NOT EXISTS`, but that is not a blanket idempotency claim for every historical migration, and a successful retry does not prove that a pre-existing object has the expected definition; always run the schema checks that follow.
 
 ```bash
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
