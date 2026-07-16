@@ -1,3 +1,5 @@
+import { trackObjectURL } from "./localDataCleanup";
+
 export type FileEncryptionAlgorithm = "AES-256-GCM";
 
 export interface EncryptedFileManifest {
@@ -89,6 +91,7 @@ export async function decryptFileBlob(
 
 export async function withObjectUrl<T>(blob: Blob, use: (url: string) => Promise<T> | T): Promise<T> {
   const url = URL.createObjectURL(blob);
+  trackObjectURL(url);
   try { return await use(url); } finally { URL.revokeObjectURL(url); }
 }
 

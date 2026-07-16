@@ -21,6 +21,7 @@
 // the pattern in LoginForm / RegisterForm.
 
 import { create } from "zustand";
+import { registerMemoryReset } from "../lib/localDataCleanup";
 import type { Contact, PresenceState, PresenceStatus } from "../types/models";
 import * as contactsApi from "../api/contacts";
 import type { ContactDirection, ContactWire } from "../api/contacts";
@@ -222,6 +223,11 @@ export const useContactStatusStore = create<ContactStatusState>((set) => ({
   setStatuses: (statuses) => set({ statuses }),
   setStatusMeta: (statuses, directions) => set({ statuses, directions }),
 }));
+
+registerMemoryReset(() => {
+  useContactStore.setState({ contacts: [], presence: {}, loading: false, error: null });
+  useContactStatusStore.setState({ statuses: {}, directions: {} });
+});
 
 export async function refreshContactStatuses(): Promise<void> {
   const wire = await contactsApi.getContacts();

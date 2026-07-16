@@ -1,4 +1,5 @@
 import { grantFileAccess, revokeFileAccess } from "../api/files";
+import { registerMemoryReset } from "./localDataCleanup";
 
 type TimerHandle = ReturnType<typeof setTimeout>;
 type ExhaustionReason = "revoke_exhausted" | "grant_restore_exhausted";
@@ -84,6 +85,11 @@ export class AttachmentGrantLifecycle {
     await Promise.allSettled([...this.pending.keys()].map((id) => this.fail(id)));
   }
 
+  discardAll(): void {
+    for (const entry of this.pending.values()) this.clearTimer(entry.timer);
+    this.pending.clear();
+  }
+
   private async settle(messageId: string, entry: PendingGrant): Promise<boolean> {
     if (entry.needsRestore) return this.restore(messageId, entry);
     const attempts = this.retryDelaysMs.length + 1;
@@ -146,3 +152,5 @@ export const attachmentGrantLifecycle = new AttachmentGrantLifecycle({
     }
   },
 });
+
+registerMemoryReset(() => attachmentGrantLifecycle.discardAll());

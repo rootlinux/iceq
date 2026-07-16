@@ -15,8 +15,9 @@ import { tokenStore } from "../api/client";
 import * as authApi from "../api/auth";
 import type { UserPublic } from "../api/auth";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
+import { clearAllIceQLocalData, registerMemoryReset, type CleanupReason } from "../lib/localDataCleanup";
 
-const LOGGED_OUT_MARKER_KEY = "iceq_logged_out";
+const ACCOUNT_UIN_KEY = "iceq_account_uin";
 
 interface AuthState {
   uin: number | null;
@@ -34,7 +35,27 @@ interface AuthState {
   login: (username: string, password: string) => Promise<void>;
   register: (input: { username: string; password: string; identityKey: string }) => Promise<void>;
   logout: () => Promise<void>;
-  setSession: (user: UserPublic, access: string, refresh: string) => void;
+  panicWipe: () => Promise<void>;
+  expireSession: () => Promise<void>;
+  setSession: (user: UserPublic, access: string, refresh: string) => Promise<void>;
+}
+
+const EMPTY_AUTH = { uin: null, username: null, accessToken: null, refreshToken: null, isAuthenticated: false } as const;
+
+async function cleanSession(reason: CleanupReason, revokeAttachments = true): Promise<void> {
+  if (revokeAttachments) await attachmentGrantLifecycle.revokeAll();
+  tokenStore.clear();
+  await clearAllIceQLocalData(reason);
+}
+
+function priorAccountUin(): number | null {
+  if (typeof localStorage === "undefined") return null;
+  const value = Number(localStorage.getItem(ACCOUNT_UIN_KEY));
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function rememberAccountUin(uin: number): void {
+  localStorage.setItem(ACCOUNT_UIN_KEY, String(uin));
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
@@ -57,16 +78,20 @@ export const useAuthStore = create<AuthState>((set) => ({
 			// Kick off a /me to populate username/uin.
 			authApi
 				.me()
-        .then((u) => {
-          set({ uin: u.uin, username: u.username });
+        .then(async (u) => {
+          const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
+          if (previousUin !== null && previousUin !== u.uin) {
+            await cleanSession("account-change");
+            tokenStore.set(access);
+          }
+          rememberAccountUin(u.uin);
+          set({ uin: u.uin, username: u.username, accessToken: access, isAuthenticated: true, hydrated: true });
         })
         .catch(() => {
           // /me failed; the refresh-on-401 path in api/client
           // will have already routed us back to /login if
           // appropriate. Nothing more to do here.
         });
-		} else if (localStorage.getItem(LOGGED_OUT_MARKER_KEY) === "1") {
-			set({ hydrated: true });
 		} else {
 			void authApi
 				.refresh()
@@ -75,8 +100,15 @@ export const useAuthStore = create<AuthState>((set) => ({
 					set({ accessToken: tokens.access_token, refreshToken: null, isAuthenticated: true, hydrated: true });
 					return authApi.me();
 				})
-				.then((u) => {
-					set({ uin: u.uin, username: u.username });
+				.then(async (u) => {
+					const access = tokenStore.accessToken;
+					const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
+					if (previousUin !== null && previousUin !== u.uin) {
+						await cleanSession("account-change");
+						if (access) tokenStore.set(access);
+					}
+					rememberAccountUin(u.uin);
+					set({ uin: u.uin, username: u.username, accessToken: access, isAuthenticated: true, hydrated: true });
 				})
 				.catch(() => {
 					tokenStore.clear();
@@ -87,8 +119,10 @@ export const useAuthStore = create<AuthState>((set) => ({
 
 	login: async (username, password) => {
 		const resp = await authApi.login({ username, password });
-		localStorage.removeItem(LOGGED_OUT_MARKER_KEY);
+		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
+		if (previousUin !== null && previousUin !== resp.user.uin) await cleanSession("account-change");
 		tokenStore.set(resp.tokens.access_token, resp.tokens.refresh_token);
+		rememberAccountUin(resp.user.uin);
 		set({
 			uin: resp.user.uin,
 			username: resp.user.username,
@@ -104,8 +138,10 @@ export const useAuthStore = create<AuthState>((set) => ({
       password: input.password,
       identity_key: input.identityKey,
 		});
-		localStorage.removeItem(LOGGED_OUT_MARKER_KEY);
+		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
+		if (previousUin !== null && previousUin !== resp.user.uin) await cleanSession("account-change");
 		tokenStore.set(resp.tokens.access_token, resp.tokens.refresh_token);
+		rememberAccountUin(resp.user.uin);
 		set({
 			uin: resp.user.uin,
 			username: resp.user.username,
@@ -120,27 +156,35 @@ export const useAuthStore = create<AuthState>((set) => ({
 		// fails. A partial-logout is worse than a full one
 		// (the user thinks they're logged out but the server
 		// still has a live refresh token).
-		await attachmentGrantLifecycle.revokeAll();
 		try {
 			await authApi.logout();
 		} catch {
 			// best-effort
 		} finally {
-			localStorage.setItem(LOGGED_OUT_MARKER_KEY, "1");
-			tokenStore.clear();
-			set({
-				uin: null,
-				username: null,
-				accessToken: null,
-				refreshToken: null,
-				isAuthenticated: false,
-			});
+			await attachmentGrantLifecycle.revokeAll();
+			try { await cleanSession("logout", false); } finally {
+				set(EMPTY_AUTH);
+			}
 		}
 	},
 
-	setSession: (user, access, refresh) => {
-		localStorage.removeItem(LOGGED_OUT_MARKER_KEY);
+	panicWipe: async () => {
+		try { await authApi.panicWipe(); } finally {
+			try { await cleanSession("panic-wipe"); } finally { set(EMPTY_AUTH); }
+		}
+	},
+
+	expireSession: async () => {
+		try { await authApi.logout(); } catch { /* best-effort revocation */ } finally {
+			try { await cleanSession("auth-expired"); } finally { set(EMPTY_AUTH); }
+		}
+	},
+
+	setSession: async (user, access, refresh) => {
+		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
+		if (previousUin !== null && previousUin !== user.uin) await cleanSession("account-change");
 		tokenStore.set(access, refresh);
+		rememberAccountUin(user.uin);
     set({
 			uin: user.uin,
 			username: user.username,
@@ -150,6 +194,8 @@ export const useAuthStore = create<AuthState>((set) => ({
 		});
 	},
 }));
+
+registerMemoryReset(() => useAuthStore.setState(EMPTY_AUTH));
 
 // ----------------------------------------------------------------------------
 // Selector helpers. Components should subscribe to the slice

@@ -32,12 +32,14 @@ export default function App(): JSX.Element {
   // refresh fails. We bounce to /login and clear state.
   useEffect(() => {
     function onExpired(): void {
-      void useAuthStore.getState().logout();
+      void useAuthStore.getState().expireSession().catch((error) => {
+        console.error("[IceQ cleanup] auth-expired local cleanup failed", error);
+        window.dispatchEvent(new CustomEvent("iceq:local-cleanup-failed", { detail: error }));
+      });
       navigate("/login", { replace: true });
     }
     function onWiped(): void {
-      // 4403 — the WS hook already cleared IndexedDB /
-      // localStorage. The auth-store logout() runs after;
+      // 4403 — the WS hook already cleared all local state;
       // we just navigate.
       navigate("/login", { replace: true });
     }

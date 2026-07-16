@@ -349,11 +349,11 @@ export async function deleteGroupCryptoRecord(key: string): Promise<void> {
 // resurrect a wiped state from a stale version.
 // ----------------------------------------------------------------------------
 export async function clearAll(): Promise<void> {
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     const req = indexedDB.deleteDatabase(ICEQ_INDEXEDDB_NAME);
     req.onsuccess = () => resolve();
-    req.onerror = () => resolve(); // best-effort; resolve so caller doesn't hang
-    req.onblocked = () => resolve();
+    req.onerror = () => reject(req.error ?? new Error("IndexedDB deletion failed"));
+    req.onblocked = () => reject(new Error("IndexedDB deletion was blocked"));
   });
 }
 

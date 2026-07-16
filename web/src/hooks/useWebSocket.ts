@@ -31,6 +31,7 @@ import { useContactStore } from "../store/contactStore";
 import { clearLocalState, classifyClose } from "../lib/wsCloseCodes";
 import { decryptMessage } from "../lib/signal";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
+import { registerMemoryReset } from "../lib/localDataCleanup";
 import type {
   AckPayload,
   AuthPayload,
@@ -158,7 +159,16 @@ export function useWebSocket(): UseWebSocketResult {
 
   const accessToken = useAuthStore((s) => s.accessToken);
   const selfUin = useAuthStore((s) => s.uin);
-  const logout = useAuthStore((s) => s.logout);
+
+  useEffect(() => registerMemoryReset(() => {
+    closedByUsRef.current = true;
+    tearDown();
+    authInflightRef.current = false;
+    seenEnvelopeIDsRef.current.clear();
+    seenEnvelopeOrderRef.current = [];
+    inflightPersistentIDsRef.current.clear();
+    setLastEnvelope(null);
+  }), []);
 
   useEffect(() => {
     if (!accessToken) {
@@ -248,14 +258,15 @@ export function useWebSocket(): UseWebSocketResult {
           // 4403 — server-initiated wipe. Drop everything
           // local, including the Signal store, then bounce
           // to /login.
-          // clearLocalState is fire-and-forget; it kicks
-          // off an async chain internally and resolves
-          // to void.
+          // Wait for the shared cleanup coordinator before
+          // notifying the router.
           Promise.resolve(clearLocalState()).then(() => {
             window.dispatchEvent(new CustomEvent("iceq:wiped"));
-            void logout();
             setConnected(false);
-          }).catch(() => {
+          }).catch((error) => {
+            console.error("[IceQ cleanup] panic-wipe local cleanup failed", error);
+            window.dispatchEvent(new CustomEvent("iceq:local-cleanup-failed", { detail: error }));
+            window.dispatchEvent(new CustomEvent("iceq:wiped"));
             setConnected(false);
           });
           return;

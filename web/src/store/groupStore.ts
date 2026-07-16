@@ -24,6 +24,7 @@ import { create } from "zustand";
 import * as groupsApi from "../api/groups";
 import type { GroupMemberWire, GroupWire } from "../api/groups";
 import { pruneObsoleteGroupEpochs } from "../lib/groupCryptoStore";
+import { registerMemoryReset } from "../lib/localDataCleanup";
 
 interface GroupState {
   groups: GroupWire[];
@@ -223,3 +224,5 @@ export const useGroupStore = create<GroupState>((set, get) => ({
     }
   },
 }));
+
+registerMemoryReset(() => useGroupStore.setState({ groups: [], members: {}, loading: false, error: null }));

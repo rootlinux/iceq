@@ -14,6 +14,8 @@
 
 import { create } from "zustand";
 import { getPrekeyCount } from "../api/keys";
+import { registerMemoryReset } from "../lib/localDataCleanup";
+import { resetSignalRuntime } from "../lib/signal";
 
 interface SignalState {
   ready: boolean;
@@ -42,6 +44,11 @@ export const useSignalStore = create<SignalState>((set) => ({
 
   setError: (message) => set({ lastError: message }),
 }));
+
+registerMemoryReset(() => {
+  resetSignalRuntime();
+  useSignalStore.setState({ ready: false, prekeyCount: 0, lastError: null });
+});
 
 // Threshold at which the chat shell prompts the user to
 // upload more prekeys. Below 10 the server may struggle

@@ -30,7 +30,9 @@ test("clearLocalState removes IceQ localStorage keys and deletes the real IceQ I
   const indexedDBStub = {
     deleteDatabase(name: string) {
       deletedDatabases.push(name);
-      return {};
+      const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null };
+      queueMicrotask(() => request.onsuccess?.());
+      return request;
     },
   };
 

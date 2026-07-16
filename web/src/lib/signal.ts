@@ -80,6 +80,11 @@ interface SignalRuntime {
 let bootPromise: Promise<BootState> | null = null;
 let runtimePromise: Promise<SignalRuntime> | null = null;
 
+export function resetSignalRuntime(): void {
+  bootPromise = null;
+  runtimePromise = null;
+}
+
 async function loadSignalRuntime(): Promise<SignalRuntime> {
   if (!runtimePromise) {
     runtimePromise = (async () => {

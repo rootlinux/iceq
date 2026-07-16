@@ -82,6 +82,10 @@ export async function logout(): Promise<void> {
 	});
 }
 
+export async function panicWipe(): Promise<void> {
+  await fetchWithAuth("/api/auth/panic-wipe", { method: "POST", body: {} });
+}
+
 export async function me(): Promise<UserPublic> {
   return fetchJSON<UserPublic>("/api/auth/me", { method: "GET" });
 }

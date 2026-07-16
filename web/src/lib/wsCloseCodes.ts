@@ -1,4 +1,4 @@
-import { ICEQ_INDEXEDDB_NAME } from "./indexeddb.js";
+import { clearAllIceQLocalData } from "./localDataCleanup.js";
 
 // wsCloseCodes — central registry for custom WebSocket close codes
 // used by the IceQ platform. RFC 6455 reserves 4000-4999 for
@@ -53,37 +53,6 @@ export function classifyClose(code: number): WsCloseAction {
 // The redirect is the caller's responsibility — this function
 // does not navigate so it can be unit-tested without a
 // router in scope.
-export function clearLocalState(): void {
-  // localStorage. Iterate rather than clear() so we leave
-  // any non-IceQ keys (e.g. third-party analytics) intact.
-  for (let i = localStorage.length - 1; i >= 0; i--) {
-    const k = localStorage.key(i);
-    if (k && k.startsWith("iceq_")) {
-      localStorage.removeItem(k);
-    }
-  }
-
-  // IndexedDB. The live client store uses the concrete
-  // "iceq" database name; delete it directly so wipe
-  // works in browsers without indexedDB.databases().
-  if (typeof indexedDB !== "undefined") {
-    indexedDB.deleteDatabase(ICEQ_INDEXEDDB_NAME);
-
-    // Clean up any older per-feature IceQ DBs left behind
-    // by previous client versions when enumeration exists.
-    if (indexedDB.databases) {
-      void indexedDB
-        .databases()
-        .then((dbs) => {
-          for (const db of dbs) {
-            if (db.name && db.name.startsWith("iceq-")) {
-              indexedDB.deleteDatabase(db.name);
-            }
-          }
-        })
-        .catch(() => {
-          // Best-effort cleanup only.
-        });
-    }
-  }
+export function clearLocalState(): Promise<void> {
+  return clearAllIceQLocalData("panic-wipe");
 }

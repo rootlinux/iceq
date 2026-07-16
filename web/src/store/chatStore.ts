@@ -19,6 +19,7 @@ import { create } from "zustand";
 import type { Message, MessageState } from "../types/models";
 import { conversationIdForPair } from "../types/models";
 import type { GroupWire } from "../api/groups";
+import { registerMemoryReset } from "../lib/localDataCleanup";
 
 interface ActiveDirectConversation {
   kind: "direct";
@@ -163,6 +164,8 @@ export const useChatStore = create<ChatState>((set) => ({
     activeConversation: null,
   }),
 }));
+
+registerMemoryReset(() => useChatStore.getState().clear());
 
 function mergeMessages(existing: Message[], incoming: Message[]): Message[] {
   const byId = new Map<string, Message>();
