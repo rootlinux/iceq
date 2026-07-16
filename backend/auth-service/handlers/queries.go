@@ -98,6 +98,21 @@ const (
 		RETURNING uin, expires_at
 	`
 
+	// qRevokeAllSessionsOnRefreshReuse is deliberately one PostgreSQL
+	// statement, executed and committed in the same transaction that observed
+	// the missing consumed row. Advancing session_epoch invalidates existing
+	// access tokens; deleting refresh rows prevents any remaining rotation.
+	qRevokeAllSessionsOnRefreshReuse = `
+		WITH revoked_user AS (
+			UPDATE users
+			SET session_epoch = GREATEST(NOW(), session_epoch + INTERVAL '1 microsecond')
+			WHERE uin = $1
+			RETURNING uin
+		)
+		DELETE FROM refresh_tokens
+		WHERE uin IN (SELECT uin FROM revoked_user)
+	`
+
 	// ------------------------------------------------------------------------
 	// Security-settings + panic-wipe queries (added by the
 	// panic-wipe addendum).

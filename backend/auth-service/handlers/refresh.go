@@ -147,19 +147,11 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 			Scan(&dbUIN, &dbExpiresAt)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				// A verified JWT with no consumable row is reuse or revocation.
-				// Fail closed by invalidating the user's epoch and wiping any
-				// remaining refresh rows; critically, do not mint anything.
-				_ = tx.Rollback(ctx)
-				if bumpErr := deps.Manager.BumpSessionEpoch(ctx, claims.UIN); bumpErr != nil {
-					log.Printf("[auth-service] epoch bump on refresh reuse failed (non-fatal): %v", bumpErr)
-				}
-				if _, delErr := deps.Pool.Exec(ctx, qWipeRefreshTokens, claims.UIN); delErr != nil {
-					log.Printf("[auth-service] delete refresh tokens on reuse failed (non-fatal): %v", delErr)
+				if !commitRefreshReuseRevocation(w, ctx, tx, claims.UIN) {
+					return
 				}
 				clearSessionCookies(w)
-				writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED",
-					"refresh token reuse detected; all sessions have been revoked, please log in again")
+				writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED", "session is no longer valid")
 				return
 			}
 			writeDBError(w, err, "refresh: consume refresh token")
@@ -207,26 +199,11 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 		// ------------------------------------------------------------
 		if dbUIN != claims.UIN {
 			log.Printf("[auth-service] refresh uin mismatch (possible token reuse attack)")
-			// Mass-revocation: bump the user's epoch. This
-			// is best-effort — if it fails the row delete
-			// still runs, and a future Verify will at least
-			// fail the per-JTI blocklist check (if the
-			// attacker had already presented this token
-			// once). But "best-effort mass-revocation" is
-			// the right thing to do here; we log loudly on
-			// failure so ops can investigate.
-			if bumpErr := deps.Manager.BumpSessionEpoch(ctx, claims.UIN); bumpErr != nil {
-				log.Printf("[auth-service] epoch bump on reuse failed (non-fatal): %v", bumpErr)
+			if !commitRefreshReuseRevocation(w, ctx, tx, claims.UIN) {
+				return
 			}
-			// Nuke every refresh row for this user. The
-			// epoch bump has already made them useless at
-			// the JWT layer; this is cleanup.
-			_ = tx.Rollback(ctx)
-			if _, delErr := deps.Pool.Exec(ctx, qWipeRefreshTokens, claims.UIN); delErr != nil {
-				log.Printf("[auth-service] delete refresh tokens on reuse failed (non-fatal): %v", delErr)
-			}
-			writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED",
-				"refresh token reuse detected; all sessions have been revoked, please log in again")
+			clearSessionCookies(w)
+			writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED", "session is no longer valid")
 			return
 		}
 
@@ -275,6 +252,20 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 			RefreshToken: tokens.RefreshToken,
 		})
 	}
+}
+
+func commitRefreshReuseRevocation(w http.ResponseWriter, ctx context.Context, tx pgx.Tx, uin int64) bool {
+	if _, err := tx.Exec(ctx, qRevokeAllSessionsOnRefreshReuse, uin); err != nil {
+		log.Printf("[auth-service] refresh reuse revocation transaction failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "SESSION_REVOCATION_FAILED", "service is temporarily unavailable")
+		return false
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("[auth-service] refresh reuse revocation commit failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "SESSION_REVOCATION_FAILED", "service is temporarily unavailable")
+		return false
+	}
+	return true
 }
 
 // Compile-time assertion: sha256Hex exists in login.go and is

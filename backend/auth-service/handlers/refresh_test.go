@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -96,7 +97,6 @@ func TestRefreshRateLimiterFailureReturns503(t *testing.T) {
 type atomicRefreshManager struct {
 	mu       sync.Mutex
 	signings int
-	bumps    int
 }
 
 func (m *atomicRefreshManager) Verify(context.Context, string, string) (*sharedjwt.Claims, error) {
@@ -109,15 +109,15 @@ func (m *atomicRefreshManager) Sign(_ int64, tokenType string) (sharedjwt.SignRe
 	return sharedjwt.SignResult{Token: tokenType + "-new"}, nil
 }
 func (m *atomicRefreshManager) BumpSessionEpoch(context.Context, int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.bumps++
-	return nil
+	return errors.New("must not be called")
 }
 
 type atomicRefreshDB struct {
-	mu      sync.Mutex
-	present bool
+	mu        sync.Mutex
+	present   bool
+	revoked   bool
+	revokeErr error
+	commitErr error
 }
 
 type alwaysAllowRefreshLimiter struct{}
@@ -136,8 +136,13 @@ func (d *atomicRefreshDB) Exec(context.Context, string, ...any) (pgconn.CommandT
 type atomicRefreshTx struct{ db *atomicRefreshDB }
 
 func (t *atomicRefreshTx) Begin(context.Context) (pgx.Tx, error) { return nil, errors.New("unused") }
-func (t *atomicRefreshTx) Commit(context.Context) error          { return nil }
-func (t *atomicRefreshTx) Rollback(context.Context) error        { return nil }
+func (t *atomicRefreshTx) Commit(context.Context) error {
+	if t.db.commitErr != nil {
+		return t.db.commitErr
+	}
+	return nil
+}
+func (t *atomicRefreshTx) Rollback(context.Context) error { return nil }
 func (t *atomicRefreshTx) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
 	return 0, errors.New("unused")
 }
@@ -146,7 +151,17 @@ func (t *atomicRefreshTx) LargeObjects() pgx.LargeObjects                       
 func (t *atomicRefreshTx) Prepare(context.Context, string, string) (*pgconn.StatementDescription, error) {
 	return nil, errors.New("unused")
 }
-func (t *atomicRefreshTx) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+
+func (t *atomicRefreshTx) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
+	if query == qRevokeAllSessionsOnRefreshReuse {
+		t.db.mu.Lock()
+		defer t.db.mu.Unlock()
+		if t.db.revokeErr != nil {
+			return pgconn.CommandTag{}, t.db.revokeErr
+		}
+		t.db.revoked = true
+		return pgconn.NewCommandTag("DELETE 1"), nil
+	}
 	return pgconn.NewCommandTag("INSERT 1"), nil
 }
 func (t *atomicRefreshTx) Query(context.Context, string, ...any) (pgx.Rows, error) {
@@ -213,7 +228,33 @@ func TestRefreshConcurrentUseAtomicallyMintsExactlyOnePair(t *testing.T) {
 	if manager.signings != 2 {
 		t.Fatalf("Sign calls = %d, want 2 (one access and one refresh)", manager.signings)
 	}
-	if manager.bumps != 1 {
-		t.Fatalf("epoch bumps = %d, want 1 for detected reuse", manager.bumps)
+	if !db.revoked {
+		t.Fatal("reuse did not atomically revoke the epoch and refresh rows")
+	}
+}
+
+func TestRefreshReuseRevocationFailureNeverClaimsSessionsWereRevoked(t *testing.T) {
+	db := &atomicRefreshDB{revokeErr: errors.New("injected revoke failure")}
+	h := NewRefreshHandler(RefreshDeps{Pool: db, Manager: &atomicRefreshManager{}, Limiter: alwaysAllowRefreshLimiter{}})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, refreshRequest("reused-refresh-token"))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "sessions have been revoked") || strings.Contains(rr.Body.String(), "reuse") {
+		t.Fatalf("public response overclaims revocation or exposes detection detail: %s", rr.Body.String())
+	}
+}
+
+func TestRefreshReuseCommitFailureNeverClaimsSessionsWereRevoked(t *testing.T) {
+	db := &atomicRefreshDB{commitErr: errors.New("injected commit failure")}
+	h := NewRefreshHandler(RefreshDeps{Pool: db, Manager: &atomicRefreshManager{}, Limiter: alwaysAllowRefreshLimiter{}})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, refreshRequest("reused-refresh-token"))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "sessions have been revoked") || strings.Contains(rr.Body.String(), "reuse") {
+		t.Fatalf("public response overclaims revocation or exposes detection detail: %s", rr.Body.String())
 	}
 }
