@@ -22,6 +22,11 @@ import (
 	"github.com/iceq/iceq/shared/models"
 )
 
+const (
+	EdgeIdentityHeader         = "X-IceQ-RateLimit-Identity"
+	EdgePreviousIdentityHeader = "X-IceQ-RateLimit-Identity-Previous"
+)
+
 // AnonymousRateLimitBucket creates the only value an unauthenticated service
 // may persist for abuse control. The edge supplies an opaque network identity;
 // neither that identity nor User-Agent/IP bytes are retained. Daily rotation
@@ -51,6 +56,31 @@ func AnonymousRateLimitBucket(secret []byte, edgeIdentity, action string, now ti
 	bucket := hmac.New(sha256.New, rotation.Sum(nil))
 	_, _ = bucket.Write([]byte(action + "\x00" + edgeIdentity))
 	return "anon:" + action + ":" + base64.RawURLEncoding.EncodeToString(bucket.Sum(nil)), nil
+}
+
+func AnonymousRateLimitBuckets(secret []byte, currentValues, previousValues []string, action string, now time.Time) ([]string, error) {
+	if len(currentValues) != 1 || len(previousValues) > 1 {
+		return nil, errors.New("edge identity header cardinality is invalid")
+	}
+	identities := append([]string{currentValues[0]}, previousValues...)
+	buckets := make([]string, 0, len(identities))
+	keyIDs := make(map[string]struct{}, len(identities))
+	for _, identity := range identities {
+		parts := strings.Split(strings.TrimSpace(identity), ".")
+		if len(parts) != 3 {
+			return nil, errors.New("edge identity format is invalid")
+		}
+		if _, duplicate := keyIDs[parts[1]]; duplicate {
+			return nil, errors.New("edge identity key ids must be distinct")
+		}
+		keyIDs[parts[1]] = struct{}{}
+		bucket, err := AnonymousRateLimitBucket(secret, identity, action, now)
+		if err != nil {
+			return nil, err
+		}
+		buckets = append(buckets, bucket)
+	}
+	return buckets, nil
 }
 
 // AuthenticatedRateLimitKey scopes an abuse bucket to the verified actor and

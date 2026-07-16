@@ -37,7 +37,7 @@ type keyStore interface {
 type BundleDeps struct {
 	Keystore        keyStore
 	RateLimitSecret []byte
-	CheckRateLimit  func(context.Context, string, time.Duration) (int64, error)
+	CheckRateLimit  func(context.Context, []string, time.Duration) (int64, error)
 }
 
 const (
@@ -46,19 +46,21 @@ const (
 )
 
 const bundleRateLimitScript = `
-local current = redis.call("INCR", KEYS[1])
-if current == 1 then
-    redis.call("EXPIRE", KEYS[1], ARGV[1])
+local maximum = 0
+for _, key in ipairs(KEYS) do
+    local current = redis.call("INCR", key)
+    if current == 1 then redis.call("EXPIRE", key, ARGV[1]) end
+    if current > maximum then maximum = current end
 end
-return current
+return maximum
 `
 
 // NewRedisFixedWindowRateLimiter implements the same atomic INCR plus
 // first-hit expiry semantics used by the auth-service anonymous limiters.
-func NewRedisFixedWindowRateLimiter(rdb *redis.Client) func(context.Context, string, time.Duration) (int64, error) {
+func NewRedisFixedWindowRateLimiter(rdb *redis.Client) func(context.Context, []string, time.Duration) (int64, error) {
 	script := redis.NewScript(bundleRateLimitScript)
-	return func(ctx context.Context, key string, window time.Duration) (int64, error) {
-		return script.Run(ctx, rdb, []string{key}, int(window.Seconds())).Int64()
+	return func(ctx context.Context, keys []string, window time.Duration) (int64, error) {
+		return script.Run(ctx, rdb, keys, int(window.Seconds())).Int64()
 	}
 }
 
@@ -93,9 +95,10 @@ func NewGetBundleHandler(deps BundleDeps) http.HandlerFunc {
 		// one-time prekey. The edge identity is transformed immediately into a
 		// daily rotating HMAC bucket; raw IP and User-Agent values never enter
 		// the persisted Redis key.
-		bucket, err := middleware.AnonymousRateLimitBucket(
+		buckets, err := middleware.AnonymousRateLimitBuckets(
 			deps.RateLimitSecret,
-			r.Header.Get("X-IceQ-RateLimit-Identity"),
+			r.Header.Values(middleware.EdgeIdentityHeader),
+			r.Header.Values(middleware.EdgePreviousIdentityHeader),
 			"key-bundle",
 			time.Now(),
 		)
@@ -107,7 +110,11 @@ func NewGetBundleHandler(deps BundleDeps) http.HandlerFunc {
 			writeError(w, http.StatusServiceUnavailable, "RATE_LIMITER_UNAVAILABLE", "service is temporarily unavailable")
 			return
 		}
-		count, err := deps.CheckRateLimit(r.Context(), bundleRateLimitKeyPrefix+bucket, time.Minute)
+		keys := make([]string, len(buckets))
+		for i, bucket := range buckets {
+			keys[i] = bundleRateLimitKeyPrefix + bucket
+		}
+		count, err := deps.CheckRateLimit(r.Context(), keys, time.Minute)
 		if err != nil {
 			log.Printf("[key-service] bundle rate limiter unavailable: %v", err)
 			writeError(w, http.StatusServiceUnavailable, "RATE_LIMITER_UNAVAILABLE", "service is temporarily unavailable")

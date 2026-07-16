@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	edgeClientIPHeader = "X-IceQ-Edge-Client-IP"
-	identityHeader     = "X-IceQ-RateLimit-Identity"
+	edgeClientIPHeader     = "X-IceQ-Edge-Client-IP"
+	identityHeader         = "X-IceQ-RateLimit-Identity"
+	previousIdentityHeader = "X-IceQ-RateLimit-Identity-Previous"
 )
 
 type config struct {
@@ -62,7 +63,7 @@ func newHandler(cfg config) http.Handler {
 		canonical := ip.String()
 		w.Header().Add(identityHeader, signIdentity(cfg.current, canonical, cfg.now()))
 		if len(cfg.previous) > 0 {
-			w.Header().Add(identityHeader, signIdentity(cfg.previous, canonical, cfg.now()))
+			w.Header().Set(previousIdentityHeader, signIdentity(cfg.previous, canonical, cfg.now()))
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})

@@ -44,7 +44,7 @@ func TestGetBundleFailsClosedBeforeOPKConsumptionWhenLimiterUnavailable(t *testi
 	rr := bundleRequest(t, BundleDeps{
 		Keystore:        store,
 		RateLimitSecret: []byte(strings.Repeat("s", 32)),
-		CheckRateLimit: func(context.Context, string, time.Duration) (int64, error) {
+		CheckRateLimit: func(context.Context, []string, time.Duration) (int64, error) {
 			return 0, errors.New("redis unavailable")
 		},
 	})
@@ -62,12 +62,12 @@ func TestGetBundleFailsClosedBeforeOPKConsumptionWhenLimiterUnavailable(t *testi
 
 func TestGetBundleReturns429BeforeOPKConsumptionAndPersistsOnlyHMACBucket(t *testing.T) {
 	store := &bundleRateLimitStore{}
-	var persistedKey string
+	var persistedKeys []string
 	rr := bundleRequest(t, BundleDeps{
 		Keystore:        store,
 		RateLimitSecret: []byte(strings.Repeat("s", 32)),
-		CheckRateLimit: func(_ context.Context, key string, window time.Duration) (int64, error) {
-			persistedKey = key
+		CheckRateLimit: func(_ context.Context, keys []string, window time.Duration) (int64, error) {
+			persistedKeys = keys
 			if window != time.Minute {
 				t.Fatalf("window = %s, want 1m", window)
 			}
@@ -85,12 +85,34 @@ func TestGetBundleReturns429BeforeOPKConsumptionAndPersistsOnlyHMACBucket(t *tes
 		t.Fatalf("GetBundle calls = %d, want 0 before OPK consumption", store.getCalls)
 	}
 	for _, raw := range []string{"203.0.113.9", "private-browser-fingerprint"} {
-		if strings.Contains(persistedKey, raw) {
-			t.Fatalf("rate-limit key %q contains raw request identity %q", persistedKey, raw)
+		if strings.Contains(strings.Join(persistedKeys, ""), raw) {
+			t.Fatalf("rate-limit keys %q contain raw request identity %q", persistedKeys, raw)
 		}
 	}
-	if !strings.HasPrefix(persistedKey, "ratelimit:key-bundle:anon:key-bundle:") {
-		t.Fatalf("rate-limit key = %q, want scoped rotating HMAC bucket", persistedKey)
+	if len(persistedKeys) != 1 || !strings.HasPrefix(persistedKeys[0], "ratelimit:key-bundle:anon:key-bundle:") {
+		t.Fatalf("rate-limit keys = %q, want one scoped rotating HMAC bucket", persistedKeys)
+	}
+}
+
+func TestGetBundleRotationOverlapChecksCurrentAndPreviousBucketsTogether(t *testing.T) {
+	store := &bundleRateLimitStore{}
+	router := chi.NewRouter()
+	router.Get("/api/keys/bundle/{uin}", NewGetBundleHandler(BundleDeps{
+		Keystore: store, RateLimitSecret: []byte(strings.Repeat("s", 32)),
+		CheckRateLimit: func(_ context.Context, keys []string, _ time.Duration) (int64, error) {
+			if len(keys) != 2 || keys[0] == keys[1] {
+				t.Fatalf("rotation keys = %v", keys)
+			}
+			return bundleFetchRateLimit + 1, nil // previous bucket is already blocked
+		},
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/keys/bundle/42", nil)
+	req.Header.Set("X-IceQ-RateLimit-Identity", "v1.0123456789ab.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	req.Header.Set("X-IceQ-RateLimit-Identity-Previous", "v1.abcdef012345.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTooManyRequests || store.getCalls != 0 {
+		t.Fatalf("status=%d GetBundle=%d", rr.Code, store.getCalls)
 	}
 }
 
@@ -101,7 +123,7 @@ func TestGetBundleFailsClosedWhenEdgeIdentityMissing(t *testing.T) {
 	r.Get("/api/keys/bundle/{uin}", NewGetBundleHandler(BundleDeps{
 		Keystore:        store,
 		RateLimitSecret: []byte(strings.Repeat("s", 32)),
-		CheckRateLimit: func(context.Context, string, time.Duration) (int64, error) {
+		CheckRateLimit: func(context.Context, []string, time.Duration) (int64, error) {
 			called = true
 			return 1, nil
 		},

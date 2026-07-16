@@ -40,12 +40,13 @@ func TestHandlerIgnoresSpoofedClientIdentityAndReturnsRotationOverlap(t *testing
 	req := httptest.NewRequest(http.MethodGet, "/identity", nil)
 	req.Header.Set(edgeClientIPHeader, "203.0.113.9")
 	req.Header.Set(identityHeader, "attacker-controlled")
+	req.Header.Set(previousIdentityHeader, "attacker-controlled-previous")
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("status = %d", rr.Code)
 	}
-	values := rr.Header().Values(identityHeader)
+	values := []string{rr.Header().Get(identityHeader), rr.Header().Get(previousIdentityHeader)}
 	if len(values) != 2 {
 		t.Fatalf("identity values = %v", values)
 	}

@@ -60,7 +60,8 @@
         uri /identity
         header_up X-IceQ-Edge-Client-IP {remote_host}
         header_up -X-IceQ-RateLimit-Identity
-        copy_headers X-IceQ-RateLimit-Identity
+        header_up -X-IceQ-RateLimit-Identity-Previous
+        copy_headers X-IceQ-RateLimit-Identity X-IceQ-RateLimit-Identity-Previous
     }
 }
 
@@ -91,6 +92,7 @@
 
     # Strip spoofable trust-boundary headers before any route is evaluated.
     request_header -X-IceQ-RateLimit-Identity
+    request_header -X-IceQ-RateLimit-Identity-Previous
     request_header -X-IceQ-Edge-Client-IP
 
     # Structured JSON access log. Caddy version field names have changed

@@ -30,13 +30,17 @@ type RegisterDeps struct {
 func NewRegisterHandler(deps RegisterDeps) http.HandlerFunc {
 	script := redis.NewScript(rateLimitScript)
 	return func(w http.ResponseWriter, r *http.Request) {
-		bucket, err := middleware.AnonymousRateLimitBucket(deps.RateLimitSecret, r.Header.Get("X-IceQ-RateLimit-Identity"), "register", time.Now())
+		buckets, err := middleware.AnonymousRateLimitBuckets(deps.RateLimitSecret, r.Header.Values(middleware.EdgeIdentityHeader), r.Header.Values(middleware.EdgePreviousIdentityHeader), "register", time.Now())
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "RATE_LIMIT_IDENTITY_UNAVAILABLE", "service is temporarily unavailable")
 			return
 		}
 		ctxLimit, cancelLimit := context.WithTimeout(r.Context(), 2*time.Second)
-		count, err := script.Run(ctxLimit, deps.Redis, []string{"ratelimit:register:" + bucket}, int(rateLimitWindow.Seconds())).Int64()
+		keys := make([]string, len(buckets))
+		for i, bucket := range buckets {
+			keys[i] = "ratelimit:register:" + bucket
+		}
+		count, err := script.Run(ctxLimit, deps.Redis, keys, int(rateLimitWindow.Seconds())).Int64()
 		cancelLimit()
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "RATE_LIMITER_UNAVAILABLE", "service is temporarily unavailable")

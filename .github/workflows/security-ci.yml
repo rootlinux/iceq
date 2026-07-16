@@ -78,6 +78,7 @@ jobs:
         run: |
           ./deploy/scripts/check-security-ci.test.sh
           ./deploy/scripts/check-compose-config.test.sh
+          ./deploy/scripts/check-edge-identity.test.sh
       - name: Scan repository for secrets
         env:
           GITLEAKS_VERSION: 8.24.3

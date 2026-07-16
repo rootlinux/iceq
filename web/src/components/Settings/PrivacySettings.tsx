@@ -37,4 +37,3 @@ export function PrivacySettings(): JSX.Element {
     </section>
   );
 }
-

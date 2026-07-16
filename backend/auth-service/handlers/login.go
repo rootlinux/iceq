@@ -55,14 +55,16 @@ const (
 // Returning the post-increment value lets the handler compare
 // against the limit in a single round trip.
 //
-// KEYS[1] = full per-IP key
+// KEYS = one current and optionally one previous rotating identity key
 // ARGV[1] = window seconds (rateLimitWindow in seconds)
 const rateLimitScript = `
-local current = redis.call("INCR", KEYS[1])
-if current == 1 then
-    redis.call("EXPIRE", KEYS[1], ARGV[1])
+local maximum = 0
+for _, key in ipairs(KEYS) do
+    local current = redis.call("INCR", key)
+    if current == 1 then redis.call("EXPIRE", key, ARGV[1]) end
+    if current > maximum then maximum = current end
 end
-return current
+return maximum
 `
 
 const qUpdateUserPasswordHash = `
@@ -122,18 +124,20 @@ func NewLoginHandler(deps LoginDeps) http.HandlerFunc {
 		// 1. Rate-limit check. Done BEFORE the DB lookup so a
 		// brute-force attempt never reaches the bcrypt path.
 		// ------------------------------------------------------------
-		edgeIdentity := r.Header.Get("X-IceQ-RateLimit-Identity")
-		bucket, err := middleware.AnonymousRateLimitBucket(deps.RateLimitSecret, edgeIdentity, "login", time.Now())
+		buckets, err := middleware.AnonymousRateLimitBuckets(deps.RateLimitSecret, r.Header.Values(middleware.EdgeIdentityHeader), r.Header.Values(middleware.EdgePreviousIdentityHeader), "login", time.Now())
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "RATE_LIMIT_IDENTITY_UNAVAILABLE", "service is temporarily unavailable")
 			return
 		}
-		key := rateLimitKeyPrefix + bucket
+		keys := make([]string, len(buckets))
+		for i, bucket := range buckets {
+			keys[i] = rateLimitKeyPrefix + bucket
+		}
 		// windowSeconds is passed as ARGV[1] (string) because
 		// Lua treats every ARGV as a string; Redis implicitly
 		// coerces it to int for EXPIRE.
 		windowSeconds := int(rateLimitWindow.Seconds())
-		count, err := script.Run(ctx, deps.Redis, []string{key}, windowSeconds).Int64()
+		count, err := script.Run(ctx, deps.Redis, keys, windowSeconds).Int64()
 		if err != nil {
 			// Fail-closed. A security-critical service should
 			// not silently allow logins when its rate limiter

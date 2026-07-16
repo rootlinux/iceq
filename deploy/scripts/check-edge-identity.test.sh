@@ -7,9 +7,10 @@ compose="$root/deploy/docker-compose.yml"
 
 grep -Fq 'forward_auth edge-identity:8090' "$caddy"
 grep -Fq 'header_up X-IceQ-Edge-Client-IP {remote_host}' "$caddy"
-grep -Fq 'copy_headers X-IceQ-RateLimit-Identity' "$caddy"
+grep -Fq 'copy_headers X-IceQ-RateLimit-Identity X-IceQ-RateLimit-Identity-Previous' "$caddy"
 grep -Fq 'header_up -X-IceQ-Edge-Client-IP' "$caddy"
 grep -Fq 'request_header -X-IceQ-RateLimit-Identity' "$caddy"
+grep -Fq 'request_header -X-IceQ-RateLimit-Identity-Previous' "$caddy"
 if grep -Fq 'header_up X-IceQ-RateLimit-Identity {remote_host}' "$caddy"; then
   echo 'raw remote_host reaches application identity header' >&2
   exit 1

@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"bytes"
 	"encoding/base64"
 	"strings"
 	"testing"
@@ -56,5 +57,45 @@ func TestRateLimitKeysRejectMissingInputs(t *testing.T) {
 	}
 	if _, err := AuthenticatedRateLimitKey(0, "files"); err == nil {
 		t.Fatal("accepted invalid uin")
+	}
+}
+
+func TestAnonymousRateLimitBucketsEnforcesRotationHeaderContract(t *testing.T) {
+	secret := []byte("01234567890123456789012345678901")
+	current := validEdgeIdentity()
+	previous := "v1.abcdef012345." + base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	buckets, err := AnonymousRateLimitBuckets(secret, []string{current}, []string{previous}, "login", time.Now())
+	if err != nil || len(buckets) != 2 || buckets[0] == buckets[1] {
+		t.Fatalf("buckets=%v err=%v", buckets, err)
+	}
+	invalid := []struct{ current, previous []string }{
+		{nil, nil}, {[]string{current, current}, nil}, {[]string{current}, []string{previous, previous}}, {[]string{current}, []string{current}},
+	}
+	for _, tc := range invalid {
+		if _, err := AnonymousRateLimitBuckets(secret, tc.current, tc.previous, "login", time.Now()); err == nil {
+			t.Fatalf("accepted invalid headers current=%v previous=%v", tc.current, tc.previous)
+		}
+	}
+}
+
+func TestRotationOverlapPreservesOldBucketUntilPreviousIsRetired(t *testing.T) {
+	secret := []byte("01234567890123456789012345678901")
+	oldIdentity := validEdgeIdentity()
+	newIdentity := "v1.abcdef012345." + base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	before, err := AnonymousRateLimitBuckets(secret, []string{oldIdentity}, nil, "login", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	during, err := AnonymousRateLimitBuckets(secret, []string{newIdentity}, []string{oldIdentity}, "login", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(during) != 2 || during[1] != before[0] {
+		t.Fatalf("old bucket continuity lost: before=%v during=%v", before, during)
+	}
+	after, err := AnonymousRateLimitBuckets(secret, []string{newIdentity}, nil, "login", now)
+	if err != nil || len(after) != 1 || after[0] != during[0] {
+		t.Fatalf("retirement contract mismatch: during=%v after=%v err=%v", during, after, err)
 	}
 }
