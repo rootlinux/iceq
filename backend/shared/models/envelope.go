@@ -214,16 +214,17 @@ func NewEnvelope(envelopeType string, payload any) (Envelope, error) {
 // the value is stored alongside the ciphertext so the recipient
 // can route it to the right Signal sub-protocol on decrypt.
 type DirectMessagePayload struct {
-	ConversationID string `json:"conversation_id"`
-	SenderUIN      int64  `json:"sender_uin"`
-	ToUIN          int64  `json:"to_uin,omitempty"`
-	ReceiverUIN    int64  `json:"receiver_uin"`
-	Content        string `json:"content"`
-	ContentType    string `json:"content_type"`
-	FileURL        string `json:"file_url,omitempty"`
-	ClientID       string `json:"client_id,omitempty"`
-	Ciphertext     []byte `json:"ciphertext,omitempty"`
-	MsgType        string `json:"msg_type,omitempty"`
+	ConversationID   string `json:"conversation_id"`
+	SenderUIN        int64  `json:"sender_uin"`
+	ToUIN            int64  `json:"to_uin,omitempty"`
+	ReceiverUIN      int64  `json:"receiver_uin"`
+	Content          string `json:"content"`
+	ContentType      string `json:"content_type"`
+	FileURL          string `json:"file_url,omitempty"`
+	ClientID         string `json:"client_id,omitempty"`
+	Ciphertext       []byte `json:"ciphertext,omitempty"`
+	MsgType          string `json:"msg_type,omitempty"`
+	ExpiresInSeconds int64  `json:"expires_in_seconds,omitempty"`
 }
 
 // GroupMessagePayload is the body of a group chat message. The
@@ -233,16 +234,17 @@ type DirectMessagePayload struct {
 // MsgType follows the same X3DH / Double Ratchet discriminator
 // convention as DirectMessagePayload; see that type's docs.
 type GroupMessagePayload struct {
-	GroupID       string `json:"group_id"`
-	SenderUIN     int64  `json:"sender_uin"`
-	Content       string `json:"content"`
-	ContentType   string `json:"content_type"`
-	FileURL       string `json:"file_url,omitempty"`
-	ClientID      string `json:"client_id,omitempty"`
-	Ciphertext    []byte `json:"ciphertext,omitempty"`
-	MsgType       string `json:"msg_type,omitempty"`
-	CryptoVersion int    `json:"crypto_version"`
-	CryptoEpoch   int64  `json:"crypto_epoch"`
+	GroupID          string `json:"group_id"`
+	SenderUIN        int64  `json:"sender_uin"`
+	Content          string `json:"content"`
+	ContentType      string `json:"content_type"`
+	FileURL          string `json:"file_url,omitempty"`
+	ClientID         string `json:"client_id,omitempty"`
+	Ciphertext       []byte `json:"ciphertext,omitempty"`
+	MsgType          string `json:"msg_type,omitempty"`
+	CryptoVersion    int    `json:"crypto_version"`
+	CryptoEpoch      int64  `json:"crypto_epoch"`
+	ExpiresInSeconds int64  `json:"expires_in_seconds,omitempty"`
 }
 
 // TypingPayload is a transient indicator. The server-side presence

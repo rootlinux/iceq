@@ -231,6 +231,18 @@ func (h *Hub) Send(ctx context.Context, uin int64, envelope []byte) error {
 	if len(envelope) == 0 {
 		return nil
 	}
+	// Polling has its own bounded stream. It is intentionally independent of
+	// the destructive WebSocket reconnect queue: either transport may observe
+	// the same envelope and the client suppresses duplicates by envelope ID.
+	pollKey := "poll:stream:" + uinToString(uin)
+	pipe := h.rdb.Pipeline()
+	pipe.XAdd(ctx, &redis.XAddArgs{Stream: pollKey, MaxLen: UndeliveredMaxLen, Approx: true, Values: map[string]any{"envelope": envelope}})
+	pipe.Expire(ctx, pollKey, UndeliveredTTL)
+	if _, err := pipe.Exec(ctx); err != nil {
+		// Poll fallback is a secondary receive path. A transient Redis
+		// failure must not suppress delivery to an already-open WebSocket.
+		log.Printf("[ws-gateway] hub: poll enqueue unavailable: %v", err)
+	}
 
 	raw, ok := h.clients.Load(uin)
 	if !ok {

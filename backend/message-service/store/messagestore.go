@@ -87,26 +87,28 @@ import (
 // Ciphertext is an opaque []byte. It is the X3DH + Double
 // Ratchet payload the web client produced. We never read it.
 type SaveRequest struct {
-	ConversationID string
-	ID             gocql.UUID
-	SenderUIN      int64
-	ReceiverUIN    int64
-	Ciphertext     []byte
-	MsgType        string
-	CreatedAt      time.Time
+	ConversationID   string
+	ID               gocql.UUID
+	SenderUIN        int64
+	ReceiverUIN      int64
+	Ciphertext       []byte
+	MsgType          string
+	CreatedAt        time.Time
+	ExpiresInSeconds int64
 }
 
 // SaveGroupRequest is the input to SaveGroupMessage. GroupID
 // is a gocql.UUID; the wire form (in JSON envelopes) is a
 // canonical 36-char string and we convert at the boundary.
 type SaveGroupRequest struct {
-	GroupID     gocql.UUID
-	ID          gocql.UUID
-	SenderUIN   int64
-	CryptoEpoch int64
-	Ciphertext  []byte
-	MsgType     string
-	CreatedAt   time.Time
+	GroupID          gocql.UUID
+	ID               gocql.UUID
+	SenderUIN        int64
+	CryptoEpoch      int64
+	Ciphertext       []byte
+	MsgType          string
+	CreatedAt        time.Time
+	ExpiresInSeconds int64
 }
 
 // HistoryRequest is the input to GetHistory. The Before
@@ -145,6 +147,7 @@ type MessageRow struct {
 	Ciphertext     []byte
 	MsgType        string
 	Status         string
+	ExpiresAt      time.Time
 }
 
 // GroupMessageRow is one row of group-message history. The
@@ -159,6 +162,7 @@ type GroupMessageRow struct {
 	CryptoEpoch int64
 	Ciphertext  []byte
 	MsgType     string
+	ExpiresAt   time.Time
 }
 
 // ----------------------------------------------------------------------------
@@ -217,6 +221,20 @@ func (m *MessageStore) WithTTL(ttl time.Duration) *MessageStore {
 	return m
 }
 
+func effectiveMessageTTL(global time.Duration, requestedSeconds int64) time.Duration {
+	if requestedSeconds > 0 {
+		return time.Duration(requestedSeconds) * time.Second
+	}
+	return global
+}
+
+func expiryAt(created time.Time, ttl time.Duration) time.Time {
+	if ttl <= 0 {
+		return time.Time{}
+	}
+	return created.Add(ttl)
+}
+
 // ----------------------------------------------------------------------------
 // SaveMessage — append a 1:1 chat message to the messages
 // table. Returns the underlying gocql error on failure.
@@ -239,12 +257,14 @@ func (m *MessageStore) WithTTL(ttl time.Duration) *MessageStore {
 // the returned error wraps the gocql error and is the only
 // signal the handler layer sees.
 func (m *MessageStore) SaveMessage(ctx context.Context, req SaveRequest) error {
+	ttl := effectiveMessageTTL(m.ttl, req.ExpiresInSeconds)
+	expiresAt := expiryAt(req.CreatedAt, ttl)
 	batch := m.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	batch.SetConsistency(gocql.Quorum)
-	if m.ttl > 0 {
+	if ttl > 0 {
 		const q = `INSERT INTO iceq.messages
-		  (conversation_id, created_at, id, sender_uin, receiver_uin, ciphertext, msg_type, status)
-		  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		  (conversation_id, created_at, id, sender_uin, receiver_uin, ciphertext, msg_type, status, expires_at)
+		  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		  USING TTL ?`
 		batch.Query(q,
 			req.ConversationID,
@@ -255,12 +275,13 @@ func (m *MessageStore) SaveMessage(ctx context.Context, req SaveRequest) error {
 			req.Ciphertext,
 			req.MsgType,
 			"",
-			int(m.ttl.Seconds()),
+			expiresAt,
+			int(ttl.Seconds()),
 		)
 		const indexQ = `INSERT INTO iceq.message_deletion_index (uin, conversation_id, created_at, id) VALUES (?, ?, ?, ?) USING TTL ?`
-		batch.Query(indexQ, req.SenderUIN, req.ConversationID, req.CreatedAt, req.ID, int(m.ttl.Seconds()))
+		batch.Query(indexQ, req.SenderUIN, req.ConversationID, req.CreatedAt, req.ID, int(ttl.Seconds()))
 		if req.ReceiverUIN != req.SenderUIN {
-			batch.Query(indexQ, req.ReceiverUIN, req.ConversationID, req.CreatedAt, req.ID, int(m.ttl.Seconds()))
+			batch.Query(indexQ, req.ReceiverUIN, req.ConversationID, req.CreatedAt, req.ID, int(ttl.Seconds()))
 		}
 		return m.session.ExecuteBatch(batch)
 	}
@@ -292,12 +313,14 @@ func (m *MessageStore) SaveMessage(ctx context.Context, req SaveRequest) error {
 // iceq.messages for each member (TODO future step: confirm
 // fan-out coverage).
 func (m *MessageStore) SaveGroupMessage(ctx context.Context, req SaveGroupRequest) error {
+	ttl := effectiveMessageTTL(m.ttl, req.ExpiresInSeconds)
+	expiresAt := expiryAt(req.CreatedAt, ttl)
 	batch := m.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	batch.SetConsistency(gocql.Quorum)
-	if m.ttl > 0 {
+	if ttl > 0 {
 		const q = `INSERT INTO iceq.group_messages
-		  (group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type)
-		  VALUES (?, ?, ?, ?, ?, ?, ?)
+		  (group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type, expires_at)
+		  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		  USING TTL ?`
 		batch.Query(q,
 			req.GroupID,
@@ -307,9 +330,10 @@ func (m *MessageStore) SaveGroupMessage(ctx context.Context, req SaveGroupReques
 			req.CryptoEpoch,
 			req.Ciphertext,
 			req.MsgType,
-			int(m.ttl.Seconds()),
+			expiresAt,
+			int(ttl.Seconds()),
 		)
-		batch.Query(`INSERT INTO iceq.group_message_deletion_index (uin, group_id, created_at, id) VALUES (?, ?, ?, ?) USING TTL ?`, req.SenderUIN, req.GroupID, req.CreatedAt, req.ID, int(m.ttl.Seconds()))
+		batch.Query(`INSERT INTO iceq.group_message_deletion_index (uin, group_id, created_at, id) VALUES (?, ?, ?, ?) USING TTL ?`, req.SenderUIN, req.GroupID, req.CreatedAt, req.ID, int(ttl.Seconds()))
 		return m.session.ExecuteBatch(batch)
 	}
 	const q = `INSERT INTO iceq.group_messages
@@ -365,7 +389,7 @@ func (m *MessageStore) GetHistory(ctx context.Context, req HistoryRequest) ([]Me
 		before = time.Now().Add(time.Second)
 	}
 
-	const q = `SELECT conversation_id, created_at, id, sender_uin, receiver_uin, ciphertext, msg_type, status
+	const q = `SELECT conversation_id, created_at, id, sender_uin, receiver_uin, ciphertext, msg_type, status, expires_at
 	  FROM iceq.messages
 	  WHERE conversation_id = ? AND created_at < ?
 	  ORDER BY created_at DESC
@@ -389,8 +413,12 @@ func (m *MessageStore) GetHistory(ctx context.Context, req HistoryRequest) ([]Me
 			&row.Ciphertext,
 			&row.MsgType,
 			&row.Status,
+			&row.ExpiresAt,
 		) {
 			break
+		}
+		if !row.ExpiresAt.IsZero() && !row.ExpiresAt.After(time.Now()) {
+			continue
 		}
 		rows = append(rows, row)
 	}
@@ -419,7 +447,7 @@ func (m *MessageStore) GetGroupHistory(ctx context.Context, req GroupHistoryRequ
 		before = time.Now().Add(time.Second)
 	}
 
-	const q = `SELECT group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type
+	const q = `SELECT group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type, expires_at
 	  FROM iceq.group_messages
 	  WHERE group_id = ? AND created_at < ?
 	  ORDER BY created_at DESC
@@ -442,8 +470,12 @@ func (m *MessageStore) GetGroupHistory(ctx context.Context, req GroupHistoryRequ
 			&row.CryptoEpoch,
 			&row.Ciphertext,
 			&row.MsgType,
+			&row.ExpiresAt,
 		) {
 			break
+		}
+		if !row.ExpiresAt.IsZero() && !row.ExpiresAt.After(time.Now()) {
+			continue
 		}
 		rows = append(rows, row)
 	}

@@ -23,7 +23,7 @@
 //      hold the current socket; reconnect attempts that fire
 //      while a connection is in flight are dropped.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { refreshSession, tokenStore } from "../api/client";
 import { useAuthStore } from "../store/authStore";
 import { useChatStore, conversationIdForPair } from "../store/chatStore";
@@ -49,6 +49,7 @@ import { parseEnvelope } from "../types/envelope";
 import { useGroupStore } from "../store/groupStore";
 import { authenticatedGroupMessageFields, decodeGroupCiphertext, openGroupContent, processDirectControlMessage } from "../lib/groupCrypto";
 import { getGroupMembersWithEpoch } from "../api/groups";
+import { permitsPrivacySignal } from "../lib/privacySettings";
 
 // ----------------------------------------------------------------------------
 // Backoff schedule. Reset on a successful auth_ok. The 5th
@@ -72,6 +73,8 @@ export interface UseWebSocketResult {
   send: (frame: Envelope) => boolean;
   connected: boolean;
   lastEnvelope: Envelope | null;
+  // Poll fallback feeds the exact same authenticated envelope dispatch path.
+  consumeExternal: (envelope: Envelope) => boolean;
 }
 
 // ----------------------------------------------------------------------------
@@ -91,6 +94,9 @@ export function useWebSocket(): UseWebSocketResult {
   const pongTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closedByUsRef = useRef(false);
   const authInflightRef = useRef(false);
+  const seenEnvelopeIDsRef = useRef<Set<string>>(new Set());
+  const seenEnvelopeOrderRef = useRef<string[]>([]);
+  const dispatchRef = useRef<(env: Envelope, ws: WebSocket | null) => Promise<void>>(async () => undefined);
 
   const accessToken = useAuthStore((s) => s.accessToken);
   const selfUin = useAuthStore((s) => s.uin);
@@ -145,7 +151,7 @@ export function useWebSocket(): UseWebSocketResult {
         type: "auth",
         id: cryptoRandomId(),
         ts: Date.now(),
-        payload: { access_token: tokenStore.accessToken ?? "" },
+        payload: { access_token: tokenStore.accessToken ?? "", presence_enabled: permitsPrivacySignal("presence") },
       };
       authInflightRef.current = true;
       safeSend(ws, authFrame);
@@ -157,9 +163,7 @@ export function useWebSocket(): UseWebSocketResult {
         if (__DEV__) console.warn("[ws] parse error:", result.error);
         return;
       }
-      const env = result.envelope;
-      setLastEnvelope(env);
-      void dispatch(env, ws);
+      consumeEnvelope(result.envelope, ws);
     };
 
     ws.onerror = () => {
@@ -225,7 +229,7 @@ export function useWebSocket(): UseWebSocketResult {
   // one EnvelopeType; the auth_* types also flip the local
   // `connected` flag.
   // ----------------------------------------------------------------------------
-  async function dispatch(env: Envelope, ws: WebSocket): Promise<void> {
+  async function dispatch(env: Envelope, ws: WebSocket | null): Promise<void> {
     switch (env.type) {
       case "auth": {
         // The server is asking us to (re-)authenticate.
@@ -237,7 +241,7 @@ export function useWebSocket(): UseWebSocketResult {
           type: "auth",
           id: cryptoRandomId(),
           ts: Date.now(),
-          payload: { access_token: tokenStore.accessToken ?? "" },
+          payload: { access_token: tokenStore.accessToken ?? "", presence_enabled: permitsPrivacySignal("presence") },
         };
         safeSend(ws, authFrame);
         return;
@@ -303,6 +307,7 @@ export function useWebSocket(): UseWebSocketResult {
           return;
         }
         attachmentGrantLifecycle.ack(p.message_id, p.state);
+        if ((p.state === "delivered" || p.state === "read") && !permitsPrivacySignal("deliveryReceipts")) return;
         // Ack frames don't carry a conversation_id; we
         // locate the message in the local store and
         // pick its conversation. The list scan is O(n)
@@ -418,6 +423,27 @@ export function useWebSocket(): UseWebSocketResult {
     }
   }
 
+  dispatchRef.current = dispatch;
+
+  const consumeExternal = useCallback((env: Envelope): boolean => {
+    return consumeEnvelope(env, null);
+  // consumeEnvelope reads refs and dispatchRef, so this identity is stable.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function consumeEnvelope(env: Envelope, ws: WebSocket | null): boolean {
+    if (seenEnvelopeIDsRef.current.has(env.id)) return false;
+    seenEnvelopeIDsRef.current.add(env.id);
+    seenEnvelopeOrderRef.current.push(env.id);
+    if (seenEnvelopeOrderRef.current.length > 2048) {
+      const oldest = seenEnvelopeOrderRef.current.shift();
+      if (oldest) seenEnvelopeIDsRef.current.delete(oldest);
+    }
+    setLastEnvelope(env);
+    void dispatchRef.current(env, ws);
+    return true;
+  }
+
   // ----------------------------------------------------------------------------
   // send — public API. Components call this to publish
   // frames. We accept the full Envelope so the caller
@@ -503,7 +529,7 @@ export function useWebSocket(): UseWebSocketResult {
     }
   }
 
-  return { send, connected, lastEnvelope };
+  return { send, connected, lastEnvelope, consumeExternal };
 }
 
 // ----------------------------------------------------------------------------
@@ -515,7 +541,8 @@ function buildWSURL(): string {
   return `${scheme}//${loc.host}/ws`;
 }
 
-function safeSend(ws: WebSocket, frame: Envelope): boolean {
+function safeSend(ws: WebSocket | null, frame: Envelope): boolean {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   try {
     ws.send(JSON.stringify(frame));
     return true;
@@ -539,7 +566,7 @@ function cryptoRandomId(): string {
 // same id generator for client_id.
 export { cryptoRandomId };
 
-function sendReadReceipt(ws: WebSocket, message: Message): void {
+function sendReadReceipt(ws: WebSocket | null, message: Message): void {
   safeSend(ws, {
     type: "read",
     id: cryptoRandomId(),

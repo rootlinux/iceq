@@ -104,7 +104,7 @@
     # routes: both carry opaque E2EE ciphertext that must not appear in
     # any log, even indirectly via request metadata.
     @silent {
-        path /ws /ws/* /api/messages/*
+        path /ws /ws/* /api/messages/* /api/transport/*
     }
     log_skip @silent
 
@@ -208,6 +208,13 @@
             }
         }
         reverse_proxy message-service:8080 {
+            import reverse_proxy_common
+            import proxy_transport
+        }
+    }
+
+    handle /api/transport/* {
+        reverse_proxy ws-gateway:8082 {
             import reverse_proxy_common
             import proxy_transport
         }

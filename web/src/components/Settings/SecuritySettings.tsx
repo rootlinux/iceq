@@ -45,6 +45,7 @@ import { computeSafetyNumber } from "../../lib/safetyFingerprint";
 import { acceptPeerIdentity, assessPeerIdentity, verifyPeerIdentity } from "../../lib/identityTrust";
 import { useAuthStore } from "../../store/authStore";
 import { verifySignedPreKeyBundle } from "../../lib/signal";
+import { loadDisappearingSeconds, loadPrivacySettings, saveDisappearingSeconds, savePrivacySettings, type PrivacySettings } from "../../lib/privacySettings";
 
 type Status =
   | { kind: "loading" }
@@ -76,6 +77,13 @@ export function SecuritySettings(): JSX.Element {
   const [peerUin, setPeerUin] = useState("");
   const [peerSafety, setPeerSafety] = useState<{ uin: number; identityKey: string; number: string; changed: boolean; verified: boolean } | null>(null);
   const [peerError, setPeerError] = useState<string | null>(null);
+  const [privacy, setPrivacy] = useState<PrivacySettings>(() => loadPrivacySettings());
+  const [disappearing, setDisappearing] = useState(() => loadDisappearingSeconds());
+
+  const togglePrivacy = (key: keyof PrivacySettings): void => {
+    const next = { ...privacy, [key]: !privacy[key] };
+    setPrivacy(next); savePrivacySettings(next);
+  };
 
   const inspectPeer = async (): Promise<void> => {
     const parsed = Number(peerUin);
@@ -217,6 +225,26 @@ export function SecuritySettings(): JSX.Element {
           />
           <span>Auto-wipe on failed logins</span>
         </label>
+      </div>
+
+      <div className="iceq-settings-row">
+        <div className="iceq-settings-status">
+          <strong>Privacy signals</strong>
+          {(["presence", "typing", "deliveryReceipts", "readReceipts"] as const).map((key) => (
+            <label key={key} className="flex items-center gap-2">
+              <input type="checkbox" checked={privacy[key]} onChange={() => togglePrivacy(key)} />
+              {key === "deliveryReceipts" ? "Delivery receipts" : key === "readReceipts" ? "Read receipts" : key[0]?.toUpperCase() + key.slice(1)}
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div className="iceq-settings-row">
+        <label htmlFor="disappearing-duration">Disappearing messages</label>
+        <select id="disappearing-duration" value={disappearing} onChange={(event) => { const next = Number(event.target.value); setDisappearing(next); saveDisappearingSeconds(next); }}>
+          <option value={0}>Off</option><option value={3600}>1 hour</option><option value={86400}>1 day</option><option value={604800}>7 days</option><option value={2592000}>30 days</option>
+        </select>
+        <p>Ciphertext expires on the server. IceQ cannot remotely erase copies already saved by recipient devices or backups.</p>
       </div>
       {fingerprintStatus.kind === "ready" && fingerprintStatus.fingerprint && (
         <SafetyQr fingerprint={fingerprintStatus.fingerprint} />

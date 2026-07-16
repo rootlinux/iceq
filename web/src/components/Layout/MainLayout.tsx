@@ -6,7 +6,7 @@
 
 import { useEffect, useState } from "react";
 import { Sidebar } from "./Sidebar";
-import { useWebSocket } from "../../hooks/useWebSocket";
+import { useMessageTransport } from "../../hooks/useMessageTransport";
 import { useOnlineStatus } from "../../hooks/useOnlineStatus";
 import { useAuthStore } from "../../store/authStore";
 import { useSignalStore } from "../../store/signalStore";
@@ -21,7 +21,7 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
   // tree. The hook's send() is what components use to publish
   // frames; we don't propagate it via context — components
   // call the hook directly.
-  const { connected, send } = useWebSocket();
+  const { connected, send } = useMessageTransport();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { isOnline } = useOnlineStatus();
   const selfUin = useAuthStore((s) => s.uin);

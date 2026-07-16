@@ -24,6 +24,7 @@ import type { GroupMessagePayload, MessagePayload } from "../../types/envelope";
 import type { Envelope } from "../../types/envelope";
 import { getGroupMembersWithEpoch, putSenderKeyDistribution } from "../../api/groups";
 import { ensureGroupSender, sealGroupContent, encodeGroupCiphertext, GROUP_CONTENT_KIND } from "../../lib/groupCrypto";
+import { loadDisappearingSeconds, permitsPrivacySignal } from "../../lib/privacySettings";
 
 interface MessageInputProps {
   peerUin?: number;
@@ -52,6 +53,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
       // limits; this is just a client courtesy.
       if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
       typingTimerRef.current = setTimeout(() => {
+		if (!permitsPrivacySignal("typing")) return;
         const now = Date.now();
         if (now - lastTypingSentRef.current < TYPING_DEBOUNCE_MS) return;
         lastTypingSentRef.current = now;
@@ -127,6 +129,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
           msg_type: "group_ciphertext",
           crypto_version: 1,
           crypto_epoch: roster.crypto_epoch,
+          expires_in_seconds: loadDisappearingSeconds(),
         };
         const frame: Envelope<typeof payload> = {
           type: "group_msg",
@@ -150,6 +153,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         client_id: clientId,
         ciphertext: sealed.ciphertext,
         msg_type: sealed.msgType,
+        expires_in_seconds: loadDisappearingSeconds(),
       };
       const frame: Envelope<typeof payload> = {
         type: "message",
@@ -202,7 +206,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         const attachment={kind:"iceq.attachment.v1",object_key:uploaded.object_key,manifest:uploaded.manifest};
         const sealed=await sealGroupContent(sender,{kind:GROUP_CONTENT_KIND,content_type:"file",attachment});
         addMessage(convId,{id:clientId,conversation_id:convId,sender_uin:selfUin,receiver_uin:0,plaintext:"",content_type:"file",file_object_key:uploaded.object_key,attachment:{object_key:uploaded.object_key,manifest:uploaded.manifest,name:uploaded.manifest.name??file.name,mime_type:uploaded.manifest.mime_type,size:uploaded.manifest.size},created_at:new Date().toISOString(),state:"sending",is_outgoing:true});
-        const payload:GroupMessagePayload={conversation_id:convId,group_id:groupId,sender_uin:selfUin,content:"",content_type:"file",client_id:clientId,ciphertext:encodeGroupCiphertext(sealed),msg_type:"group_ciphertext",crypto_version:1,crypto_epoch:roster.crypto_epoch};
+        const payload:GroupMessagePayload={conversation_id:convId,group_id:groupId,sender_uin:selfUin,content:"",content_type:"file",client_id:clientId,ciphertext:encodeGroupCiphertext(sealed),msg_type:"group_ciphertext",crypto_version:1,crypto_epoch:roster.crypto_epoch,expires_in_seconds:loadDisappearingSeconds()};
         if(!send({type:"group_msg",id:cryptoRandomId(),ts:Date.now(),payload})) throw new Error("message transport is unavailable");
         groupGrantCleanup=null;
         return;
@@ -248,6 +252,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         client_id: clientId,
         ciphertext: sealed.ciphertext,
         msg_type: sealed.msgType,
+        expires_in_seconds: loadDisappearingSeconds(),
       };
       if (!send({
         type: "message",

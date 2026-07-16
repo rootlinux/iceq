@@ -163,6 +163,7 @@ func main() {
 
 	// --- Hub -----------------------------------------------------------
 	h := hub.New(rdb)
+	pollStore := router.NewRedisPollStore(rdb)
 
 	// --- Shared client deps (passed to every WebSocket) ---------------
 	deps := client.Deps{
@@ -178,6 +179,7 @@ func main() {
 		FrameRateLimiter: middleware.NewAuthenticatedRateLimiter(middleware.AuthenticatedRateLimitConfig{
 			Redis: rdb, Action: "ws:frame", Limit: 30, Window: time.Minute, Timeout: 200 * time.Millisecond,
 		}),
+		MessageDeduper: router.NewRedisMessageDeduper(rdb),
 	}
 
 	// --- NATS subscribers. These run for the lifetime of the process
@@ -199,6 +201,19 @@ func main() {
 	r.Get("/ws", func(w http.ResponseWriter, req *http.Request) {
 		client.ServeHTTP(deps, w, req)
 	})
+	authMW := middleware.NewBearerAuth(middleware.BearerAuthConfig{Manager: mgr})
+	pollRate := middleware.NewAuthenticatedRateLimit(middleware.AuthenticatedRateLimitConfig{
+		Redis: rdb, Action: "transport:poll", Limit: 120, Window: time.Minute, Timeout: 200 * time.Millisecond,
+	})
+	// Timeout exceeds MaxPollWait slightly so JSON serialization can finish;
+	// request cancellation propagates through Redis XREAD.
+	r.With(authMW, pollRate, chimw.Timeout(30*time.Second)).Get("/api/transport/poll", router.NewPollHandler(pollStore).ServeHTTP)
+	sendRate := middleware.NewAuthenticatedRateLimit(middleware.AuthenticatedRateLimitConfig{
+		Redis: rdb, Action: "transport:send", Limit: 30, Window: time.Minute, Timeout: 200 * time.Millisecond,
+	})
+	r.With(authMW, sendRate, chimw.Timeout(10*time.Second)).Post("/api/transport/send", router.NewSendHandler(router.SendDeps{
+		Publisher: nc, Deduper: deps.MessageDeduper, Groups: router.NewPGGroupSendAuthorizer(pgPool),
+	}).ServeHTTP)
 	// /health: standard 30 s timeout (short-lived probe).
 	r.With(chimw.Timeout(30*time.Second)).Get("/health", newHealthHandler(pgPool, rdb, nc, VERSION))
 

@@ -79,6 +79,7 @@ export interface Envelope<P = unknown> {
 // ----------------------------------------------------------------------------
 export interface AuthPayload {
   access_token: string;
+  presence_enabled?: boolean;
 }
 
 export interface AuthOkPayload {
@@ -118,6 +119,7 @@ export interface MessagePayload {
   // session (the recipient has to bootstrap with X3DH), or
   // "signal_message" once a session exists.
   msg_type?: "prekey_message" | "signal_message";
+  expires_in_seconds?: number;
 }
 
 export interface GroupMessagePayload {
@@ -132,6 +134,7 @@ export interface GroupMessagePayload {
   msg_type: "group_ciphertext";
   crypto_version: 1;
   crypto_epoch: number;
+  expires_in_seconds?: number;
 }
 
 export interface AckPayload {

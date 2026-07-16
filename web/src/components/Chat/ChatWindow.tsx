@@ -28,6 +28,7 @@ import { useChatShell } from "../Layout/MainLayout";
 import { cryptoRandomId } from "../../hooks/useWebSocket";
 import type { Message } from "../../types/models";
 import type { Envelope, ReadPayload } from "../../types/envelope";
+import { permitsPrivacySignal } from "../../lib/privacySettings";
 
 interface ChatWindowProps {
   peerUin: number;
@@ -49,6 +50,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
   // Fetch + decrypt history on mount / peer change.
   useEffect(() => {
     if (!convId) return;
+	if (!permitsPrivacySignal("readReceipts")) return;
     markConversationRead(convId);
   }, [convId, markConversationRead]);
 

@@ -16,7 +16,7 @@ func TestGroupMessageCryptoEpochPersistenceContract(t *testing.T) {
 		"CryptoEpoch int64",
 		"sender_uin, crypto_epoch, ciphertext, msg_type",
 		"req.CryptoEpoch",
-		"sender_uin, crypto_epoch, ciphertext, msg_type\n\t  FROM iceq.group_messages",
+		"sender_uin, crypto_epoch, ciphertext, msg_type, expires_at\n\t  FROM iceq.group_messages",
 		"&row.CryptoEpoch",
 	} {
 		if !strings.Contains(s, want) {

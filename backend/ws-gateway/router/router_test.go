@@ -99,6 +99,31 @@ func TestValidateDirectPayloadRejectsMissingBody(t *testing.T) {
 	}
 }
 
+func TestDisappearingPolicyAcceptsOffAndBoundedDurationsOnly(t *testing.T) {
+	allowed := []int64{0, 3600, 86400, 604800, 2592000}
+	for _, seconds := range allowed {
+		if err := validateDisappearingSeconds(seconds); err != nil {
+			t.Fatalf("%d rejected: %v", seconds, err)
+		}
+	}
+	for _, seconds := range []int64{-1, 1, 3599, 2592001} {
+		if validateDisappearingSeconds(seconds) == nil {
+			t.Fatalf("%d accepted", seconds)
+		}
+	}
+}
+
+func TestParseDirectPayloadPreservesDisappearingPolicy(t *testing.T) {
+	raw := []byte(`{"conversation_id":"dm:7:42","to_uin":42,"ciphertext":"Y2lwaGVy","msg_type":"signal_message","expires_in_seconds":86400}`)
+	got, err := parseDirectPayload(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ExpiresInSeconds != 86400 {
+		t.Fatalf("expires=%d", got.ExpiresInSeconds)
+	}
+}
+
 func TestAuthorizeDirectConversationRejectsForeignOrMismatchedObject(t *testing.T) {
 	tests := []models.DirectMessagePayload{
 		{ConversationID: "dm:7:99", ReceiverUIN: 42},

@@ -468,13 +468,14 @@ func handleDirectMessage(bus *natsclient.Client, ms *store.MessageStore, subject
 	// store/messagestore.go for the authoritative
 	// documentation.
 	if err := ms.SaveMessage(ctx, store.SaveRequest{
-		ConversationID: convID,
-		ID:             id,
-		SenderUIN:      p.SenderUIN,
-		ReceiverUIN:    p.ReceiverUIN,
-		Ciphertext:     p.Ciphertext,
-		MsgType:        p.MsgType,
-		CreatedAt:      createdAt,
+		ConversationID:   convID,
+		ID:               id,
+		SenderUIN:        p.SenderUIN,
+		ReceiverUIN:      p.ReceiverUIN,
+		Ciphertext:       p.Ciphertext,
+		MsgType:          p.MsgType,
+		CreatedAt:        createdAt,
+		ExpiresInSeconds: p.ExpiresInSeconds,
 	}); err != nil {
 		// Operational log only — never includes
 		// the E2EE bytes or the message id.
@@ -571,13 +572,14 @@ func handleGroupMessage(_ *natsclient.Client, ms *store.MessageStore, pg *pgxpoo
 
 func newSaveGroupRequest(groupID, id gocql.UUID, p models.GroupMessagePayload, createdAt time.Time) store.SaveGroupRequest {
 	return store.SaveGroupRequest{
-		GroupID:     groupID,
-		ID:          id,
-		SenderUIN:   p.SenderUIN,
-		CryptoEpoch: p.CryptoEpoch,
-		Ciphertext:  p.Ciphertext,
-		MsgType:     p.MsgType,
-		CreatedAt:   createdAt,
+		GroupID:          groupID,
+		ID:               id,
+		SenderUIN:        p.SenderUIN,
+		CryptoEpoch:      p.CryptoEpoch,
+		Ciphertext:       p.Ciphertext,
+		MsgType:          p.MsgType,
+		CreatedAt:        createdAt,
+		ExpiresInSeconds: p.ExpiresInSeconds,
 	}
 }
 

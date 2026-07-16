@@ -108,8 +108,17 @@ const (
 )
 
 type authPayload struct {
-	AccessToken string `json:"access_token"`
-	Token       string `json:"token"`
+	AccessToken     string `json:"access_token"`
+	Token           string `json:"token"`
+	PresenceEnabled bool   `json:"presence_enabled"`
+}
+
+func parsePresenceEnabled(raw []byte) bool {
+	var frame authEnvelope
+	if json.Unmarshal(raw, &frame) != nil {
+		return false
+	}
+	return frame.Payload.PresenceEnabled
 }
 
 type authEnvelope struct {
@@ -173,6 +182,12 @@ type Deps struct {
 	Dispatch           func(c *Client, env models.Envelope)
 	ConnectRateLimiter *middleware.AuthenticatedRateLimiter
 	FrameRateLimiter   *middleware.AuthenticatedRateLimiter
+	MessageDeduper     MessageDeduper
+}
+
+type MessageDeduper interface {
+	Reserve(context.Context, int64, string, string) (string, bool, error)
+	Release(context.Context, int64, string, string) error
 }
 
 // HubRegister is the slice of the hub.Hub API the client needs.
@@ -320,6 +335,7 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 		_ = ws.Close(websocket.StatusPolicyViolation, "auth_required")
 		return
 	}
+	presenceEnabled := parsePresenceEnabled(authFrame)
 	claims, err := deps.Manager.Verify(ctx, token, jwt.TokenTypeAccess)
 	if err != nil {
 		// Token-level error: expired, revoked, wrong type,
@@ -414,7 +430,9 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 	// NATS is degraded the message is dropped, but the
 	// connection itself is already healthy and the next
 	// presence update (offline) will catch up.
-	publishPresence(deps.NATS, uin, models.PresenceStatusOnline)
+	if presenceEnabled {
+		publishPresence(deps.NATS, uin, models.PresenceStatusOnline)
+	}
 
 	// 7. Drain undelivered envelopes. Each frame is written to
 	// the per-client send channel; the writeLoop will pick
@@ -433,7 +451,9 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 	// is a no-op guard so any future code added after the
 	// loops cannot accidentally skip the cleanup.
 	deps.Hub.Unregister(c)
-	publishPresence(deps.NATS, uin, models.PresenceStatusOffline)
+	if presenceEnabled {
+		publishPresence(deps.NATS, uin, models.PresenceStatusOffline)
+	}
 	_ = ws.Close(websocket.StatusNormalClosure, "bye")
 }
 

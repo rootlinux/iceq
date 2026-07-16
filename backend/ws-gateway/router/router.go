@@ -130,6 +130,18 @@ func handleDirect(c *client.Client, deps client.Deps, env models.Envelope) {
 	// Mint a server-side message ID. We use a UUID v4; the
 	// spec asks for a UUID.
 	msgID := uuid.NewString()
+	idemCtx, idemCancel := context.WithTimeout(context.Background(), time.Second)
+	reservedID, duplicate, err := reserveMessageID(idemCtx, deps.MessageDeduper, c.UIN(), p.ClientID, msgID)
+	idemCancel()
+	if err != nil {
+		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "message idempotency check failed")
+		return
+	}
+	if duplicate {
+		ack, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{MessageID: ackMessageID(reservedID, p.ClientID), State: models.AckStatePersisted, RecipientUIN: p.ReceiverUIN})
+		c.TrySend(mustMarshal(ack))
+		return
+	}
 
 	// Build the on-wire envelope. The router includes the
 	// message_id so the recipient's message-service can
@@ -142,6 +154,9 @@ func handleDirect(c *client.Client, deps client.Deps, env models.Envelope) {
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = deps.MessageDeduper.Release(releaseCtx, c.UIN(), p.ClientID, msgID)
+		cancel()
 		log.Printf("[ws-gateway] marshal direct: %v", err)
 		return
 	}
@@ -156,6 +171,9 @@ func handleDirect(c *client.Client, deps client.Deps, env models.Envelope) {
 		"msg.direct."+itoa(p.ReceiverUIN),
 		data,
 	); err != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = deps.MessageDeduper.Release(releaseCtx, c.UIN(), p.ClientID, msgID)
+		cancel()
 		// The publish failed (NATS down, server closing,
 		// etc.). The send ACKs we are about to emit would
 		// be misleading because the recipient won't see
@@ -179,16 +197,17 @@ func handleDirect(c *client.Client, deps client.Deps, env models.Envelope) {
 }
 
 type directMessageWirePayload struct {
-	ConversationID string `json:"conversation_id"`
-	SenderUIN      int64  `json:"sender_uin"`
-	ToUIN          int64  `json:"to_uin,omitempty"`
-	ReceiverUIN    int64  `json:"receiver_uin"`
-	Content        string `json:"content"`
-	ContentType    string `json:"content_type"`
-	FileURL        string `json:"file_url,omitempty"`
-	ClientID       string `json:"client_id,omitempty"`
-	Ciphertext     string `json:"ciphertext,omitempty"`
-	MsgType        string `json:"msg_type,omitempty"`
+	ConversationID   string `json:"conversation_id"`
+	SenderUIN        int64  `json:"sender_uin"`
+	ToUIN            int64  `json:"to_uin,omitempty"`
+	ReceiverUIN      int64  `json:"receiver_uin"`
+	Content          string `json:"content"`
+	ContentType      string `json:"content_type"`
+	FileURL          string `json:"file_url,omitempty"`
+	ClientID         string `json:"client_id,omitempty"`
+	Ciphertext       string `json:"ciphertext,omitempty"`
+	MsgType          string `json:"msg_type,omitempty"`
+	ExpiresInSeconds int64  `json:"expires_in_seconds,omitempty"`
 }
 
 func parseDirectPayload(raw json.RawMessage) (models.DirectMessagePayload, error) {
@@ -205,16 +224,17 @@ func parseDirectPayload(raw json.RawMessage) (models.DirectMessagePayload, error
 		receiverUIN = wire.ToUIN
 	}
 	return models.DirectMessagePayload{
-		ConversationID: wire.ConversationID,
-		SenderUIN:      wire.SenderUIN,
-		ToUIN:          receiverUIN,
-		ReceiverUIN:    receiverUIN,
-		Content:        wire.Content,
-		ContentType:    wire.ContentType,
-		FileURL:        wire.FileURL,
-		ClientID:       wire.ClientID,
-		Ciphertext:     ciphertext,
-		MsgType:        wire.MsgType,
+		ConversationID:   wire.ConversationID,
+		SenderUIN:        wire.SenderUIN,
+		ToUIN:            receiverUIN,
+		ReceiverUIN:      receiverUIN,
+		Content:          wire.Content,
+		ContentType:      wire.ContentType,
+		FileURL:          wire.FileURL,
+		ClientID:         wire.ClientID,
+		Ciphertext:       ciphertext,
+		MsgType:          wire.MsgType,
+		ExpiresInSeconds: wire.ExpiresInSeconds,
 	}, nil
 }
 
@@ -249,7 +269,19 @@ func validateDirectPayload(p models.DirectMessagePayload) error {
 	if len(p.Ciphertext) > 0 && !isValidMessageType(p.MsgType) {
 		return fmt.Errorf("msg_type must be prekey_message or signal_message")
 	}
+	if err := validateDisappearingSeconds(p.ExpiresInSeconds); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateDisappearingSeconds(seconds int64) error {
+	switch seconds {
+	case 0, 3600, 86400, 604800, 2592000:
+		return nil
+	default:
+		return fmt.Errorf("expires_in_seconds must be off, 1h, 1d, 7d, or 30d")
+	}
 }
 
 func isValidMessageType(msgType string) bool {
@@ -273,16 +305,17 @@ func authorizeDirectConversation(p models.DirectMessagePayload, senderUIN int64)
 
 func forwardDirectPayload(p models.DirectMessagePayload, senderUIN int64) models.DirectMessagePayload {
 	return models.DirectMessagePayload{
-		ConversationID: p.ConversationID,
-		SenderUIN:      senderUIN,
-		ToUIN:          p.ReceiverUIN,
-		ReceiverUIN:    p.ReceiverUIN,
-		Content:        p.Content,
-		ContentType:    p.ContentType,
-		FileURL:        p.FileURL,
-		ClientID:       p.ClientID,
-		Ciphertext:     p.Ciphertext,
-		MsgType:        p.MsgType,
+		ConversationID:   p.ConversationID,
+		SenderUIN:        senderUIN,
+		ToUIN:            p.ReceiverUIN,
+		ReceiverUIN:      p.ReceiverUIN,
+		Content:          p.Content,
+		ContentType:      p.ContentType,
+		FileURL:          p.FileURL,
+		ClientID:         p.ClientID,
+		Ciphertext:       p.Ciphertext,
+		MsgType:          p.MsgType,
+		ExpiresInSeconds: p.ExpiresInSeconds,
 	}
 }
 
@@ -334,26 +367,42 @@ func handleGroup(c *client.Client, deps client.Deps, env models.Envelope) {
 
 	ts := time.Now().UTC().Truncate(time.Minute).UnixMilli()
 	msgID := uuid.NewString()
+	idemCtx, idemCancel := context.WithTimeout(context.Background(), time.Second)
+	reservedID, duplicate, err := reserveMessageID(idemCtx, deps.MessageDeduper, c.UIN(), p.ClientID, msgID)
+	idemCancel()
+	if err != nil {
+		sendErrorFrame(c, "DELIVERY_UNAVAILABLE", "message idempotency check failed")
+		return
+	}
+	if duplicate {
+		ack, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{MessageID: ackMessageID(reservedID, p.ClientID), State: models.AckStatePersisted})
+		c.TrySend(mustMarshal(ack))
+		return
+	}
 
 	out := models.Envelope{
 		Type: models.EnvelopeTypeGroup,
 		ID:   msgID,
 		TS:   ts,
 		Payload: mustMarshalRaw(models.GroupMessagePayload{
-			GroupID:       p.GroupID,
-			SenderUIN:     p.SenderUIN,
-			Content:       p.Content,
-			ContentType:   p.ContentType,
-			FileURL:       p.FileURL,
-			ClientID:      p.ClientID,
-			Ciphertext:    p.Ciphertext,
-			MsgType:       p.MsgType,
-			CryptoVersion: p.CryptoVersion,
-			CryptoEpoch:   p.CryptoEpoch,
+			GroupID:          p.GroupID,
+			SenderUIN:        p.SenderUIN,
+			Content:          p.Content,
+			ContentType:      p.ContentType,
+			FileURL:          p.FileURL,
+			ClientID:         p.ClientID,
+			Ciphertext:       p.Ciphertext,
+			MsgType:          p.MsgType,
+			CryptoVersion:    p.CryptoVersion,
+			CryptoEpoch:      p.CryptoEpoch,
+			ExpiresInSeconds: p.ExpiresInSeconds,
 		}),
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = deps.MessageDeduper.Release(releaseCtx, c.UIN(), p.ClientID, msgID)
+		cancel()
 		log.Printf("[ws-gateway] marshal group: %v", err)
 		return
 	}
@@ -361,6 +410,9 @@ func handleGroup(c *client.Client, deps client.Deps, env models.Envelope) {
 		"msg.group."+p.GroupID,
 		data,
 	); err != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = deps.MessageDeduper.Release(releaseCtx, c.UIN(), p.ClientID, msgID)
+		cancel()
 		log.Printf("[ws-gateway] publish group: %v", err)
 		return
 	}
@@ -384,16 +436,17 @@ func ackMessageID(serverID, clientID string) string {
 }
 
 type groupMessageWirePayload struct {
-	GroupID       string `json:"group_id"`
-	SenderUIN     int64  `json:"sender_uin"`
-	Content       string `json:"content"`
-	ContentType   string `json:"content_type"`
-	FileURL       string `json:"file_url,omitempty"`
-	ClientID      string `json:"client_id,omitempty"`
-	Ciphertext    string `json:"ciphertext,omitempty"`
-	MsgType       string `json:"msg_type,omitempty"`
-	CryptoVersion int    `json:"crypto_version"`
-	CryptoEpoch   int64  `json:"crypto_epoch"`
+	GroupID          string `json:"group_id"`
+	SenderUIN        int64  `json:"sender_uin"`
+	Content          string `json:"content"`
+	ContentType      string `json:"content_type"`
+	FileURL          string `json:"file_url,omitempty"`
+	ClientID         string `json:"client_id,omitempty"`
+	Ciphertext       string `json:"ciphertext,omitempty"`
+	MsgType          string `json:"msg_type,omitempty"`
+	CryptoVersion    int    `json:"crypto_version"`
+	CryptoEpoch      int64  `json:"crypto_epoch"`
+	ExpiresInSeconds int64  `json:"expires_in_seconds,omitempty"`
 }
 
 func parseGroupPayload(raw json.RawMessage) (models.GroupMessagePayload, error) {
@@ -406,16 +459,17 @@ func parseGroupPayload(raw json.RawMessage) (models.GroupMessagePayload, error) 
 		return models.GroupMessagePayload{}, err
 	}
 	return models.GroupMessagePayload{
-		GroupID:       wire.GroupID,
-		SenderUIN:     wire.SenderUIN,
-		Content:       wire.Content,
-		ContentType:   wire.ContentType,
-		FileURL:       wire.FileURL,
-		ClientID:      wire.ClientID,
-		Ciphertext:    ciphertext,
-		MsgType:       wire.MsgType,
-		CryptoVersion: wire.CryptoVersion,
-		CryptoEpoch:   wire.CryptoEpoch,
+		GroupID:          wire.GroupID,
+		SenderUIN:        wire.SenderUIN,
+		Content:          wire.Content,
+		ContentType:      wire.ContentType,
+		FileURL:          wire.FileURL,
+		ClientID:         wire.ClientID,
+		Ciphertext:       ciphertext,
+		MsgType:          wire.MsgType,
+		CryptoVersion:    wire.CryptoVersion,
+		CryptoEpoch:      wire.CryptoEpoch,
+		ExpiresInSeconds: wire.ExpiresInSeconds,
 	}, nil
 }
 
@@ -431,6 +485,9 @@ func validateGroupPayload(p models.GroupMessagePayload) error {
 	}
 	if p.CryptoVersion != 1 || p.CryptoEpoch < 1 || p.MsgType != "group_ciphertext" {
 		return fmt.Errorf("versioned group ciphertext is required")
+	}
+	if err := validateDisappearingSeconds(p.ExpiresInSeconds); err != nil {
+		return err
 	}
 	return nil
 }
