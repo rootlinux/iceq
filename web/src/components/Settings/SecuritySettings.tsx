@@ -39,6 +39,12 @@ import {
   putSettings,
 } from "../../api/settings";
 import { loadIdentity } from "../../lib/indexeddb";
+import { SafetyQr } from "./SafetyQr";
+import { fetchBundle } from "../../api/keys";
+import { computeSafetyNumber } from "../../lib/safetyFingerprint";
+import { acceptPeerIdentity, assessPeerIdentity, verifyPeerIdentity } from "../../lib/identityTrust";
+import { useAuthStore } from "../../store/authStore";
+import { verifySignedPreKeyBundle } from "../../lib/signal";
 
 type Status =
   | { kind: "loading" }
@@ -55,6 +61,7 @@ type FingerprintStatus =
   | { kind: "error" };
 
 export function SecuritySettings(): JSX.Element {
+  const selfUin = useAuthStore((state) => state.uin);
   const [status, setStatus] = useState<Status>({ kind: "loading" });
   // Working copy of the threshold. Kept separate from
   // `status.settings.panic_wipe_threshold` so the user can
@@ -66,6 +73,28 @@ export function SecuritySettings(): JSX.Element {
     kind: "loading",
   });
   const [saving, setSaving] = useState(false);
+  const [peerUin, setPeerUin] = useState("");
+  const [peerSafety, setPeerSafety] = useState<{ uin: number; identityKey: string; number: string; changed: boolean; verified: boolean } | null>(null);
+  const [peerError, setPeerError] = useState<string | null>(null);
+
+  const inspectPeer = async (): Promise<void> => {
+    const parsed = Number(peerUin);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0 || selfUin === null) {
+      setPeerError("Enter a valid contact UIN."); return;
+    }
+    try {
+      const [local, remote] = await Promise.all([loadIdentity(), fetchBundle(parsed)]);
+      if (!local) throw new Error("Local identity is unavailable.");
+      await verifySignedPreKeyBundle(remote);
+      const assessment = await assessPeerIdentity(parsed, remote.identity_key);
+      const number = await computeSafetyNumber(
+        { uin: selfUin, identityKey: local.publicKey },
+        { uin: parsed, identityKey: remote.identity_key },
+      );
+      setPeerSafety({ uin: parsed, identityKey: remote.identity_key, number, changed: !assessment.sendAllowed, verified: assessment.record.verified && assessment.record.fingerprint === remote.identity_key });
+      setPeerError(null);
+    } catch (error) { setPeerSafety(null); setPeerError((error as Error).message); }
+  };
 
   // Initial fetch.
   useEffect(() => {
@@ -188,6 +217,27 @@ export function SecuritySettings(): JSX.Element {
           />
           <span>Auto-wipe on failed logins</span>
         </label>
+      </div>
+      {fingerprintStatus.kind === "ready" && fingerprintStatus.fingerprint && (
+        <SafetyQr fingerprint={fingerprintStatus.fingerprint} />
+      )}
+      <div className="iceq-settings-row">
+        <div className="iceq-settings-status">
+          <strong>Verify a contact</strong>
+          <input aria-label="Contact UIN" inputMode="numeric" value={peerUin} onChange={(event) => setPeerUin(event.target.value)} />
+          <button type="button" onClick={() => void inspectPeer()}>Load safety number</button>
+          {peerError && <div role="alert">{peerError}</div>}
+          {peerSafety && (
+            <div>
+              <div>{peerSafety.number}</div>
+              <SafetyQr fingerprint={peerSafety.number} />
+              {peerSafety.changed && <div role="alert">Identity changed. Sending is blocked.</div>}
+              {peerSafety.changed && <button type="button" onClick={async () => { await acceptPeerIdentity(peerSafety.uin, peerSafety.identityKey); await inspectPeer(); }}>Accept new identity</button>}
+              {!peerSafety.verified && !peerSafety.changed && <button type="button" onClick={async () => { await verifyPeerIdentity(peerSafety.uin, peerSafety.identityKey); await inspectPeer(); }}>I verified this fingerprint</button>}
+              {peerSafety.verified && <div role="status">Verified on this device</div>}
+            </div>
+          )}
+        </div>
       </div>
 
       {isEnabled && (

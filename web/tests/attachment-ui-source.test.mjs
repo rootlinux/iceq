@@ -29,7 +29,7 @@ test("message item renders encrypted attachments with a decrypting download acti
   assert.match(item, /downloadEncryptedFile/);
   assert.match(item, /parseAttachment/);
   assert.match(item, /content_type === "file"/);
-  assert.match(item, /URL\.createObjectURL/);
+  assert.match(item, /withObjectUrl/);
   assert.match(item, /download=\{attachment\.name/);
   assert.match(item, /"Download"/);
 });

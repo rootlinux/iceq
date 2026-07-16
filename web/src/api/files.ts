@@ -19,6 +19,7 @@ import { fetchJSON, fetchWithAuth } from "./client";
 import {
   decryptFileBlob,
   encryptFileBlob,
+  assertAcceptableFileSize,
   type EncryptedFileManifest,
 } from "../lib/fileCrypto";
 
@@ -103,12 +104,13 @@ export interface EncryptedUploadResult {
 }
 
 export async function uploadEncryptedFile(file: Blob, displayName?: string): Promise<EncryptedUploadResult> {
-  const encrypted = await encryptFileBlob(file, displayName);
+  assertAcceptableFileSize(file.size);
   const upload = await getUploadURL({
     filename: "encrypted.bin",
-    content_type: encrypted.encryptedBlob.type,
-    size: encrypted.encryptedBlob.size,
+    content_type: "application/octet-stream",
+    size: file.size + 16,
   });
+  const encrypted = await encryptFileBlob(file, displayName, upload.object_key);
   await putToPresignedURL(upload.upload_url, encrypted.encryptedBlob, encrypted.encryptedBlob.type);
   return {
     object_key: upload.object_key,
@@ -123,5 +125,5 @@ export async function downloadEncryptedFile(
 ): Promise<Blob> {
   const download = await getDownloadURL(objectKey);
   const encrypted = await getFromPresignedURL(download.download_url);
-  return decryptFileBlob(encrypted, manifest);
+  return decryptFileBlob(encrypted, manifest, objectKey);
 }

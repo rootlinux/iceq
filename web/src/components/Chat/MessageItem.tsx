@@ -13,7 +13,7 @@
 
 import { useState } from "react";
 import { downloadEncryptedFile } from "../../api/files";
-import { isEncryptedFileManifest } from "../../lib/fileCrypto";
+import { isEncryptedFileManifest, withObjectUrl } from "../../lib/fileCrypto";
 import type { Message, MessageAttachment } from "../../types/models";
 
 interface MessageItemProps {
@@ -55,6 +55,7 @@ function parseAttachment(message: Message): MessageAttachment | null {
 
 export function MessageItem({ message }: MessageItemProps): JSX.Element {
   const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const outgoing = message.is_outgoing;
   // Defense in depth: even if a future bug let a server-
   // supplied plaintext through, we explicitly never render
@@ -66,16 +67,19 @@ export function MessageItem({ message }: MessageItemProps): JSX.Element {
     e.preventDefault();
     if (!attachment || downloading) return;
     setDownloading(true);
+    setDownloadError(null);
     try {
       const blob = await downloadEncryptedFile(attachment.object_key, attachment.manifest);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = attachment.name;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      await withObjectUrl(blob, (url) => {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = attachment.name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      });
+    } catch {
+      setDownloadError("File authentication failed. The file was not opened.");
     } finally {
       setDownloading(false);
     }
@@ -108,6 +112,7 @@ export function MessageItem({ message }: MessageItemProps): JSX.Element {
             >
               {downloading ? "Decrypting..." : "Download"}
             </a>
+            {downloadError && <div role="alert" className="text-xs text-red-400">{downloadError}</div>}
           </div>
         ) : (
           <div className="whitespace-pre-wrap break-words">{text}</div>

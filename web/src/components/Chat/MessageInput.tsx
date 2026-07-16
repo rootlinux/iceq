@@ -37,6 +37,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [attaching, setAttaching] = useState(false);
+  const [securityError, setSecurityError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTypingSentRef = useRef(0);
@@ -84,6 +85,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
     if (selfUin === null) return;
     if (peerUin === undefined && groupId === undefined) return;
     setSending(true);
+    setSecurityError(null);
     const clientId = cryptoRandomId();
     const isGroup = groupId !== undefined;
     const convId = isGroup ? `group:${groupId}` : conversationIdForPair(selfUin, peerUin as number);
@@ -147,6 +149,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
       // via the dispatch path in useWebSocket.
     } catch (e) {
       const reason = e instanceof SignalError ? e.message : (e as Error).message;
+      setSecurityError(reason);
       if (__DEV__) console.error("[send] encrypt failed:", reason);
       // Mark the optimistic row as failed. The chat-store
       // doesn't have a `markFailed` action, so we replace
@@ -171,6 +174,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
     if (attaching || sending) return;
     if (selfUin === null || peerUin === undefined || groupId !== undefined) return;
     setAttaching(true);
+    setSecurityError(null);
     const clientId = cryptoRandomId();
     const convId = conversationIdForPair(selfUin, peerUin as number);
     try {
@@ -228,6 +232,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
     } catch (e) {
       await attachmentGrantLifecycle.fail(clientId).catch(() => undefined);
       const reason = e instanceof SignalError ? e.message : (e as Error).message;
+      setSecurityError(reason);
       if (__DEV__) console.error("[send] attachment failed:", reason);
       useChatStore.setState((s) => {
         const list = s.messagesByConversation[convId];
@@ -248,6 +253,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
 
   return (
     <div className="border-t border-border p-3">
+      {securityError && <div role="alert" className="mb-2 text-sm text-red-400">Send blocked: {securityError}</div>}
       <div className="flex items-end gap-2">
         <input
           ref={fileInputRef}

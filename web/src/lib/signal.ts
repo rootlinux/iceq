@@ -40,6 +40,7 @@ import {
   saveIdentity,
   type StoredIdentity,
 } from "./indexeddb";
+import { assessPeerIdentity, isPeerSendAllowed } from "./identityTrust";
 
 // ============================================================================
 // Library bootstrap.
@@ -60,6 +61,7 @@ interface BootState {
   // cached for the curve + WebCrypto wiring only.
   curveReady: true;
   runtime: SignalRuntime;
+  curve: InstanceType<SignalRuntime["AsyncCurve25519Wrapper"]>;
 }
 
 interface SignalRuntime {
@@ -109,7 +111,7 @@ async function boot(): Promise<BootState> {
   // 2. Wire WebCrypto. The library's Crypto class reads
   //    from the global this.crypto.
   runtime.setWebCrypto(globalThis.crypto);
-  return { curveReady: true, runtime };
+  return { curveReady: true, runtime, curve: asyncCurve };
 }
 
 async function ensureBoot(): Promise<BootState> {
@@ -409,6 +411,9 @@ export async function encryptMessage(
   const { runtime } = await ensureBoot();
   const identity = await getLocalIdentity();
   if (!identity) throw new SignalError("no local identity — register first");
+  if (!(await isPeerSendAllowed(recipientUin))) {
+    throw new SignalError("peer identity changed; sending is blocked until explicitly accepted or verified");
+  }
 
   const store = getSignalStore();
   const remoteAddress = new runtime.SignalProtocolAddress(String(recipientUin), 1);
@@ -454,6 +459,26 @@ export async function encryptMessage(
     if (e instanceof SignalError) throw e;
     throw new SignalError(`encrypt failed for uin=${recipientUin}`, e);
   }
+}
+
+export async function verifySignedPreKeyBundle(remote: Pick<RemotePreKeyBundle, "identity_key" | "signed_pre_key">): Promise<true> {
+  const { curve } = await ensureBoot();
+  let valid = false;
+  try {
+    // curve25519-typescript's low-level `verify` mirrors the C return code:
+    // false means valid, true means invalid. Keep the inversion explicit.
+    valid = !(await curve.verify(
+      // The low-level verifier consumes the raw 32-byte identity public key;
+      // the signed message remains Signal's 33-byte prefixed prekey.
+      b64UrlToArrayBuffer(remote.identity_key),
+      restoreSignalPublicKey(remote.signed_pre_key.public_key),
+      b64UrlToArrayBuffer(remote.signed_pre_key.signature),
+    ));
+  } catch (cause) {
+    throw new SignalError("signed prekey verification failed", cause);
+  }
+  if (!valid) throw new SignalError("signed prekey verification failed");
+  return true;
 }
 
 // ============================================================================
@@ -509,6 +534,12 @@ async function seedSessionFromBundle(
   store: ReturnType<typeof getSignalStore>,
 ): Promise<void> {
   const { runtime } = await ensureBoot();
+  await verifySignedPreKeyBundle(remote);
+  const peerUin = Number(remoteAddress.getName());
+  const trust = await assessPeerIdentity(peerUin, remote.identity_key);
+  if (!trust.sendAllowed) {
+    throw new SignalError("peer identity changed; sending is blocked until explicitly accepted or verified");
+  }
   const device: DeviceType = {
     identityKey: restoreSignalIdentityPublicKey(remote.identity_key),
     signedPreKey: {

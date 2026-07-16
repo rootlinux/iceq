@@ -20,8 +20,18 @@ const ALGORITHM: FileEncryptionAlgorithm = "AES-256-GCM";
 const KEY_LENGTH_BITS = 256;
 const NONCE_LENGTH_BYTES = 12;
 const FALLBACK_MIME = "application/octet-stream";
+export const MAX_ENCRYPTED_FILE_BYTES = 25 * 1024 * 1024;
 
-export async function encryptFileBlob(blob: Blob, displayName?: string): Promise<EncryptedFileBlob> {
+export function assertAcceptableFileSize(size: number): void {
+  if (!Number.isSafeInteger(size) || size < 0) throw new Error("invalid file size");
+  if (size > MAX_ENCRYPTED_FILE_BYTES) throw new Error("file is too large");
+}
+
+export async function encryptFileBlob(blob: Blob, displayName: string | undefined, objectKey: string): Promise<EncryptedFileBlob> {
+  assertAcceptableFileSize(blob.size);
+  if (!objectKey.trim()) throw new Error("object key is required");
+  const mimeType = normalizeMimeType(blob.type);
+  const name = sanitizeDisplayName(displayName);
   const key = await globalThis.crypto.subtle.generateKey(
     { name: "AES-GCM", length: KEY_LENGTH_BITS },
     true,
@@ -32,13 +42,11 @@ export async function encryptFileBlob(blob: Blob, displayName?: string): Promise
 
   const plaintext = await blob.arrayBuffer();
   const ciphertext = await globalThis.crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: nonce },
+    { name: "AES-GCM", iv: nonce, additionalData: manifestAAD(objectKey, mimeType, blob.size, name) },
     key,
     plaintext,
   );
   const rawKey = await globalThis.crypto.subtle.exportKey("raw", key);
-  const mimeType = normalizeMimeType(blob.type);
-  const name = sanitizeDisplayName(displayName);
 
   return {
     encryptedBlob: new Blob([ciphertext], { type: FALLBACK_MIME }),
@@ -57,6 +65,7 @@ export async function encryptFileBlob(blob: Blob, displayName?: string): Promise
 export async function decryptFileBlob(
   encryptedBlob: Blob,
   manifest: EncryptedFileManifest,
+  objectKey: string,
 ): Promise<Blob> {
   if (!isEncryptedFileManifest(manifest)) {
     throw new Error("invalid encrypted file manifest");
@@ -69,11 +78,17 @@ export async function decryptFileBlob(
     ["decrypt"],
   );
   const plaintext = await globalThis.crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: b64UrlToArrayBuffer(manifest.nonce) },
+    { name: "AES-GCM", iv: b64UrlToArrayBuffer(manifest.nonce), additionalData: manifestAAD(objectKey, manifest.mime_type, manifest.size, manifest.name) },
     key,
     await encryptedBlob.arrayBuffer(),
   );
+  if (plaintext.byteLength !== manifest.size) throw new Error("decrypted file size does not match manifest");
   return new Blob([plaintext], { type: manifest.mime_type });
+}
+
+export async function withObjectUrl<T>(blob: Blob, use: (url: string) => Promise<T> | T): Promise<T> {
+  const url = URL.createObjectURL(blob);
+  try { return await use(url); } finally { URL.revokeObjectURL(url); }
 }
 
 export function isEncryptedFileManifest(value: unknown): value is EncryptedFileManifest {
@@ -90,7 +105,8 @@ export function isEncryptedFileManifest(value: unknown): value is EncryptedFileM
     && typeof m.size === "number"
     && Number.isSafeInteger(m.size)
     && m.size >= 0
-    && (m.name === undefined || (typeof m.name === "string" && m.name.length > 0));
+    && m.size <= MAX_ENCRYPTED_FILE_BYTES
+    && (m.name === undefined || (typeof m.name === "string" && sanitizeDisplayName(m.name) === m.name));
 }
 
 export function serializeEncryptedFileManifest(manifest: EncryptedFileManifest): string {
@@ -121,6 +137,11 @@ function sanitizeDisplayName(name?: string): string | undefined {
   const normalized = name.replace(/\\/g, "/").split("/").filter(Boolean).pop()?.trim();
   if (!normalized || normalized === "." || normalized === "..") return undefined;
   return normalized.slice(0, 120);
+}
+
+function manifestAAD(objectKey: string, mimeType: string, size: number, name?: string): ArrayBuffer {
+  const encoded = new TextEncoder().encode(JSON.stringify([MANIFEST_VERSION, objectKey, mimeType, size, name ?? ""]));
+  return encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength) as ArrayBuffer;
 }
 
 function arrayBufferToB64Url(buf: ArrayBuffer): string {
