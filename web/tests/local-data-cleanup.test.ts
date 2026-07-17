@@ -26,7 +26,7 @@ function storage(values: Record<string, string>) {
 }
 
 test("clears every IceQ-owned browser and registered in-memory state without touching other apps", async () => {
-  const local = storage({ iceq_access_token: "secret", iceq_privacy_settings: "{}", iceq_logged_out: "1", other_app: "keep" });
+  const local = storage({ iceq_access_token: "secret", iceq_privacy_settings: "{}", iceq_logged_out: "1", iceq_cleanup_required: "1", other_app: "keep" });
   const session = storage({ "iceq:transport": "secret", unrelated: "keep" });
   const deletedDatabases: string[] = [];
   const deletedCaches: string[] = [];
@@ -70,7 +70,7 @@ test("clears every IceQ-owned browser and registered in-memory state without tou
   assert.deepEqual(revokedUrls, ["blob:iceq-secret"]);
   assert.deepEqual(unregisteredWorkers, ["https://iceq.test/sw.js", "https://iceq.test/sw.js"]);
   assert.equal(resets, 2);
-  assert.deepEqual([...local.entries], [["iceq_logged_out", "1"], ["other_app", "keep"]]);
+  assert.deepEqual([...local.entries], [["iceq_logged_out", "1"], ["iceq_cleanup_required", "1"], ["other_app", "keep"]]);
   assert.deepEqual([...session.entries], [["unrelated", "keep"]]);
 });
 

@@ -215,6 +215,8 @@ test("logout attempts server revocation before clearing every local account stat
   await assert.rejects(useAuthStore.getState().panicWipe());
   assert.equal(panicCalls, 1);
   assert.equal(cleanupEvents, 1);
+  assert.equal(values.get("iceq_cleanup_required"), "1");
+  assert.deepEqual(JSON.parse(JSON.stringify({ marker: values.get("iceq_cleanup_required") })), { marker: "1" });
   await assert.rejects(useAuthStore.getState().login("must-wait", "password"), /cleanup must be retried/);
   await assert.rejects(useAuthStore.getState().register({ username: "must-wait", password: "password", identityKey: "public" }), /cleanup must be retried/);
   await assert.rejects(useAuthStore.getState().setSession({ uin: 30, username: "must-wait" }, "blocked", ""), /cleanup must be retried/);
@@ -224,6 +226,7 @@ test("logout attempts server revocation before clearing every local account stat
   Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
   await useAuthStore.getState().retryLocalCleanup();
   assert.equal(panicCalls, 1);
+  assert.equal(values.has("iceq_cleanup_required"), false);
   Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
     if (String(input).includes("/api/auth/login")) return new Response(JSON.stringify({ user: { uin: 31, username: "after-retry" }, tokens: { access_token: "after-retry-token", refresh_token: "" } }), { status: 200, headers: { "Content-Type": "application/json" } });
     return new Response(null, { status: 204 });
@@ -231,6 +234,70 @@ test("logout attempts server revocation before clearing every local account stat
   await useAuthStore.getState().login("after-retry", "password");
   assert.equal(useAuthStore.getState().uin, 31);
   assert.equal(useAuthStore.getState().isAuthenticated, true);
+
+  // A durable marker alone (as after a reload/crash) blocks network/session
+  // restoration, emits the visible failure signal during hydrate, and is
+  // removed only by the store-owned retry coordinator.
+  values.set("iceq_cleanup_required", "1");
+  let durableLoginCalls = 0;
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/auth/login")) durableLoginCalls += 1;
+    return new Response(null, { status: 204 });
+  } });
+  useAuthStore.setState({ uin: 31, username: "after-retry", accessToken: "after-retry-token", isAuthenticated: true, hydrated: false });
+  useAuthStore.getState().hydrate();
+  await Promise.resolve();
+  assert.equal(useAuthStore.getState().isAuthenticated, false);
+  assert.ok(cleanupEvents >= 2);
+  await assert.rejects(useAuthStore.getState().login("blocked-after-reload", "password"), /cleanup must be retried/);
+  assert.equal(durableLoginCalls, 0);
+  await useAuthStore.getState().retryLocalCleanup();
+  assert.equal(values.has("iceq_cleanup_required"), false);
+
+  async function accountChangeFailure(establish: () => Promise<void>): Promise<void> {
+    values.set("iceq_account_uin", "40");
+    values.set("iceq_access_token", "old-account");
+    useAuthStore.setState({ uin: 40, username: "old", accessToken: "old-account", isAuthenticated: true, hydrated: true });
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: { deleteDatabase() {
+      const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null };
+      queueMicrotask(() => request.onerror?.());
+      return request;
+    } } });
+    await assert.rejects(establish());
+    assert.equal(values.get("iceq_cleanup_required"), "1");
+    assert.equal(useAuthStore.getState().isAuthenticated, false);
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
+    await useAuthStore.getState().retryLocalCleanup();
+    assert.equal(values.has("iceq_cleanup_required"), false);
+  }
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
+    const path = String(input);
+    if (path.includes("/api/auth/login")) return new Response(JSON.stringify({ user: { uin: 41, username: "new-login" }, tokens: { access_token: "new-login", refresh_token: "" } }), { status: 200, headers: { "Content-Type": "application/json" } });
+    if (path.includes("/api/auth/register")) return new Response(JSON.stringify({ user: { uin: 42, username: "new-register" }, tokens: { access_token: "new-register", refresh_token: "" } }), { status: 200, headers: { "Content-Type": "application/json" } });
+    return new Response(null, { status: 204 });
+  } });
+  await accountChangeFailure(() => useAuthStore.getState().login("new-login", "password"));
+  await accountChangeFailure(() => useAuthStore.getState().register({ username: "new-register", password: "password", identityKey: "public" }));
+  await accountChangeFailure(() => useAuthStore.getState().setSession({ uin: 43, username: "new-set" }, "new-set", ""));
+
+  values.set("iceq_account_uin", "40");
+  values.set("iceq_access_token", "hydrate-old");
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: { deleteDatabase() {
+    const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null };
+    queueMicrotask(() => request.onerror?.());
+    return request;
+  } } });
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/auth/me")) return new Response(JSON.stringify({ uin: 44, username: "hydrate-new" }), { status: 200, headers: { "Content-Type": "application/json" } });
+    return new Response(null, { status: 204 });
+  } });
+  useAuthStore.setState({ uin: null, username: null, accessToken: null, isAuthenticated: false, hydrated: false });
+  useAuthStore.getState().hydrate();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(values.get("iceq_cleanup_required"), "1");
+  assert.equal(useAuthStore.getState().isAuthenticated, false);
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
+  await useAuthStore.getState().retryLocalCleanup();
 
   // A server-originated 4403 path performs the same synchronous demotion and
   // generation invalidation without calling the panic endpoint.

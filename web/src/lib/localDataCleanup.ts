@@ -14,6 +14,7 @@ const memoryResetters = new Set<() => void>();
 const objectUrls = new Set<string>();
 const ICEQ_CACHE_PREFIX = "iceq-static-";
 export const ICEQ_LOGGED_OUT_MARKER_KEY = "iceq_logged_out";
+export const ICEQ_CLEANUP_REQUIRED_MARKER_KEY = "iceq_cleanup_required";
 const LEGACY_ICEQ_DATABASES = ["iceq-signal", "iceq-messages", "iceq-keys"] as const;
 let cleanupFlight: Promise<void> | null = null;
 const outstandingBlockedDatabases = new Set<string>();
@@ -99,7 +100,7 @@ async function performCleanup(_reason: CleanupReason): Promise<void> {
       objectUrls.delete(url);
     });
   }
-  await capture("local-storage", () => clearStorage(typeof localStorage === "undefined" ? undefined : localStorage, new Set([ICEQ_LOGGED_OUT_MARKER_KEY])));
+  await capture("local-storage", () => clearStorage(typeof localStorage === "undefined" ? undefined : localStorage, new Set([ICEQ_LOGGED_OUT_MARKER_KEY, ICEQ_CLEANUP_REQUIRED_MARKER_KEY])));
   await capture("session-storage", () => clearStorage(typeof sessionStorage === "undefined" ? undefined : sessionStorage));
   await capture("service-worker", async () => {
     if (typeof navigator === "undefined" || !navigator.serviceWorker?.getRegistrations) return;

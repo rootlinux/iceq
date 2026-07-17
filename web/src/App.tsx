@@ -21,13 +21,14 @@ import { RegisterForm } from "./components/Auth/RegisterForm";
 import { MainLayout } from "./components/Layout/MainLayout";
 import { ChatShell } from "./components/Chat/ChatShell";
 import { useI18n } from "./i18n";
+import { ICEQ_CLEANUP_REQUIRED_MARKER_KEY } from "./lib/localDataCleanup";
 
 export default function App(): JSX.Element {
   const isAuthed = useAuthStore((s) => s.isAuthenticated);
   const hydrated = useAuthStore((s) => s.hydrated);
   const navigate = useNavigate();
   const i18n = useI18n();
-  const [cleanupFailed, setCleanupFailed] = useState(false);
+  const [cleanupFailed, setCleanupFailed] = useState(() => localStorage.getItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY) === "1");
 
   // The auth-expired event is fired by the api/client when a
   // refresh fails. We bounce to /login and clear state.

@@ -15,7 +15,7 @@ import { tokenStore } from "../api/client";
 import * as authApi from "../api/auth";
 import type { UserPublic } from "../api/auth";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
-import { clearAllIceQLocalData, ICEQ_LOGGED_OUT_MARKER_KEY, registerMemoryReset, resetIceQMemory, type CleanupReason } from "../lib/localDataCleanup";
+import { clearAllIceQLocalData, ICEQ_CLEANUP_REQUIRED_MARKER_KEY, ICEQ_LOGGED_OUT_MARKER_KEY, registerMemoryReset, resetIceQMemory, type CleanupReason } from "../lib/localDataCleanup";
 
 const ACCOUNT_UIN_KEY = "iceq_account_uin";
 
@@ -114,9 +114,34 @@ function reportCleanupFailure(error: unknown): void {
 	}
 }
 
+function hasDurableCleanupRequirement(): boolean {
+	return typeof localStorage !== "undefined" && localStorage.getItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY) === "1";
+}
+
+function markCleanupRequired(reason: CleanupReason, error: unknown): void {
+	cleanupRequired = reason;
+	if (typeof localStorage !== "undefined") localStorage.setItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY, "1");
+	reportCleanupFailure(error);
+}
+
+function clearCleanupRequirement(_reason: CleanupReason): void {
+	cleanupRequired = null;
+	if (typeof localStorage !== "undefined") localStorage.removeItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY);
+}
+
+async function runTrackedCleanup(reason: CleanupReason): Promise<void> {
+	try {
+		await cleanSession(reason);
+		clearCleanupRequirement(reason);
+	} catch (error) {
+		markCleanupRequired(reason, error);
+		throw error;
+	}
+}
+
 async function waitForTeardown(): Promise<void> {
 	if (teardownFlight) await teardownFlight;
-	if (cleanupRequired) throw new Error("local cleanup must be retried before starting a new session");
+	if (cleanupRequired || hasDurableCleanupRequirement()) throw new Error("local cleanup must be retried before starting a new session");
 }
 
 function startSessionTeardown(reason: CleanupReason, logoutServer: boolean, set: (state: Partial<AuthState>) => void): Promise<void> {
@@ -130,11 +155,8 @@ function startSessionTeardown(reason: CleanupReason, logoutServer: boolean, set:
 	teardownFlight = (async () => {
 		if (logoutServer) await observeLogoutBounded(accessToken);
 		try {
-			await cleanSession(reason);
-			cleanupRequired = null;
+			await runTrackedCleanup(reason);
 		} catch (error) {
-			cleanupRequired = reason;
-			reportCleanupFailure(error);
 			throw error;
 		} finally {
 			if (generationIsCurrent(ownerGeneration)) {
@@ -155,6 +177,14 @@ export const useAuthStore = create<AuthState>((set) => ({
   hydrated: false,
 
 	hydrate: () => {
+		if (hasDurableCleanupRequirement()) {
+			cleanupRequired = cleanupRequired ?? "logout";
+			tokenStore.clear();
+			resetIceQMemory();
+			set({ ...EMPTY_AUTH, hydrated: true });
+			queueMicrotask(() => reportCleanupFailure(new Error("local cleanup must be retried before restoring a session")));
+			return;
+		}
 		const generation = authLifecycleGeneration;
 		// Read the short-lived access token from localStorage on first load. The user
 		// object is unknown until the next /me round-trip; we
@@ -171,7 +201,10 @@ export const useAuthStore = create<AuthState>((set) => ({
           if (!generationIsCurrent(generation)) return;
           const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
           if (previousUin !== null && previousUin !== u.uin) {
-            await cleanSession("account-change");
+            tokenStore.clear();
+            resetIceQMemory();
+            set({ ...EMPTY_AUTH, hydrated: true });
+            await runTrackedCleanup("account-change");
             if (!generationIsCurrent(generation)) return;
             tokenStore.set(access);
           }
@@ -201,7 +234,10 @@ export const useAuthStore = create<AuthState>((set) => ({
 					const access = tokenStore.accessToken;
 					const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
 					if (previousUin !== null && previousUin !== u.uin) {
-						await cleanSession("account-change");
+						tokenStore.clear();
+						resetIceQMemory();
+						set({ ...EMPTY_AUTH, hydrated: true });
+						await runTrackedCleanup("account-change");
 						if (!generationIsCurrent(generation)) return;
 						if (access) tokenStore.set(access);
 					}
@@ -223,7 +259,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 		const resp = await authApi.login({ username, password });
 		assertGenerationCurrent(generation);
 		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
-		if (previousUin !== null && previousUin !== resp.user.uin) await cleanSession("account-change");
+		if (previousUin !== null && previousUin !== resp.user.uin) await runTrackedCleanup("account-change");
 		assertGenerationCurrent(generation);
 		authLifecycleGeneration += 1;
 		tokenStore.set(resp.tokens.access_token, resp.tokens.refresh_token);
@@ -248,7 +284,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 		});
 		assertGenerationCurrent(generation);
 		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
-		if (previousUin !== null && previousUin !== resp.user.uin) await cleanSession("account-change");
+		if (previousUin !== null && previousUin !== resp.user.uin) await runTrackedCleanup("account-change");
 		assertGenerationCurrent(generation);
 		authLifecycleGeneration += 1;
 		tokenStore.set(resp.tokens.access_token, resp.tokens.refresh_token);
@@ -275,15 +311,10 @@ export const useAuthStore = create<AuthState>((set) => ({
 	handleServerWipe: () => startSessionTeardown("panic-wipe", false, set),
 
 	retryLocalCleanup: () => {
-		if (!cleanupRequired) return Promise.resolve();
+		if (!cleanupRequired && !hasDurableCleanupRequirement()) return Promise.resolve();
 		if (cleanupRetryFlight) return cleanupRetryFlight;
-		const reason = cleanupRequired;
-		cleanupRetryFlight = cleanSession(reason).then(() => {
-			if (cleanupRequired === reason) cleanupRequired = null;
-		}).catch((error) => {
-			reportCleanupFailure(error);
-			throw error;
-		}).finally(() => { cleanupRetryFlight = null; });
+		const reason = cleanupRequired ?? "logout";
+		cleanupRetryFlight = runTrackedCleanup(reason).finally(() => { cleanupRetryFlight = null; });
 		return cleanupRetryFlight;
 	},
 
@@ -295,7 +326,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 		await waitForTeardown();
 		const generation = authLifecycleGeneration;
 		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
-		if (previousUin !== null && previousUin !== user.uin) await cleanSession("account-change");
+		if (previousUin !== null && previousUin !== user.uin) await runTrackedCleanup("account-change");
 		assertGenerationCurrent(generation);
 		authLifecycleGeneration += 1;
 		tokenStore.set(access, refresh);

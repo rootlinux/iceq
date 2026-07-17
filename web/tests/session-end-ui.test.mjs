@@ -10,6 +10,7 @@ test("cleanup failures render a persistent accessible retry surface with localiz
   assert.match(app, /role="alert"/);
   assert.match(app, /cleanup\.retry/);
   assert.match(app, /retryLocalCleanup/);
+  assert.match(app, /ICEQ_CLEANUP_REQUIRED_MARKER_KEY/);
   assert.doesNotMatch(app, /clearAllIceQLocalData/);
   for (const source of [en, tr]) {
     assert.match(source, /"cleanup\.failed"/);
