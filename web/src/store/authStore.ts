@@ -41,11 +41,39 @@ interface AuthState {
 }
 
 const EMPTY_AUTH = { uin: null, username: null, accessToken: null, refreshToken: null, isAuthenticated: false } as const;
+const ATTACHMENT_REVOKE_GRACE_MS = 1_000;
+let authLifecycleGeneration = 0;
+let expiryFlight: Promise<void> | null = null;
+
+function beginSessionTeardown(): void {
+	authLifecycleGeneration += 1;
+}
+
+function generationIsCurrent(generation: number): boolean {
+	return generation === authLifecycleGeneration;
+}
+
+async function revokeAttachmentsBounded(): Promise<void> {
+	await new Promise<void>((resolve) => {
+		const timeout = setTimeout(resolve, ATTACHMENT_REVOKE_GRACE_MS);
+		void attachmentGrantLifecycle.revokeAll().catch(() => undefined).finally(() => {
+			clearTimeout(timeout);
+			resolve();
+		});
+	});
+}
 
 async function cleanSession(reason: CleanupReason, revokeAttachments = true): Promise<void> {
-  if (revokeAttachments) await attachmentGrantLifecycle.revokeAll();
+  // Durable local deletion must not depend on a remote grant revoke that may
+  // never settle. Start both, then give the best-effort remote cleanup only a
+  // bounded grace period before returning.
+  const revokeFlight = revokeAttachments ? revokeAttachmentsBounded() : Promise.resolve();
   tokenStore.clear();
-  await clearAllIceQLocalData(reason);
+  try {
+    await clearAllIceQLocalData(reason);
+  } finally {
+    await revokeFlight;
+  }
 }
 
 function priorAccountUin(): number | null {
@@ -77,6 +105,7 @@ export const useAuthStore = create<AuthState>((set) => ({
   hydrated: false,
 
 	hydrate: () => {
+		const generation = authLifecycleGeneration;
 		// Read the short-lived access token from localStorage on first load. The user
 		// object is unknown until the next /me round-trip; we
 		// optimistically set isAuthenticated = true so the chat
@@ -89,15 +118,19 @@ export const useAuthStore = create<AuthState>((set) => ({
 			authApi
 				.me()
         .then(async (u) => {
+          if (!generationIsCurrent(generation)) return;
           const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
           if (previousUin !== null && previousUin !== u.uin) {
             await cleanSession("account-change");
+            if (!generationIsCurrent(generation)) return;
             tokenStore.set(access);
           }
+          if (!generationIsCurrent(generation)) return;
           rememberAccountUin(u.uin);
           set({ uin: u.uin, username: u.username, accessToken: access, isAuthenticated: true, hydrated: true });
         })
         .catch(() => {
+          if (!generationIsCurrent(generation)) return;
           // /me failed; the refresh-on-401 path in api/client
           // will have already routed us back to /login if
           // appropriate. Nothing more to do here.
@@ -108,21 +141,26 @@ export const useAuthStore = create<AuthState>((set) => ({
 			void authApi
 				.refresh()
 				.then((tokens) => {
+					if (!generationIsCurrent(generation)) return null;
 					tokenStore.set(tokens.access_token);
 					set({ accessToken: tokens.access_token, refreshToken: null, isAuthenticated: true, hydrated: true });
 					return authApi.me();
 				})
 				.then(async (u) => {
+					if (!u || !generationIsCurrent(generation)) return;
 					const access = tokenStore.accessToken;
 					const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
 					if (previousUin !== null && previousUin !== u.uin) {
 						await cleanSession("account-change");
+						if (!generationIsCurrent(generation)) return;
 						if (access) tokenStore.set(access);
 					}
+					if (!generationIsCurrent(generation)) return;
 					rememberAccountUin(u.uin);
 					set({ uin: u.uin, username: u.username, accessToken: access, isAuthenticated: true, hydrated: true });
 				})
 				.catch(() => {
+					if (!generationIsCurrent(generation)) return;
 					tokenStore.clear();
 					set({ hydrated: true });
 				});
@@ -166,6 +204,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 	},
 
 	logout: async () => {
+		beginSessionTeardown();
 		// Always clear local state, even if the server call
 		// fails. A partial-logout is worse than a full one
 		// (the user thinks they're logged out but the server
@@ -175,8 +214,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 		} catch {
 			// best-effort
 		} finally {
-			await attachmentGrantLifecycle.revokeAll();
-			try { await cleanSession("logout", false); } finally {
+			try { await cleanSession("logout"); } finally {
 				set(EMPTY_AUTH);
 				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
 			}
@@ -185,6 +223,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 
 	panicWipe: async () => {
 		await authApi.panicWipe();
+		beginSessionTeardown();
 		try { await cleanSession("panic-wipe"); } finally {
 			set(EMPTY_AUTH);
 			localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
@@ -192,16 +231,19 @@ export const useAuthStore = create<AuthState>((set) => ({
 	},
 
 	expireSession: () => {
+		if (expiryFlight) return expiryFlight;
+		beginSessionTeardown();
 		tokenStore.clear();
 		resetIceQMemory();
 		set(EMPTY_AUTH);
-		return (async () => {
+		expiryFlight = (async () => {
 			await observeLogoutBounded();
 			try { await cleanSession("auth-expired"); } finally {
 				set(EMPTY_AUTH);
 				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
 			}
-		})();
+		})().finally(() => { expiryFlight = null; });
+		return expiryFlight;
 	},
 
 	setSession: async (user, access, refresh) => {

@@ -79,6 +79,7 @@ export async function logout(): Promise<void> {
 	await fetchWithAuth("/api/auth/logout", {
 		method: "POST",
 		body: {},
+		skipRefresh: true,
 	});
 }
 

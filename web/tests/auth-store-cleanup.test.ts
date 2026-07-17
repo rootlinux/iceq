@@ -63,4 +63,87 @@ test("logout attempts server revocation before clearing every local account stat
   const expiryStarted = Date.now();
   await expiry;
   assert.ok(Date.now() - expiryStarted < 1_500);
+
+  // A hydrate request that resolves after teardown must never resurrect auth.
+  let resolveMe!: (response: Response) => void;
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/auth/me")) return new Promise<Response>((resolve) => { resolveMe = resolve; });
+    return Promise.resolve(new Response(null, { status: 204 }));
+  } });
+  values.set("iceq_access_token", "late-hydrate-token");
+  values.delete("iceq_logged_out");
+  useAuthStore.setState({ uin: null, username: null, accessToken: null, isAuthenticated: false, hydrated: false });
+  useAuthStore.getState().hydrate();
+  await Promise.resolve();
+  await useAuthStore.getState().logout();
+  resolveMe(new Response(JSON.stringify({ uin: 99, username: "stale" }), {
+    status: 200, headers: { "Content-Type": "application/json" },
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(useAuthStore.getState().isAuthenticated, false);
+  assert.equal(useAuthStore.getState().uin, null);
+  assert.equal(values.has("iceq_access_token"), false);
+
+  for (const teardown of ["expire", "panic"] as const) {
+    let settleLateMe!: (response: Response) => void;
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: (input: RequestInfo | URL) => {
+      if (String(input).includes("/api/auth/me")) return new Promise<Response>((resolve) => { settleLateMe = resolve; });
+      return Promise.resolve(new Response(null, { status: 204 }));
+    } });
+    values.set("iceq_access_token", `late-${teardown}`);
+    values.delete("iceq_logged_out");
+    useAuthStore.setState({ uin: null, username: null, accessToken: null, isAuthenticated: false, hydrated: false });
+    useAuthStore.getState().hydrate();
+    await Promise.resolve();
+    if (teardown === "expire") await useAuthStore.getState().expireSession();
+    else await useAuthStore.getState().panicWipe();
+    settleLateMe(new Response(JSON.stringify({ uin: 100, username: "stale" }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(useAuthStore.getState().isAuthenticated, false);
+    assert.equal(useAuthStore.getState().uin, null);
+    assert.equal(values.has("iceq_access_token"), false);
+  }
+
+  // Expiry teardown is single-flight and its logout 401 must not recurse into
+  // refresh/auth-expired dispatch.
+  const expiryPaths: string[] = [];
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
+    expiryPaths.push(String(input));
+    return new Response("unauthorized", { status: 401 });
+  } });
+  useAuthStore.setState({ uin: 7, username: "alice", accessToken: "expired", isAuthenticated: true });
+  values.set("iceq_access_token", "expired");
+  const firstExpiry = useAuthStore.getState().expireSession();
+  const secondExpiry = useAuthStore.getState().expireSession();
+  assert.equal(firstExpiry, secondExpiry);
+  await Promise.all([firstExpiry, secondExpiry]);
+  assert.equal(expiryPaths.filter((path) => path.includes("/api/auth/logout")).length, 1);
+  assert.equal(expiryPaths.some((path) => path.includes("/api/auth/refresh")), false);
+
+  // Pending attachment revocation cannot hold durable browser cleanup hostage.
+  const { attachmentGrantLifecycle } = await import("../src/lib/attachmentGrantLifecycle.ts");
+  const originalRevokeAll = attachmentGrantLifecycle.revokeAll.bind(attachmentGrantLifecycle);
+  attachmentGrantLifecycle.revokeAll = () => new Promise<void>(() => undefined);
+  try {
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: async () => new Response(null, { status: 204 }) });
+    values.set("iceq_access_token", "bounded-logout");
+    values.set("iceq_privacy_settings", "secret");
+    useAuthStore.setState({ uin: 7, username: "alice", accessToken: "bounded-logout", isAuthenticated: true });
+    const logoutStarted = Date.now();
+    await useAuthStore.getState().logout();
+    assert.ok(Date.now() - logoutStarted < 1_500);
+    assert.equal(values.has("iceq_privacy_settings"), false);
+
+    values.set("iceq_access_token", "bounded-panic");
+    values.set("iceq_privacy_settings", "secret");
+    useAuthStore.setState({ uin: 7, username: "alice", accessToken: "bounded-panic", isAuthenticated: true });
+    const panicStarted = Date.now();
+    await useAuthStore.getState().panicWipe();
+    assert.ok(Date.now() - panicStarted < 1_500);
+    assert.equal(values.has("iceq_privacy_settings"), false);
+  } finally {
+    attachmentGrantLifecycle.revokeAll = originalRevokeAll;
+  }
 });
