@@ -146,4 +146,90 @@ test("logout attempts server revocation before clearing every local account stat
   } finally {
     attachmentGrantLifecycle.revokeAll = originalRevokeAll;
   }
+
+  // A normal logout also bounds a server call that never settles.
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: () => new Promise<Response>(() => undefined) });
+  values.set("iceq_access_token", "never-logout");
+  values.set("iceq_privacy_settings", "secret");
+  useAuthStore.setState({ uin: 7, username: "alice", accessToken: "never-logout", isAuthenticated: true });
+  const neverLogoutStarted = Date.now();
+  await useAuthStore.getState().logout();
+  assert.ok(Date.now() - neverLogoutStarted < 1_500);
+  assert.equal(values.has("iceq_privacy_settings"), false);
+
+  // New sessions wait for the active teardown owner and cannot be erased by
+  // its late completion.
+  async function raceTeardownWithSession(establish: () => Promise<void>, expectedUin: number): Promise<void> {
+    let finishDelete!: () => void;
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: {
+      async databases() { return [{ name: "iceq" }]; },
+      deleteDatabase() {
+        const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null };
+        finishDelete = () => request.onsuccess?.();
+        return request;
+      },
+    } });
+    const teardown = useAuthStore.getState().logout();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const session = establish();
+    await Promise.resolve();
+    assert.equal(useAuthStore.getState().isAuthenticated, false);
+    finishDelete();
+    await Promise.all([teardown, session]);
+    assert.equal(useAuthStore.getState().isAuthenticated, true);
+    assert.equal(useAuthStore.getState().uin, expectedUin);
+  }
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
+    const path = String(input);
+    if (path.includes("/api/auth/login")) return new Response(JSON.stringify({ user: { uin: 21, username: "login" }, tokens: { access_token: "login-token", refresh_token: "" } }), { status: 200, headers: { "Content-Type": "application/json" } });
+    if (path.includes("/api/auth/register")) return new Response(JSON.stringify({ user: { uin: 22, username: "register" }, tokens: { access_token: "register-token", refresh_token: "" } }), { status: 200, headers: { "Content-Type": "application/json" } });
+    return new Response(null, { status: 204 });
+  } });
+  await raceTeardownWithSession(() => useAuthStore.getState().login("login", "password"), 21);
+  await raceTeardownWithSession(() => useAuthStore.getState().register({ username: "register", password: "password", identityKey: "public" }), 22);
+  await raceTeardownWithSession(() => useAuthStore.getState().setSession({ uin: 23, username: "set" }, "set-token", ""), 23);
+
+  // Once the panic endpoint succeeds, a local failure publishes the global
+  // persistent retry signal; retrying local cleanup does not call panic again.
+  let panicCalls = 0;
+  let cleanupEvents = 0;
+  const eventTarget = new EventTarget();
+  eventTarget.addEventListener("iceq:local-cleanup-failed", () => { cleanupEvents += 1; });
+  Object.defineProperty(globalThis, "window", { configurable: true, value: eventTarget });
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
+    if (String(input).includes("panic-wipe")) panicCalls += 1;
+    return new Response(null, { status: 204 });
+  } });
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: { deleteDatabase() {
+    const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null };
+    queueMicrotask(() => request.onerror?.());
+    return request;
+  } } });
+  await assert.rejects(useAuthStore.getState().panicWipe());
+  assert.equal(panicCalls, 1);
+  assert.equal(cleanupEvents, 1);
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
+  const { clearAllIceQLocalData } = await import("../src/lib/localDataCleanup.ts");
+  await clearAllIceQLocalData("panic-wipe");
+  assert.equal(panicCalls, 1);
+
+  // A server-originated 4403 path performs the same synchronous demotion and
+  // generation invalidation without calling the panic endpoint.
+  let settleWipedMe!: (response: Response) => void;
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/auth/me")) return new Promise<Response>((resolve) => { settleWipedMe = resolve; });
+    return Promise.resolve(new Response(null, { status: 204 }));
+  } });
+  values.set("iceq_access_token", "server-wipe");
+  values.delete("iceq_logged_out");
+  useAuthStore.setState({ uin: null, username: null, accessToken: null, isAuthenticated: false, hydrated: false });
+  useAuthStore.getState().hydrate();
+  await Promise.resolve();
+  const serverWipe = useAuthStore.getState().handleServerWipe();
+  assert.equal(useAuthStore.getState().isAuthenticated, false);
+  settleWipedMe(new Response(JSON.stringify({ uin: 77, username: "stale" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+  await serverWipe;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(useAuthStore.getState().isAuthenticated, false);
+  assert.equal(panicCalls, 1);
 });

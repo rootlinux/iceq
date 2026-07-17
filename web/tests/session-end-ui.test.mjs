@@ -22,3 +22,10 @@ test("security settings exposes authenticated panic wipe behind strong confirmat
   assert.match(source, /window\.confirm/);
   assert.match(source, /security\.panicWipeConfirm/);
 });
+
+test("WebSocket 4403 delegates to the auth lifecycle without replaying the panic API", async () => {
+  const source = await readFile(new URL("../src/hooks/useWebSocket.ts", import.meta.url), "utf8");
+  assert.match(source, /handleServerWipe\(\)/);
+  assert.doesNotMatch(source, /clearLocalState\(\)/);
+  assert.doesNotMatch(source, /panicWipe\(\)/);
+});

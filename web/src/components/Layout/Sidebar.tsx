@@ -77,7 +77,6 @@ export function Sidebar({ open, onClose }: SidebarProps): JSX.Element {
             className="iceq-btn-secondary mt-2 w-full"
             onClick={() => void logout().catch((error) => {
               console.error("[IceQ cleanup] logout local cleanup failed", error);
-              window.dispatchEvent(new CustomEvent("iceq:local-cleanup-failed", { detail: error }));
             })}
           >
             {i18n.t("nav.signOut")}

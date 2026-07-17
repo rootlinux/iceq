@@ -36,6 +36,7 @@ interface AuthState {
   register: (input: { username: string; password: string; identityKey: string }) => Promise<void>;
   logout: () => Promise<void>;
   panicWipe: () => Promise<void>;
+  handleServerWipe: () => Promise<void>;
   expireSession: () => Promise<void>;
   setSession: (user: UserPublic, access: string, refresh: string) => Promise<void>;
 }
@@ -43,7 +44,7 @@ interface AuthState {
 const EMPTY_AUTH = { uin: null, username: null, accessToken: null, refreshToken: null, isAuthenticated: false } as const;
 const ATTACHMENT_REVOKE_GRACE_MS = 1_000;
 let authLifecycleGeneration = 0;
-let expiryFlight: Promise<void> | null = null;
+let teardownFlight: Promise<void> | null = null;
 
 function beginSessionTeardown(): void {
 	authLifecycleGeneration += 1;
@@ -51,6 +52,10 @@ function beginSessionTeardown(): void {
 
 function generationIsCurrent(generation: number): boolean {
 	return generation === authLifecycleGeneration;
+}
+
+function assertGenerationCurrent(generation: number): void {
+	if (!generationIsCurrent(generation)) throw new Error("authentication operation was superseded by session teardown");
 }
 
 async function revokeAttachmentsBounded(): Promise<void> {
@@ -88,12 +93,50 @@ function rememberAccountUin(uin: number): void {
 
 async function observeLogoutBounded(): Promise<void> {
   await new Promise<void>((resolve) => {
-    const timeout = setTimeout(resolve, 1_000);
-    void authApi.logout().catch(() => undefined).finally(() => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      controller.abort();
+      resolve();
+    }, 1_000);
+    void authApi.logout(controller.signal).catch(() => undefined).finally(() => {
       clearTimeout(timeout);
       resolve();
     });
   });
+}
+
+function reportCleanupFailure(error: unknown): void {
+	if (typeof window !== "undefined") {
+		window.dispatchEvent(new CustomEvent("iceq:local-cleanup-failed", { detail: error }));
+	}
+}
+
+async function waitForTeardown(): Promise<void> {
+	if (teardownFlight) await teardownFlight;
+}
+
+function startSessionTeardown(reason: CleanupReason, logoutServer: boolean, set: (state: Partial<AuthState>) => void): Promise<void> {
+	if (teardownFlight) return teardownFlight;
+	beginSessionTeardown();
+	tokenStore.clear();
+	resetIceQMemory();
+	set(EMPTY_AUTH);
+	const ownerGeneration = authLifecycleGeneration;
+	teardownFlight = (async () => {
+		if (logoutServer) await observeLogoutBounded();
+		try {
+			await cleanSession(reason);
+		} catch (error) {
+			reportCleanupFailure(error);
+			throw error;
+		} finally {
+			if (generationIsCurrent(ownerGeneration)) {
+				set(EMPTY_AUTH);
+				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
+			}
+		}
+	})().finally(() => { teardownFlight = null; });
+	return teardownFlight;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
@@ -168,9 +211,14 @@ export const useAuthStore = create<AuthState>((set) => ({
 	},
 
 	login: async (username, password) => {
+		await waitForTeardown();
+		const generation = authLifecycleGeneration;
 		const resp = await authApi.login({ username, password });
+		assertGenerationCurrent(generation);
 		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
 		if (previousUin !== null && previousUin !== resp.user.uin) await cleanSession("account-change");
+		assertGenerationCurrent(generation);
+		authLifecycleGeneration += 1;
 		tokenStore.set(resp.tokens.access_token, resp.tokens.refresh_token);
 		localStorage.removeItem(ICEQ_LOGGED_OUT_MARKER_KEY);
 		rememberAccountUin(resp.user.uin);
@@ -184,13 +232,18 @@ export const useAuthStore = create<AuthState>((set) => ({
 	},
 
 	register: async (input) => {
+		await waitForTeardown();
+		const generation = authLifecycleGeneration;
 		const resp = await authApi.register({
       username: input.username,
       password: input.password,
       identity_key: input.identityKey,
 		});
+		assertGenerationCurrent(generation);
 		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
 		if (previousUin !== null && previousUin !== resp.user.uin) await cleanSession("account-change");
+		assertGenerationCurrent(generation);
+		authLifecycleGeneration += 1;
 		tokenStore.set(resp.tokens.access_token, resp.tokens.refresh_token);
 		localStorage.removeItem(ICEQ_LOGGED_OUT_MARKER_KEY);
 		rememberAccountUin(resp.user.uin);
@@ -204,51 +257,27 @@ export const useAuthStore = create<AuthState>((set) => ({
 	},
 
 	logout: async () => {
-		beginSessionTeardown();
-		// Always clear local state, even if the server call
-		// fails. A partial-logout is worse than a full one
-		// (the user thinks they're logged out but the server
-		// still has a live refresh token).
-		try {
-			await authApi.logout();
-		} catch {
-			// best-effort
-		} finally {
-			try { await cleanSession("logout"); } finally {
-				set(EMPTY_AUTH);
-				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
-			}
-		}
+		return startSessionTeardown("logout", true, set);
 	},
 
 	panicWipe: async () => {
 		await authApi.panicWipe();
-		beginSessionTeardown();
-		try { await cleanSession("panic-wipe"); } finally {
-			set(EMPTY_AUTH);
-			localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
-		}
+		return startSessionTeardown("panic-wipe", false, set);
 	},
 
+	handleServerWipe: () => startSessionTeardown("panic-wipe", false, set),
+
 	expireSession: () => {
-		if (expiryFlight) return expiryFlight;
-		beginSessionTeardown();
-		tokenStore.clear();
-		resetIceQMemory();
-		set(EMPTY_AUTH);
-		expiryFlight = (async () => {
-			await observeLogoutBounded();
-			try { await cleanSession("auth-expired"); } finally {
-				set(EMPTY_AUTH);
-				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
-			}
-		})().finally(() => { expiryFlight = null; });
-		return expiryFlight;
+		return startSessionTeardown("auth-expired", true, set);
 	},
 
 	setSession: async (user, access, refresh) => {
+		await waitForTeardown();
+		const generation = authLifecycleGeneration;
 		const previousUin = useAuthStore.getState().uin ?? priorAccountUin();
 		if (previousUin !== null && previousUin !== user.uin) await cleanSession("account-change");
+		assertGenerationCurrent(generation);
+		authLifecycleGeneration += 1;
 		tokenStore.set(access, refresh);
 		localStorage.removeItem(ICEQ_LOGGED_OUT_MARKER_KEY);
 		rememberAccountUin(user.uin);

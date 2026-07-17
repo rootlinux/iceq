@@ -17,8 +17,8 @@
 //        typing              -> chatStore.setTyping
 //        ack                 -> chatStore.markDelivered
 //        error               -> console.error
-//   6. On close code 4403, call clearLocalState() and dispatch
-//      a "iceq:wiped" event the auth-store listens to.
+//   6. On close code 4403, delegate to the auth-store's server-wipe lifecycle
+//      and dispatch a "iceq:wiped" navigation event.
 //   7. Concurrency: only one WS at a time. We use a ref to
 //      hold the current socket; reconnect attempts that fire
 //      while a connection is in flight are dropped.
@@ -28,7 +28,7 @@ import { refreshSession, tokenStore } from "../api/client";
 import { useAuthStore } from "../store/authStore";
 import { useChatStore, conversationIdForPair } from "../store/chatStore";
 import { useContactStore } from "../store/contactStore";
-import { clearLocalState, classifyClose } from "../lib/wsCloseCodes";
+import { classifyClose } from "../lib/wsCloseCodes";
 import { decryptMessage } from "../lib/signal";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
 import { registerMemoryReset } from "../lib/localDataCleanup";
@@ -260,12 +260,11 @@ export function useWebSocket(): UseWebSocketResult {
           // to /login.
           // Wait for the shared cleanup coordinator before
           // notifying the router.
-          Promise.resolve(clearLocalState()).then(() => {
+          useAuthStore.getState().handleServerWipe().then(() => {
             window.dispatchEvent(new CustomEvent("iceq:wiped"));
             setConnected(false);
           }).catch((error) => {
-            console.error("[IceQ cleanup] panic-wipe local cleanup failed", error);
-            window.dispatchEvent(new CustomEvent("iceq:local-cleanup-failed", { detail: error }));
+            console.error("[IceQ cleanup] server wipe local cleanup failed", error);
             window.dispatchEvent(new CustomEvent("iceq:wiped"));
             setConnected(false);
           });

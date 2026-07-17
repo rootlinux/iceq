@@ -36,7 +36,6 @@ export default function App(): JSX.Element {
     function onExpired(): void {
       void useAuthStore.getState().expireSession().catch((error) => {
         console.error("[IceQ cleanup] auth-expired local cleanup failed", error);
-        window.dispatchEvent(new CustomEvent("iceq:local-cleanup-failed", { detail: error }));
       });
       navigate("/login", { replace: true });
     }

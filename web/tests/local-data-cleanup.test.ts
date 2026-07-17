@@ -108,6 +108,21 @@ test("untracked object URLs are not revoked by later cleanup", async () => {
   assert.deepEqual(revoked, []);
 });
 
+test("a failed object URL revoke remains tracked for cleanup retry", async () => {
+  const attempts: string[] = [];
+  let fail = true;
+  Object.defineProperty(globalThis.URL, "revokeObjectURL", { configurable: true, value: (url: string) => {
+    attempts.push(url);
+    if (fail) throw new Error("busy");
+  } });
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
+  trackObjectURL("blob:retry-me");
+  await assert.rejects(clearAllIceQLocalData("panic-wipe"), LocalCleanupError);
+  fail = false;
+  await clearAllIceQLocalData("panic-wipe");
+  assert.deepEqual(attempts, ["blob:retry-me", "blob:retry-me"]);
+});
+
 test("rejects a typed aggregate error when mandatory IndexedDB deletion fails", async () => {
   Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: {
     deleteDatabase() {

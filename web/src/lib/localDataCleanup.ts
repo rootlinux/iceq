@@ -94,8 +94,10 @@ async function performCleanup(_reason: CleanupReason): Promise<void> {
 
   for (const reset of memoryResetters) await capture("memory", reset);
   if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
-    for (const url of objectUrls) await capture("object-urls", () => URL.revokeObjectURL(url));
-    objectUrls.clear();
+    for (const url of [...objectUrls]) await capture("object-urls", () => {
+      URL.revokeObjectURL(url);
+      objectUrls.delete(url);
+    });
   }
   await capture("local-storage", () => clearStorage(typeof localStorage === "undefined" ? undefined : localStorage, new Set([ICEQ_LOGGED_OUT_MARKER_KEY])));
   await capture("session-storage", () => clearStorage(typeof sessionStorage === "undefined" ? undefined : sessionStorage));
