@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import "fake-indexeddb/auto";
+import { getActiveCryptoNamespace, setActiveCryptoNamespace } from "../src/lib/indexeddb.ts";
+setActiveCryptoNamespace({uin:7,deviceId:"signed-prekey-test-device"});
 
 import {
   generateIdentityKeyPair,
@@ -14,7 +16,7 @@ Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: tr
 
 async function bundle() {
   const identity = await generateIdentityKeyPair();
-  return generatePreKeyBundle(identity, 1, 1, 7);
+  return generatePreKeyBundle(identity, 1, 1, 7, getActiveCryptoNamespace());
 }
 
 test("accepts an authentic signed prekey", async () => {

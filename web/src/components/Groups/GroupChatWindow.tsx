@@ -13,6 +13,7 @@ import { decryptMessage } from "../../lib/signal";
 import { pruneObsoleteGroupEpochs } from "../../lib/groupCryptoStore";
 import { GroupDetail } from "./GroupDetail";
 import { useI18n } from "../../i18n";
+import { getActiveCryptoNamespace } from "../../lib/indexeddb";
 
 interface GroupChatWindowProps {
   group: GroupWire;
@@ -24,20 +25,20 @@ function loadEncryptedGroupHistory(groupId: string, selfUin: number, conversatio
   const existing = inFlightHistoryLoads.get(key);
   if (existing) return existing;
   const operation = (async () => {
-    const roster = await getGroupMembersWithEpoch(groupId);
+    const operationNamespace=getActiveCryptoNamespace();const roster = await getGroupMembersWithEpoch(groupId);
     const memberUins = roster.members.map((member) => member.uin);
-    await pruneObsoleteGroupEpochs(groupId, roster.crypto_epoch);
+    await pruneObsoleteGroupEpochs(operationNamespace,groupId, roster.crypto_epoch);
     useGroupStore.getState().setMembers(groupId, roster.members);
     useGroupStore.setState((state) => ({ groups: state.groups.map((item) => item.group_id === groupId ? { ...item, crypto_epoch: roster.crypto_epoch } : item) }));
     const distributions:SenderKeyInboxItem[]=[];for(let page=0;page<128;page++){const inbox=await getSenderKeyDistributions(groupId,page);if(inbox.epoch!==roster.crypto_epoch)throw new Error("sender-key inbox epoch changed during hydration");distributions.push(...inbox.distributions);if(inbox.distributions.length<8)break;if(page===127)throw new Error("sender-key inbox page limit exceeded");}
-    await hydrateSenderKeyInbox(groupId, roster.crypto_epoch, memberUins, async () => distributions, decryptMessage);
+    await hydrateSenderKeyInbox(operationNamespace,groupId, roster.crypto_epoch, memberUins, async () => distributions, (a,b,c)=>decryptMessage(a,b,c,operationNamespace));
     const resp = await historyGroup(groupId, 50);
     const out: Message[] = [];
     for (const row of resp.messages) {
       try {
         if (row.msg_type !== "group_ciphertext") throw new Error("legacy insecure group row");
         if(!Number.isSafeInteger(row.crypto_epoch)||!row.crypto_epoch||row.crypto_epoch<1)throw new Error("group history epoch is missing");
-        const content = await openGroupContent(decodeGroupCiphertext(row.ciphertext), roster.crypto_epoch, memberUins, true, Date.now(), {group_id:groupId,sender_uin:row.sender_uin,epoch:row.crypto_epoch});
+        const content = await openGroupContent(operationNamespace,decodeGroupCiphertext(row.ciphertext), roster.crypto_epoch, memberUins, true, Date.now(), {group_id:groupId,sender_uin:row.sender_uin,epoch:row.crypto_epoch});
         out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: content.content_type === "file" ? JSON.stringify(content.attachment ?? null) : (content.text ?? ""), content_type: content.content_type, created_at: row.created_at, state: "delivered", is_outgoing: row.sender_uin === selfUin });
       } catch {
         out.push({ id: row.id, conversation_id: conversationId, sender_uin: row.sender_uin, receiver_uin: 0, plaintext: securityWarning, content_type: "text", created_at: row.created_at, state: "failed", is_outgoing: row.sender_uin === selfUin });

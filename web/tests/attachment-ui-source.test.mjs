@@ -15,12 +15,20 @@ test("message input sends direct-message attachments as Signal-encrypted manifes
   assert.match(input, /handleAttachment/);
   assert.match(input, /kind:\s*"iceq\.attachment\.v1"/);
   assert.match(input, /JSON\.stringify\(\s*attachmentEnvelope/);
-  assert.match(input, /encryptMessage\(peerUin as number,\s*encoder\.encode\(attachmentPlaintext\)\)/);
+  assert.match(input, /encryptMessage\(peerUin as number,\s*encoder\.encode\(attachmentPlaintext\),\s*operationNamespace\)/);
   assert.match(input, /content_type:\s*"file"/);
   assert.match(input, /await attachmentGrantLifecycle\.prepare\(clientId, uploaded\.object_key, peerUin as number\)/);
   assert.match(input, /await attachmentGrantLifecycle\.fail\(clientId\)/);
   assert.match(input, /if \(!send\(\{/);
   assert.doesNotMatch(input, /file_url:\s*upload\.upload_url/);
+});
+
+test("message operations capture one crypto namespace before asynchronous work",()=>{
+  const input=read("src/components/Chat/MessageInput.tsx");const history=read("src/components/Chat/ChatWindow.tsx");
+  assert.doesNotMatch(input,/encryptMessage\([^\n]+getActiveCryptoNamespace\(\)/);
+  assert.match(input,/const operationNamespace\s*=\s*getActiveCryptoNamespace\(\);[\s\S]{0,500}await uploadEncryptedFile/);
+  assert.match(history,/const operationNamespace\s*=\s*getActiveCryptoNamespace\(\);[\s\S]{0,300}await historyDM/);
+  assert.doesNotMatch(history,/(decryptMessage|processDirectControlMessage)\([^\n]+getActiveCryptoNamespace\(\)/);
 });
 
 test("message item renders encrypted attachments with a decrypting download action", () => {

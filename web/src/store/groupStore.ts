@@ -25,6 +25,7 @@ import * as groupsApi from "../api/groups";
 import type { GroupMemberWire, GroupWire } from "../api/groups";
 import { pruneObsoleteGroupEpochs } from "../lib/groupCryptoStore";
 import { registerMemoryReset } from "../lib/localDataCleanup";
+import { getActiveCryptoNamespace } from "../lib/indexeddb";
 
 interface GroupState {
   groups: GroupWire[];
@@ -138,7 +139,7 @@ export const useGroupStore = create<GroupState>((set, get) => ({
       const wire = await groupsApi.getGroupMembersWithEpoch(groupId);
       get().setMembers(groupId, wire.members);
       set((s)=>({groups:s.groups.map(g=>g.group_id===groupId?{...g,crypto_epoch:wire.crypto_epoch}:g)}));
-      await pruneObsoleteGroupEpochs(groupId, wire.crypto_epoch);
+      await pruneObsoleteGroupEpochs(getActiveCryptoNamespace(),groupId, wire.crypto_epoch);
     } catch (e) {
       set({ error: (e as Error).message });
       throw e;

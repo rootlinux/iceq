@@ -74,6 +74,44 @@ const STORE_TRANSPORT_SEEN = "transport_seen";
 const SELF_KEY = "self";
 const NEXT_PREKEY_ID_KEY = "next_prekey_id";
 
+export interface CryptoNamespace { uin: number; deviceId: string }
+const CRYPTO_KEY_VERSION = "crypto-v1";
+const DEVICE_ID_KEY = "crypto_device_id_v1";
+const PENDING_REGISTRATION_KEY = "pending_registration_v1";
+
+export function cryptoRecordKey(ns: CryptoNamespace, kind: string, id: string | number): string {
+  if (!Number.isSafeInteger(ns.uin) || ns.uin <= 0 || !/^[A-Za-z0-9_-]{16,128}$/.test(ns.deviceId)) {
+    throw new Error("invalid crypto namespace");
+  }
+  return `${CRYPTO_KEY_VERSION}:${ns.uin}:${ns.deviceId}:${kind}:${id}`;
+}
+
+let activeCryptoNamespace: CryptoNamespace | null = null;
+export function setActiveCryptoNamespace(ns: CryptoNamespace | null): void { activeCryptoNamespace = ns; }
+export function getActiveCryptoNamespace(): CryptoNamespace {
+  if (!activeCryptoNamespace) throw new Error("crypto namespace is not initialized");
+  return activeCryptoNamespace;
+}
+export function createRegistrationCryptoNamespace():CryptoNamespace{const bytes=new Uint8Array(24);globalThis.crypto.getRandomValues(bytes);let binary="";for(const byte of bytes)binary+=String.fromCharCode(byte);return{uin:Number.MAX_SAFE_INTEGER,deviceId:`registration_${btoa(binary).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}`};}
+
+export async function commitCryptoNamespace(from:CryptoNamespace,to:CryptoNamespace):Promise<void>{
+  const db=await openDB();const stores=[STORE_IDENTITY,STORE_SESSIONS,STORE_PREKEYS,STORE_SIGNED_PREKEYS,STORE_PEER_IDENTITIES,STORE_METADATA,STORE_PEER_TRUST,STORE_GROUP_CRYPTO];
+  const tx=db.transaction(stores,"readwrite");const done=transactionDone(tx);const prefix=`${CRYPTO_KEY_VERSION}:${from.uin}:${from.deviceId}:`;
+  try{await Promise.all(stores.map(name=>new Promise<void>((resolve,reject)=>{const store=tx.objectStore(name);const req=store.openCursor();req.onsuccess=()=>{const cursor=req.result;if(!cursor)return resolve();const key=String(cursor.key);if(!key.startsWith(prefix)){cursor.continue();return;}const next=`${CRYPTO_KEY_VERSION}:${to.uin}:${to.deviceId}:${key.slice(prefix.length)}`;const collision=store.get(next);collision.onerror=()=>reject(collision.error);collision.onsuccess=()=>{if(collision.result!==undefined){tx.abort();reject(new Error("crypto namespace destination collision"));return;}const value=cursor.value as Record<string,unknown>;if(name===STORE_PREKEYS||name===STORE_SIGNED_PREKEYS)store.put({...value,id:next});else store.put(value,next);cursor.delete();cursor.continue();};};req.onerror=()=>reject(req.error);})));await done;}catch(error){try{tx.abort();}catch{/* already complete */}await done.catch(()=>undefined);throw error;}finally{db.close();}
+}
+
+let deviceIdFlight: Promise<string>|null=null;
+export function loadOrCreateDeviceId(): Promise<string> {
+  if(deviceIdFlight)return deviceIdFlight;
+  deviceIdFlight=(async()=>{const db=await openDB();try{return await new Promise<string>((resolve,reject)=>{const tx=db.transaction(STORE_METADATA,"readwrite");const store=tx.objectStore(STORE_METADATA);const get=store.get(DEVICE_ID_KEY);let value="";get.onsuccess=()=>{if(typeof get.result==="string"&&get.result){value=get.result;return;}const bytes=new Uint8Array(24);globalThis.crypto.getRandomValues(bytes);let binary="";for(const byte of bytes)binary+=String.fromCharCode(byte);value=btoa(binary).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");store.put(value,DEVICE_ID_KEY);};tx.oncomplete=()=>resolve(value);tx.onerror=()=>reject(tx.error??new Error("device id transaction failed"));tx.onabort=()=>reject(tx.error??new Error("device id transaction aborted"));});}finally{db.close();}})().catch(error=>{deviceIdFlight=null;throw error;});return deviceIdFlight;
+}
+
+export async function loadPendingRegistration<T>(): Promise<T | null> {
+  const db=await openDB();try{return (await idbGet<T>(db,STORE_METADATA,PENDING_REGISTRATION_KEY))??null;}finally{db.close();}
+}
+export async function savePendingRegistration<T>(value:T):Promise<void>{const db=await openDB();try{await idbPut(db,STORE_METADATA,value,PENDING_REGISTRATION_KEY);}finally{db.close();}}
+export async function clearPendingRegistration():Promise<void>{const db=await openDB();try{await idbDelete(db,STORE_METADATA,PENDING_REGISTRATION_KEY);}finally{db.close();}}
+
 // ----------------------------------------------------------------------------
 // Identity. Own long-term identity. Persisted in IndexedDB only.
 // Zustand NEVER holds the private key — only the Signal bindings
@@ -106,39 +144,62 @@ function restoreSignalIdentityPublicKey(publicKey: string): ArrayBuffer {
   return prefixed.buffer;
 }
 
-export async function saveIdentity(id: StoredIdentity): Promise<void> {
+export async function saveIdentity(ns: CryptoNamespace, id: StoredIdentity): Promise<void> {
   const db = await openDB();
-  await idbPut(db, STORE_IDENTITY, id, SELF_KEY);
+  await idbPut(db, STORE_IDENTITY, id, cryptoRecordKey(ns, "identity", SELF_KEY));
   db.close();
 }
 
-export async function loadIdentity(): Promise<StoredIdentity | null> {
+export async function loadIdentity(ns: CryptoNamespace): Promise<StoredIdentity | null> {
   const db = await openDB();
-  const v = await idbGet<StoredIdentity>(db, STORE_IDENTITY, SELF_KEY);
+  const v = await idbGet<StoredIdentity>(db, STORE_IDENTITY, cryptoRecordKey(ns, "identity", SELF_KEY));
   db.close();
   return v ?? null;
 }
+
+export async function migrateVerifiedLegacyIdentity(ns: CryptoNamespace, authenticatedPublicKey: string, derivePublic: (privateKey:string)=>Promise<string>): Promise<StoredIdentity | null> {
+  const scoped = await loadIdentity(ns); if (scoped) return scoped;
+  const db = await openDB();
+  const legacy = await idbGet<StoredIdentity>(db, STORE_IDENTITY, SELF_KEY);
+  if (!legacy) { db.close(); await deleteUnscopedLegacyCryptoRecords(); return null; }
+  let derived: string;
+  try { derived=await derivePublic(legacy.privateKey); } catch { await idbDelete(db, STORE_IDENTITY, SELF_KEY); db.close(); await deleteUnscopedLegacyCryptoRecords(); throw new LegacyIdentityMismatchError(); }
+  if (!constantTimeStringEqual(derived, authenticatedPublicKey)) {
+    await idbDelete(db, STORE_IDENTITY, SELF_KEY);
+    db.close(); await deleteUnscopedLegacyCryptoRecords(); throw new LegacyIdentityMismatchError();
+  }
+  const normalized={...legacy,publicKey:derived};await idbPut(db, STORE_IDENTITY, normalized, cryptoRecordKey(ns, "identity", SELF_KEY));
+  await idbDelete(db, STORE_IDENTITY, SELF_KEY); db.close(); await deleteUnscopedLegacyCryptoRecords(); return normalized;
+}
+export class LegacyIdentityMismatchError extends Error { constructor(){super("legacy identity mismatch");this.name="LegacyIdentityMismatchError";} }
+
+async function deleteUnscopedLegacyCryptoRecords(): Promise<void> {
+  const db=await openDB(); const stores=[STORE_IDENTITY,STORE_SESSIONS,STORE_PREKEYS,STORE_SIGNED_PREKEYS,STORE_PEER_IDENTITIES,STORE_PEER_TRUST,STORE_GROUP_CRYPTO];
+  for(const name of stores){const tx=db.transaction(name,"readwrite");const store=tx.objectStore(name);const done=transactionDone(tx);await new Promise<void>((resolve,reject)=>{const req=store.openCursor();req.onsuccess=()=>{const cursor=req.result;if(!cursor)return resolve();if(String(cursor.key).startsWith(`${CRYPTO_KEY_VERSION}:`)){cursor.continue();return;}const deletion=cursor.delete();deletion.onsuccess=()=>cursor.continue();deletion.onerror=()=>reject(deletion.error);};req.onerror=()=>reject(req.error);});await done;}
+  db.close();
+}
+export async function quarantineUnverifiedLegacyCrypto():Promise<void>{await deleteUnscopedLegacyCryptoRecords();}
 
 // ----------------------------------------------------------------------------
 // Sessions. One row per peer UIN. The value is whatever the
 // Signal bindings want to hand back on load — opaque to us.
 // ----------------------------------------------------------------------------
-export async function saveSession(peerUin: number, record: string): Promise<void> {
+export async function saveSession(ns: CryptoNamespace, peerUin: number, record: string): Promise<void> {
   const db = await openDB();
-  await idbPut(db, STORE_SESSIONS, record, String(peerUin));
+  await idbPut(db, STORE_SESSIONS, record, cryptoRecordKey(ns, "session", peerUin));
   db.close();
 }
 
-export async function loadSession(peerUin: number): Promise<string | null> {
+export async function loadSession(ns: CryptoNamespace, peerUin: number): Promise<string | null> {
   const db = await openDB();
-  const v = await idbGet<string>(db, STORE_SESSIONS, String(peerUin));
+  const v = await idbGet<string>(db, STORE_SESSIONS, cryptoRecordKey(ns, "session", peerUin));
   db.close();
   return v ?? null;
 }
 
-export async function deleteSession(peerUin: number): Promise<void> {
+export async function deleteSession(ns: CryptoNamespace, peerUin: number): Promise<void> {
   const db = await openDB();
-  await idbDelete(db, STORE_SESSIONS, String(peerUin));
+  await idbDelete(db, STORE_SESSIONS, cryptoRecordKey(ns, "session", peerUin));
   db.close();
 }
 
@@ -151,37 +212,48 @@ export interface StoredPreKey {
   privateKey: string;
 }
 
-export async function savePreKey(pk: StoredPreKey): Promise<void> {
+export async function savePreKey(ns: CryptoNamespace, pk: StoredPreKey): Promise<void> {
   const db = await openDB();
-  await idbPut(db, STORE_PREKEYS, pk, pk.id);
+  await idbPutKeyPath(db, STORE_PREKEYS, { ...pk, keyId: pk.id, id: cryptoRecordKey(ns, "prekey", pk.id) });
   db.close();
 }
 
-export async function loadPreKeys(): Promise<StoredPreKey[]> {
+export async function loadPreKeys(ns: CryptoNamespace): Promise<StoredPreKey[]> {
   const db = await openDB();
-  const v = await idbGetAll<StoredPreKey>(db, STORE_PREKEYS);
+  const v = (await idbGetAll<StoredPreKey & {keyId?:number}>(db, STORE_PREKEYS)).filter((record) =>
+    String(record.id).startsWith(cryptoRecordKey(ns, "prekey", "")),
+  ).map(record=>({...record,id:record.keyId??Number(record.id)}));
   db.close();
   return v ?? [];
 }
 
-export async function deletePreKey(id: number): Promise<void> {
+export async function deletePreKey(ns: CryptoNamespace, id: number): Promise<void> {
   const db = await openDB();
-  await idbDelete(db, STORE_PREKEYS, id);
+  await idbDelete(db, STORE_PREKEYS, cryptoRecordKey(ns, "prekey", id));
   db.close();
 }
 
-export async function loadNextPreKeyId(): Promise<number | null> {
+export async function loadNextPreKeyId(ns: CryptoNamespace): Promise<number | null> {
   const db = await openDB();
-  const v = await idbGet<number>(db, STORE_METADATA, NEXT_PREKEY_ID_KEY);
+  const v = await idbGet<number>(db, STORE_METADATA, cryptoRecordKey(ns, "metadata", NEXT_PREKEY_ID_KEY));
   db.close();
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-export async function saveNextPreKeyId(id: number): Promise<void> {
+export async function saveNextPreKeyId(ns: CryptoNamespace, id: number): Promise<void> {
   const db = await openDB();
-  await idbPut(db, STORE_METADATA, id, NEXT_PREKEY_ID_KEY);
+  const key = cryptoRecordKey(ns, "metadata", NEXT_PREKEY_ID_KEY);
+  const current = await idbGet<number>(db, STORE_METADATA, key);
+  await idbPut(db, STORE_METADATA, Math.max(current ?? 0, id), key);
   db.close();
 }
+
+export async function reserveNextPreKeyIds(ns:CryptoNamespace,count:number,fallback:number):Promise<number>{
+  if(!Number.isSafeInteger(count)||count<1)throw new Error("invalid prekey reservation count");const db=await openDB();try{return await new Promise<number>((resolve,reject)=>{const tx=db.transaction(STORE_METADATA,"readwrite");const store=tx.objectStore(STORE_METADATA);const key=cryptoRecordKey(ns,"metadata",NEXT_PREKEY_ID_KEY);const get=store.get(key);let start=fallback;get.onsuccess=()=>{if(typeof get.result==="number"&&Number.isFinite(get.result))start=Math.max(fallback,get.result);store.put(start+count,key);};tx.oncomplete=()=>resolve(start);tx.onerror=()=>reject(tx.error??new Error("prekey reservation failed"));});}finally{db.close();}
+}
+export interface SignedPreKeyRotationMetadata{publishedAt:number;rotateAfter:number;currentId:number;previousExpiresAt?:number}
+export async function saveSignedPreKeyRotationMetadata(ns:CryptoNamespace,value:SignedPreKeyRotationMetadata):Promise<void>{const db=await openDB();await idbPut(db,STORE_METADATA,value,cryptoRecordKey(ns,"metadata","signed-prekey-rotation"));db.close();}
+export async function loadSignedPreKeyRotationMetadata(ns:CryptoNamespace):Promise<SignedPreKeyRotationMetadata|null>{const db=await openDB();const value=await idbGet<SignedPreKeyRotationMetadata>(db,STORE_METADATA,cryptoRecordKey(ns,"metadata","signed-prekey-rotation"));db.close();return value??null;}
 
 export interface StoredPeerTrust {
   version: 1;
@@ -193,40 +265,41 @@ export interface StoredPeerTrust {
   pendingFingerprint?: string;
 }
 
-export async function loadPeerTrust(peerUin: number): Promise<StoredPeerTrust | null> {
+export async function loadPeerTrust(peerUin: number, ns:CryptoNamespace): Promise<StoredPeerTrust | null> {
   const db = await openDB();
-  const value = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, peerUin);
+  const value = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, cryptoRecordKey(ns, "peer-trust", peerUin));
   db.close();
   return value ?? null;
 }
 
-export async function savePeerTrust(record: StoredPeerTrust): Promise<void> {
+export async function savePeerTrust(record: StoredPeerTrust, ns:CryptoNamespace): Promise<void> {
   const db = await openDB();
-  await idbPut(db, STORE_PEER_TRUST, record, record.peerUin);
+  await idbPut(db, STORE_PEER_TRUST, record, cryptoRecordKey(ns, "peer-trust", record.peerUin));
   db.close();
 }
 
-export async function resetPeerSignalState(peerUin: number): Promise<void> {
+export async function resetPeerSignalState(peerUin: number, ns:CryptoNamespace): Promise<void> {
   const db = await openDB();
   const address = `${peerUin}.1`;
-  await idbDelete(db, STORE_SESSIONS, address);
-  await idbDelete(db, STORE_PEER_IDENTITIES, address);
+  await idbDelete(db, STORE_SESSIONS, cryptoRecordKey(ns,"session",address));
+  await idbDelete(db, STORE_PEER_IDENTITIES, cryptoRecordKey(ns,"peer-identity",address));
   db.close();
 }
 
-export async function acceptPendingPeerIdentity(peerUin: number, fingerprint: string): Promise<void> {
+export async function acceptPendingPeerIdentity(peerUin: number, fingerprint: string, operationNs:CryptoNamespace): Promise<void> {
   const db = await openDB();
   const tx = db.transaction([STORE_PEER_TRUST, STORE_SESSIONS, STORE_PEER_IDENTITIES], "readwrite");
   const done = transactionDone(tx);
   try {
     const trustStore = tx.objectStore(STORE_PEER_TRUST);
-    const existing = await requestResult<StoredPeerTrust>(trustStore.get(peerUin));
+    const ns=operationNs; const trustKey=cryptoRecordKey(ns,"peer-trust",peerUin);
+    const existing = await requestResult<StoredPeerTrust>(trustStore.get(trustKey));
     if (!existing || existing.pendingFingerprint !== fingerprint) throw new Error("fingerprint does not match the current pending identity");
     const now = Date.now();
-    trustStore.put({ ...existing, fingerprint, verified: false, pendingFingerprint: undefined, updatedAt: now } satisfies StoredPeerTrust, peerUin);
+    trustStore.put({ ...existing, fingerprint, verified: false, pendingFingerprint: undefined, updatedAt: now } satisfies StoredPeerTrust, trustKey);
     for (const address of [String(peerUin), `${peerUin}.1`]) {
-      tx.objectStore(STORE_SESSIONS).delete(address);
-      tx.objectStore(STORE_PEER_IDENTITIES).delete(address);
+      tx.objectStore(STORE_SESSIONS).delete(cryptoRecordKey(ns,"session",address));
+      tx.objectStore(STORE_PEER_IDENTITIES).delete(cryptoRecordKey(ns,"peer-identity",address));
     }
     await done;
   } catch (error) {
@@ -236,29 +309,30 @@ export async function acceptPendingPeerIdentity(peerUin: number, fingerprint: st
   } finally { db.close(); }
 }
 
-export async function assertInboundIdentityTrusted(peerUin: number, identityKey: ArrayBuffer): Promise<void> {
+export async function assertInboundIdentityTrusted(peerUin: number, identityKey: ArrayBuffer, operationNs:CryptoNamespace): Promise<void> {
   const db = await openDB();
-  const qualified = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, `${peerUin}.1`);
-  const bare = qualified ?? await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, String(peerUin));
-  const trust = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, peerUin);
+  const ns=operationNs;
+  const qualified = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, cryptoRecordKey(ns,"peer-identity",`${peerUin}.1`));
+  const bare = qualified ?? await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, cryptoRecordKey(ns,"peer-identity",String(peerUin)));
+  const trustKey=cryptoRecordKey(ns,"peer-trust",peerUin); const trust = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, trustKey);
   const incomingFingerprint = signalIdentityToWire(identityKey);
   if (bare && !arrayBufferEquals(bare.publicKey, identityKey)) {
-    db.close(); await persistInboundIdentityChange(String(peerUin), bare.publicKey, identityKey); throw new Error("peer identity changed");
+    db.close(); await persistInboundIdentityChange(String(peerUin), bare.publicKey, identityKey,ns); throw new Error("peer identity changed");
   }
   if (trust && (trust.pendingFingerprint !== undefined || trust.fingerprint !== incomingFingerprint)) {
-    await idbPut(db, STORE_PEER_TRUST, { ...trust, pendingFingerprint: incomingFingerprint, updatedAt: Date.now() } satisfies StoredPeerTrust, peerUin);
+    await idbPut(db, STORE_PEER_TRUST, { ...trust, pendingFingerprint: incomingFingerprint, updatedAt: Date.now() } satisfies StoredPeerTrust, trustKey);
     db.close(); throw new Error("peer identity changed");
   }
   db.close();
 }
 
-async function persistInboundIdentityChange(identifier: string, oldKey: ArrayBuffer, newKey: ArrayBuffer): Promise<void> {
+async function persistInboundIdentityChange(identifier: string, oldKey: ArrayBuffer, newKey: ArrayBuffer, ns:CryptoNamespace): Promise<void> {
   const match = /^(\d+)(?:\.\d+)?$/.exec(identifier);
   if (!match) return;
   const peerUin = Number(match[1]);
   if (!Number.isSafeInteger(peerUin) || peerUin <= 0) return;
   const db = await openDB();
-  const existing = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, peerUin);
+  const trustKey=cryptoRecordKey(ns,"peer-trust",peerUin); const existing = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, trustKey);
   const now = Date.now();
   const record: StoredPeerTrust = existing ?? {
     version: 1,
@@ -272,7 +346,7 @@ async function persistInboundIdentityChange(identifier: string, oldKey: ArrayBuf
     ...record,
     pendingFingerprint: signalIdentityToWire(newKey),
     updatedAt: now,
-  } satisfies StoredPeerTrust, peerUin);
+  } satisfies StoredPeerTrust, trustKey);
   db.close();
 }
 
@@ -319,26 +393,26 @@ export async function loadCachedMessages(conversationId: string): Promise<unknow
   return (all ?? []).filter((c) => c.conversation_id === conversationId).map((c) => c.message);
 }
 
-export async function putGroupCryptoRecord(key: string, value: unknown): Promise<void> {
-  const db = await openDB(); await idbPut(db, STORE_GROUP_CRYPTO, value, key); db.close();
+export async function putGroupCryptoRecord(ns:CryptoNamespace,key: string, value: unknown): Promise<void> {
+  const db = await openDB(); await idbPut(db, STORE_GROUP_CRYPTO, value, cryptoRecordKey(ns,"sender-key",key)); db.close();
 }
-export async function compareAndSwapGroupCryptoRecord<T extends {state?:unknown}>(key:string,expectedRevision:number|null,value:T):Promise<boolean>{
+export async function compareAndSwapGroupCryptoRecord<T extends {state?:unknown}>(ns:CryptoNamespace,key:string,expectedRevision:number|null,value:T):Promise<boolean>{
   const db=await openDB();const tx=db.transaction(STORE_GROUP_CRYPTO,"readwrite");const done=transactionDone(tx);
   try{
-    const store=tx.objectStore(STORE_GROUP_CRYPTO);const current=await requestResult<{state?:{revision?:number}}|undefined>(store.get(key));
+    const scoped=cryptoRecordKey(ns,"sender-key",key);const store=tx.objectStore(STORE_GROUP_CRYPTO);const current=await requestResult<{state?:{revision?:number}}|undefined>(store.get(scoped));
     const matches=expectedRevision===null?current===undefined:current!==undefined&&(current.state?.revision??0)===expectedRevision;
     if(!matches){tx.abort();await done.catch(()=>undefined);return false;}
-    store.put(value,key);await done;return true;
+    store.put(value,scoped);await done;return true;
   }finally{db.close();}
 }
-export async function getGroupCryptoRecord<T>(key: string): Promise<T | null> {
-  const db = await openDB(); const value = await idbGet<T>(db, STORE_GROUP_CRYPTO, key); db.close(); return value ?? null;
+export async function getGroupCryptoRecord<T>(ns:CryptoNamespace,key: string): Promise<T | null> {
+  const db = await openDB(); const value = await idbGet<T>(db, STORE_GROUP_CRYPTO, cryptoRecordKey(ns,"sender-key",key)); db.close(); return value ?? null;
 }
-export async function getAllGroupCryptoRecords<T>(): Promise<T[]> {
-  const db = await openDB(); const value = await idbGetAll<T>(db, STORE_GROUP_CRYPTO); db.close(); return value;
+export async function getAllGroupCryptoRecords<T>(ns:CryptoNamespace): Promise<T[]> {
+  const db = await openDB(); const prefix=cryptoRecordKey(ns,"sender-key",""); const value = await idbGetAllEntries<T>(db, STORE_GROUP_CRYPTO); db.close(); return value.filter(v=>String(v.key).startsWith(prefix)).map(v=>v.value);
 }
-export async function deleteGroupCryptoRecord(key: string): Promise<void> {
-  const db = await openDB(); await idbDelete(db, STORE_GROUP_CRYPTO, key); db.close();
+export async function deleteGroupCryptoRecord(ns:CryptoNamespace,key: string): Promise<void> {
+  const db = await openDB(); await idbDelete(db, STORE_GROUP_CRYPTO, cryptoRecordKey(ns,"sender-key",key)); db.close();
 }
 
 // ----------------------------------------------------------------------------
@@ -349,6 +423,7 @@ export async function deleteGroupCryptoRecord(key: string): Promise<void> {
 // resurrect a wiped state from a stale version.
 // ----------------------------------------------------------------------------
 export async function clearAll(): Promise<void> {
+  deviceIdFlight=null;
   await new Promise<void>((resolve, reject) => {
     const req = indexedDB.deleteDatabase(ICEQ_INDEXEDDB_NAME);
     req.onsuccess = () => resolve();
@@ -521,6 +596,10 @@ function idbGetAll<T>(db: IDBDatabase, store: string): Promise<T[]> {
   });
 }
 
+function idbGetAllEntries<T>(db: IDBDatabase, store: string): Promise<Array<{key: IDBValidKey; value: T}>> {
+  return new Promise((resolve,reject)=>{const tx=db.transaction(store,"readonly");const out:Array<{key:IDBValidKey;value:T}>=[];const req=tx.objectStore(store).openCursor();req.onsuccess=()=>{const cursor=req.result;if(!cursor)return resolve(out);out.push({key:cursor.key,value:cursor.value as T});cursor.continue();};req.onerror=()=>reject(req.error??new Error("idb cursor failed"));});
+}
+
 function idbDelete(db: IDBDatabase, store: string, key: IDBValidKey): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(store, "readwrite");
@@ -556,12 +635,12 @@ import type {
 } from "@privacyresearch/libsignal-protocol-typescript";
 
 interface StoredPreKeyRecord {
-  id: number;
+  id: IDBValidKey;
   keyPair: KeyPairType<ArrayBufferLike>;
 }
 
 interface StoredSignedPreKeyRecord {
-  id: number;
+  id: IDBValidKey;
   keyPair: KeyPairType<ArrayBufferLike>;
 }
 
@@ -573,6 +652,7 @@ interface StoredPeerIdentity {
 }
 
 export class IndexedDBSignalProtocolStore implements StorageType {
+  constructor(public readonly namespace: CryptoNamespace) {}
   // -----------------------------------------------------------------
   // Identity key pair. One row, key="self", in STORE_IDENTITY.
   // The privacyresearch library calls this only for the LOCAL
@@ -580,7 +660,7 @@ export class IndexedDBSignalProtocolStore implements StorageType {
   // -----------------------------------------------------------------
   async getIdentityKeyPair(): Promise<KeyPairType<ArrayBuffer> | undefined> {
     const db = await openDB();
-    const v = await idbGet<StoredIdentity>(db, STORE_IDENTITY, SELF_KEY);
+    const v = await idbGet<StoredIdentity>(db, STORE_IDENTITY, cryptoRecordKey(this.namespace, "identity", SELF_KEY));
     db.close();
     if (!v) return undefined;
     return {
@@ -591,7 +671,7 @@ export class IndexedDBSignalProtocolStore implements StorageType {
 
   async getLocalRegistrationId(): Promise<number | undefined> {
     const db = await openDB();
-    const v = await idbGet<StoredIdentity>(db, STORE_IDENTITY, SELF_KEY);
+    const v = await idbGet<StoredIdentity>(db, STORE_IDENTITY, cryptoRecordKey(this.namespace, "identity", SELF_KEY));
     db.close();
     return v?.registrationId;
   }
@@ -633,11 +713,11 @@ export class IndexedDBSignalProtocolStore implements StorageType {
     _direction: Direction,
   ): Promise<boolean> {
     const db = await openDB();
-    const existing = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, identifier);
+    const existing = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, cryptoRecordKey(this.namespace, "peer-identity", identifier));
     db.close();
     if (!existing) return true; // first sighting — accept and let saveIdentity pin it
     if (arrayBufferEquals(existing.publicKey, identityKey)) return true;
-    await persistInboundIdentityChange(identifier, existing.publicKey, identityKey);
+    await persistInboundIdentityChange(identifier, existing.publicKey, identityKey,this.namespace);
     return false;
   }
 
@@ -647,16 +727,17 @@ export class IndexedDBSignalProtocolStore implements StorageType {
     _nonblockingApproval?: boolean,
   ): Promise<boolean> {
     const db = await openDB();
-    const existing = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, encodedAddress);
+    const key = cryptoRecordKey(this.namespace, "peer-identity", encodedAddress);
+    const existing = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, key);
     if (existing && !arrayBufferEquals(existing.publicKey, publicKey)) {
       // Identity changed — refuse to overwrite. The peer needs
       // to re-init the session from a fresh bundle.
       db.close();
-      await persistInboundIdentityChange(encodedAddress, existing.publicKey, publicKey);
+      await persistInboundIdentityChange(encodedAddress, existing.publicKey, publicKey,this.namespace);
       return false;
     }
     const rec: StoredPeerIdentity = { publicKey, firstSeenAt: Date.now() };
-    await idbPut(db, STORE_PEER_IDENTITIES, rec, encodedAddress);
+    await idbPut(db, STORE_PEER_IDENTITIES, rec, key);
     db.close();
     return true;
   }
@@ -672,7 +753,7 @@ export class IndexedDBSignalProtocolStore implements StorageType {
   // -----------------------------------------------------------------
   async loadPreKey(keyId: number | string): Promise<KeyPairType<ArrayBuffer> | undefined> {
     const db = await openDB();
-    const v = await idbGet<StoredPreKeyRecord>(db, STORE_PREKEYS, keyId as IDBValidKey);
+    const v = await idbGet<StoredPreKeyRecord>(db, STORE_PREKEYS, cryptoRecordKey(this.namespace, "prekey", keyId));
     db.close();
     if (!v) return undefined;
     return { pubKey: v.keyPair.pubKey as ArrayBuffer, privKey: v.keyPair.privKey as ArrayBuffer };
@@ -680,14 +761,14 @@ export class IndexedDBSignalProtocolStore implements StorageType {
 
   async storePreKey(keyId: number | string, keyPair: KeyPairType): Promise<void> {
     const db = await openDB();
-    const rec: StoredPreKeyRecord = { id: Number(keyId), keyPair: { pubKey: keyPair.pubKey as ArrayBufferLike, privKey: keyPair.privKey as ArrayBufferLike } };
+    const rec: StoredPreKeyRecord = { id: cryptoRecordKey(this.namespace, "prekey", keyId), keyPair: { pubKey: keyPair.pubKey as ArrayBufferLike, privKey: keyPair.privKey as ArrayBufferLike } };
     await idbPutKeyPath(db, STORE_PREKEYS, rec);
     db.close();
   }
 
   async removePreKey(keyId: number | string): Promise<void> {
     const db = await openDB();
-    await idbDelete(db, STORE_PREKEYS, Number(keyId));
+    await idbDelete(db, STORE_PREKEYS, cryptoRecordKey(this.namespace, "prekey", keyId));
     db.close();
   }
 
@@ -698,7 +779,7 @@ export class IndexedDBSignalProtocolStore implements StorageType {
   // -----------------------------------------------------------------
   async loadSignedPreKey(keyId: number | string): Promise<KeyPairType<ArrayBuffer> | undefined> {
     const db = await openDB();
-    const v = await idbGet<StoredSignedPreKeyRecord>(db, STORE_SIGNED_PREKEYS, keyId as IDBValidKey);
+    const v = await idbGet<StoredSignedPreKeyRecord>(db, STORE_SIGNED_PREKEYS, cryptoRecordKey(this.namespace, "signed-prekey", keyId));
     db.close();
     if (!v) return undefined;
     return { pubKey: v.keyPair.pubKey as ArrayBuffer, privKey: v.keyPair.privKey as ArrayBuffer };
@@ -706,14 +787,14 @@ export class IndexedDBSignalProtocolStore implements StorageType {
 
   async storeSignedPreKey(keyId: number | string, keyPair: KeyPairType): Promise<void> {
     const db = await openDB();
-    const rec: StoredSignedPreKeyRecord = { id: Number(keyId), keyPair: { pubKey: keyPair.pubKey as ArrayBufferLike, privKey: keyPair.privKey as ArrayBufferLike } };
+    const rec: StoredSignedPreKeyRecord = { id: cryptoRecordKey(this.namespace, "signed-prekey", keyId), keyPair: { pubKey: keyPair.pubKey as ArrayBufferLike, privKey: keyPair.privKey as ArrayBufferLike } };
     await idbPutKeyPath(db, STORE_SIGNED_PREKEYS, rec);
     db.close();
   }
 
   async removeSignedPreKey(keyId: number | string): Promise<void> {
     const db = await openDB();
-    await idbDelete(db, STORE_SIGNED_PREKEYS, Number(keyId));
+    await idbDelete(db, STORE_SIGNED_PREKEYS, cryptoRecordKey(this.namespace, "signed-prekey", keyId));
     db.close();
   }
 
@@ -725,20 +806,20 @@ export class IndexedDBSignalProtocolStore implements StorageType {
   // -----------------------------------------------------------------
   async loadSession(encodedAddress: string): Promise<SessionRecordType | undefined> {
     const db = await openDB();
-    const v = await idbGet<SessionRecordType>(db, STORE_SESSIONS, encodedAddress);
+    const v = await idbGet<SessionRecordType>(db, STORE_SESSIONS, cryptoRecordKey(this.namespace, "session", encodedAddress));
     db.close();
     return v;
   }
 
   async storeSession(encodedAddress: string, record: SessionRecordType): Promise<void> {
     const db = await openDB();
-    await idbPut(db, STORE_SESSIONS, record, encodedAddress);
+    await idbPut(db, STORE_SESSIONS, record, cryptoRecordKey(this.namespace, "session", encodedAddress));
     db.close();
   }
 
   async removeSession(encodedAddress: string): Promise<void> {
     const db = await openDB();
-    await idbDelete(db, STORE_SESSIONS, encodedAddress);
+    await idbDelete(db, STORE_SESSIONS, cryptoRecordKey(this.namespace, "session", encodedAddress));
     db.close();
   }
 }
@@ -748,10 +829,8 @@ export class IndexedDBSignalProtocolStore implements StorageType {
 // always go through getSignalStore() rather than `new`-ing
 // ad-hoc, so a future instrumentation hook (metrics, logging)
 // has a single chokepoint to attach to.
-let _signalStoreSingleton: IndexedDBSignalProtocolStore | null = null;
-export function getSignalStore(): IndexedDBSignalProtocolStore {
-  if (!_signalStoreSingleton) _signalStoreSingleton = new IndexedDBSignalProtocolStore();
-  return _signalStoreSingleton;
+export function getSignalStore(namespace: CryptoNamespace): IndexedDBSignalProtocolStore {
+  return new IndexedDBSignalProtocolStore(namespace);
 }
 
 // ----------------------------------------------------------------------------
@@ -774,4 +853,11 @@ function arrayBufferEquals(a: ArrayBuffer, b: ArrayBuffer): boolean {
   const bv = new Uint8Array(b);
   for (let i = 0; i < av.length; i++) if (av[i] !== bv[i]) return false;
   return true;
+}
+
+function constantTimeStringEqual(a: string, b: string): boolean {
+  const aa = new TextEncoder().encode(a); const bb = new TextEncoder().encode(b);
+  let mismatch = aa.length ^ bb.length; const n = Math.max(aa.length, bb.length);
+  for (let i = 0; i < n; i++) mismatch |= (aa[i % (aa.length || 1)] ?? 0) ^ (bb[i % (bb.length || 1)] ?? 0);
+  return mismatch === 0;
 }

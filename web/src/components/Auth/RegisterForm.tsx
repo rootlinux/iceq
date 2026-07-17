@@ -23,8 +23,11 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuthStore } from "../../store/authStore";
-import { uploadBundle, type OneTimePreKeyUpload, type SignedPreKeyUpload } from "../../api/keys";
+import { fetchBundle, uploadBundle, type OneTimePreKeyUpload, type SignedPreKeyUpload } from "../../api/keys";
+import { me } from "../../api/auth";
+import { ApiError } from "../../api/client";
 import { useI18n } from "../../i18n";
+import { runRegistration, type PendingRegistration } from "../../lib/registrationRecovery";
 
 const ONETIMEPREKEY_COUNT = 20;
 
@@ -49,7 +52,6 @@ export function RegisterForm(): JSX.Element {
   const onSubmit = async (e: React.FormEvent): Promise<void> => {
     e.preventDefault();
     setError(null);
-    setStage("generating");
     try {
       const {
         assertValidIdentityKey,
@@ -58,54 +60,23 @@ export function RegisterForm(): JSX.Element {
         generateRegistrationId,
         saveOwnIdentity,
       } = await import("../../lib/signal");
-      // ---- 1. Generate identity + bundle ----
-      const identity = await generateIdentityKeyPair();
-      const registrationId = generateRegistrationId();
-      await saveOwnIdentity(identity, registrationId);
-
-      // The bundle includes the public key + a signature
-      // that the server can verify against the identity.
-      // The Signal bindings expose a helper to build the
-      // signed prekey with a valid signature; we re-use
-      // the same primitive for both upload and persist.
-      const bundle = await generatePreKeyBundle(
-        identity,
-        1,
-        ONETIMEPREKEY_COUNT,
-        registrationId,
-      );
-      const signedPreKey: SignedPreKeyUpload = {
-        id: bundle.signed_pre_key.id,
-        public_key: bundle.signed_pre_key.public_key,
-        // The signature is computed by KeyHelper.generateSignedPreKey
-        // (an Ed25519 signature by the identity private key over
-        // the signed prekey public bytes) and passed through here.
-        // The server verifies it on upload.
-        signature: bundle.signed_pre_key.signature,
-      };
-      const oneTimePreKeys: OneTimePreKeyUpload[] = bundle.one_time_pre_keys.map((p) => ({
-        id: p.id,
-        public_key: p.public_key,
-      }));
-      assertValidIdentityKey(bundle.identity_key);
-
-      // ---- 2. Register the user (also mints tokens) ----
-      setStage("registering");
-      await register({
-        username,
-        password,
-        identityKey: bundle.identity_key,
-      });
-
-      // ---- 3. Upload prekey bundle. Must happen after
-      //         /register because /keys/bundle is authed. ----
-      setStage("uploading");
-      await uploadBundle({
-        identity_key: bundle.identity_key,
-        signed_pre_key: signedPreKey,
-        one_time_pre_keys: oneTimePreKeys,
-        registration_id: registrationId,
-      });
+      const {createRegistrationCryptoNamespace,commitCryptoNamespace,loadOrCreateDeviceId,setActiveCryptoNamespace,loadPendingRegistration,savePendingRegistration,clearPendingRegistration}=await import("../../lib/indexeddb");
+      const activeNamespace=await runRegistration({username,password},{
+        store:{load:()=>loadPendingRegistration<PendingRegistration>(),save:savePendingRegistration,clear:clearPendingRegistration},
+        prepare:async()=>{
+          const stagingNamespace=createRegistrationCryptoNamespace();
+          const identity=await generateIdentityKeyPair();const registrationId=generateRegistrationId();await saveOwnIdentity(identity,registrationId,stagingNamespace);
+          const bundle=await generatePreKeyBundle(identity,1,ONETIMEPREKEY_COUNT,registrationId,stagingNamespace);
+          const signedPreKey:SignedPreKeyUpload={id:bundle.signed_pre_key.id,public_key:bundle.signed_pre_key.public_key,signature:bundle.signed_pre_key.signature};
+          const oneTimePreKeys:OneTimePreKeyUpload[]=bundle.one_time_pre_keys.map(p=>({id:p.id,public_key:p.public_key}));assertValidIdentityKey(bundle.identity_key);
+          return{stagingNamespace,identityKey:bundle.identity_key,bundle:{identity_key:bundle.identity_key,signed_pre_key:signedPreKey,one_time_pre_keys:oneTimePreKeys,registration_id:registrationId}};
+        },
+        register:async input=>{await register(input);const uin=useAuthStore.getState().uin;if(uin===null)throw new Error("registration session missing account");return{uin};},
+        authenticatedAccount:async()=>{try{const account=await me();return{uin:account.uin,username:account.username};}catch{return null;}},
+        fetchDirectory:async uin=>{try{return await fetchBundle(uin);}catch(error){if(error instanceof ApiError&&error.status===404)return null;throw error;}},
+        deviceId:loadOrCreateDeviceId,upload:uploadBundle,commit:commitCryptoNamespace,
+      },setStage);
+      setActiveCryptoNamespace(activeNamespace);
 
       setSignalReady(true);
       navigate("/app", { replace: true });

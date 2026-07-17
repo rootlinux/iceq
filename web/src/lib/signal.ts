@@ -39,6 +39,7 @@ import {
   loadIdentity as idbLoadIdentity,
   saveIdentity,
   type StoredIdentity,
+  type CryptoNamespace,
 } from "./indexeddb";
 import { assessPeerIdentity, isPeerSendAllowed } from "./identityTrust";
 import { assertInboundIdentityTrusted } from "./indexeddb";
@@ -134,9 +135,9 @@ export async function preloadSignal(): Promise<void> {
 // The boot is cached but the identity is short-lived — we
 // want the latest write to be visible immediately (e.g. after
 // register() lands, or after 4403 wipe + re-register).
-async function getLocalIdentity(): Promise<StoredIdentity | null> {
+async function getLocalIdentity(namespace:CryptoNamespace): Promise<StoredIdentity | null> {
   await ensureBoot();
-  return idbLoadIdentity();
+  return idbLoadIdentity(namespace);
 }
 
 // ============================================================================
@@ -273,6 +274,12 @@ export async function generateIdentityKeyPair(): Promise<IdentityKeyPair> {
   };
 }
 
+export async function deriveIdentityPublicKey(privateKey: string): Promise<string> {
+  const { curve } = await ensureBoot();
+  const pair = await curve.keyPair(b64UrlToArrayBuffer(privateKey));
+  return encodeIdentityKeyForWire(new Uint8Array(pair.pubKey));
+}
+
 export function generateRegistrationId(): number {
   const registrationId = new Uint16Array(1);
   globalThis.crypto.getRandomValues(registrationId);
@@ -305,9 +312,10 @@ export async function generatePreKeyBundle(
   signedPreKeyId: number,
   oneTimePreKeyCount: number,
   registrationId: number,
+  namespace: CryptoNamespace,
 ): Promise<PreKeyBundleUpload> {
   const { runtime } = await ensureBoot();
-  const store = getSignalStore();
+  const store = getSignalStore(namespace);
 
   // The KeyHelper API takes a KeyPairType, not our wrapped
   // IdentityKeyPair. Convert the Buffer-style values.
@@ -346,9 +354,9 @@ export async function generatePreKeyBundle(
   };
 }
 
-export async function generateOneTimePreKeys(startId: number, count: number): Promise<OneTimePreKeyUpload[]> {
+export async function generateOneTimePreKeys(startId: number, count: number, namespace: CryptoNamespace): Promise<OneTimePreKeyUpload[]> {
   const { runtime } = await ensureBoot();
-  const store = getSignalStore();
+  const store = getSignalStore(namespace);
   const prekeys: OneTimePreKeyUpload[] = [];
 
   for (let i = 0; i < count; i++) {
@@ -374,13 +382,14 @@ export async function generateOneTimePreKeys(startId: number, count: number): Pr
 export async function saveOwnIdentity(
   id: IdentityKeyPair,
   registrationId: number,
+  namespace: CryptoNamespace,
 ): Promise<void> {
   const stored: StoredIdentity = {
     publicKey: encodeIdentityKeyForWire(id.publicKey),
     privateKey: arrayBufferToB64Url(uint8ToArrayBuffer(id.privateKey)),
     registrationId,
   };
-  await saveIdentity(stored);
+  await saveIdentity(namespace, stored);
 }
 
 export function restoreOwnIdentity(stored: StoredIdentity): IdentityKeyPair & { registrationId: number } {
@@ -414,15 +423,16 @@ export interface SealedMessage {
 export async function encryptMessage(
   recipientUin: number,
   plaintext: Uint8Array,
+  operationNamespace:CryptoNamespace,
 ): Promise<SealedMessage> {
   const { runtime } = await ensureBoot();
-  const identity = await getLocalIdentity();
+  const identity = await getLocalIdentity(operationNamespace);
   if (!identity) throw new SignalError("no local identity — register first");
-  if (!(await isPeerSendAllowed(recipientUin))) {
+  if (!(await isPeerSendAllowed(recipientUin,operationNamespace))) {
     throw new SignalError("peer identity changed; sending is blocked until explicitly accepted or verified");
   }
 
-  const store = getSignalStore();
+  const store = getSignalStore(operationNamespace);
   const remoteAddress = new runtime.SignalProtocolAddress(String(recipientUin), 1);
   const encoded = remoteAddress.toString();
 
@@ -505,12 +515,13 @@ export async function decryptMessage(
   senderUin: number,
   ciphertextB64: string,
   msgType: "prekey_message" | "signal_message",
+  operationNamespace:CryptoNamespace,
 ): Promise<Uint8Array> {
   const { runtime } = await ensureBoot();
-  const identity = await getLocalIdentity();
+  const identity = await getLocalIdentity(operationNamespace);
   if (!identity) throw new SignalError("no local identity — register first");
 
-  const store = getSignalStore();
+  const store = getSignalStore(operationNamespace);
   const remoteAddress = new runtime.SignalProtocolAddress(String(senderUin), 1);
   const cipher = new runtime.SessionCipher(store, remoteAddress);
   const bytes = b64UrlToArrayBuffer(ciphertextB64);
@@ -525,7 +536,7 @@ export async function decryptMessage(
       if (proto.identityKey.length !== SIGNAL_PUBLIC_KEY_LENGTH || proto.identityKey[0] !== SIGNAL_PUBLIC_KEY_PREFIX) {
         throw new SignalError("invalid inbound identity key");
       }
-      await assertInboundIdentityTrusted(senderUin, inboundIdentity);
+      await assertInboundIdentityTrusted(senderUin, inboundIdentity,operationNamespace);
       // First message from a peer. The SessionBuilder runs
       // X3DH against our stored prekey/signed-prekey and
       // sets up the ratchet state.
@@ -564,7 +575,7 @@ async function seedSessionFromBundle(
   const { runtime } = await ensureBoot();
   await verifySignedPreKeyBundle(remote);
   const peerUin = Number(remoteAddress.getName());
-  const trust = await assessPeerIdentity(peerUin, remote.identity_key);
+  const trust = await assessPeerIdentity(peerUin, remote.identity_key,store.namespace);
   if (!trust.sendAllowed) {
     throw new SignalError("peer identity changed; sending is blocked until explicitly accepted or verified");
   }

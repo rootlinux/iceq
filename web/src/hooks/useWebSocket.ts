@@ -32,6 +32,7 @@ import { classifyClose } from "../lib/wsCloseCodes";
 import { decryptMessage } from "../lib/signal";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
 import { registerMemoryReset } from "../lib/localDataCleanup";
+import { getActiveCryptoNamespace } from "../lib/indexeddb";
 import type {
   AckPayload,
   AuthPayload,
@@ -408,10 +409,11 @@ export function useWebSocket(): UseWebSocketResult {
       }
       case "message":
       case "group_msg": {
-        try {
+		try {
+		  const operationNamespace=getActiveCryptoNamespace();
 		  const processed = await processEncryptedEnvelopeForDispatch(env, {
-			decryptDirect: decryptMessage,
-			processDirectControl: (senderUin, bytes) => processDirectControlMessage(senderUin, bytes, async(gid)=>{
+			decryptDirect: (a,b,c)=>decryptMessage(a,b,c,operationNamespace),
+			processDirectControl: (senderUin, bytes) => processDirectControlMessage(operationNamespace,senderUin, bytes, async(gid)=>{
                 let group=useGroupStore.getState().groups.find(g=>g.group_id===gid);
                 const roster=await getGroupMembersWithEpoch(gid);
                 useGroupStore.getState().setMembers(gid,roster.members);
@@ -425,7 +427,7 @@ export function useWebSocket(): UseWebSocketResult {
 			},
 			decryptGroup: async (gp, routing) => {
 			  const p=gp;
-			  const content=await openGroupContent(decodeGroupCiphertext(gp.ciphertext??""),routing.cryptoEpoch,routing.members,false,Date.now(),{group_id:gp.group_id,sender_uin:gp.sender_uin,epoch:gp.crypto_epoch});
+			  const content=await openGroupContent(operationNamespace,decodeGroupCiphertext(gp.ciphertext??""),routing.cryptoEpoch,routing.members,false,Date.now(),{group_id:gp.group_id,sender_uin:gp.sender_uin,epoch:gp.crypto_epoch});
 			  const fields=authenticatedGroupMessageFields(content,p.content_type);
 			  return {plaintext:fields.plaintext,contentType:fields.content_type};
 			},

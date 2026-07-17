@@ -18,6 +18,7 @@ import { MessageInput } from "./MessageInput";
 import { TypingIndicator } from "./TypingIndicator";
 import { historyDM } from "../../api/messages";
 import { decryptMessage } from "../../lib/signal";
+import { getActiveCryptoNamespace } from "../../lib/indexeddb";
 import { processDirectControlMessage } from "../../lib/groupCrypto";
 import { getGroupMembersWithEpoch } from "../../api/groups";
 import { useChatStore, conversationIdForPair } from "../../store/chatStore";
@@ -87,6 +88,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
 
   useEffect(() => {
     if (selfUin === null) return;
+    const operationNamespace = getActiveCryptoNamespace();
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -99,8 +101,8 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
           if (!row.ciphertext || !row.msg_type) continue;
           if (row.msg_type === "plaintext" || row.msg_type === "group_ciphertext") continue;
           try {
-            const plain = await decryptMessage(row.sender_uin, row.ciphertext, row.msg_type);
-            if(await processDirectControlMessage(row.sender_uin,plain,async(groupId)=>{const roster=await getGroupMembersWithEpoch(groupId);return {epoch:roster.crypto_epoch,members:roster.members.map(member=>member.uin)};}))continue;
+            const plain = await decryptMessage(row.sender_uin, row.ciphertext, row.msg_type,operationNamespace);
+            if(await processDirectControlMessage(operationNamespace,row.sender_uin,plain,async(groupId)=>{const roster=await getGroupMembersWithEpoch(groupId);return {epoch:roster.crypto_epoch,members:roster.members.map(member=>member.uin)};}))continue;
             out.push({
               id: row.id,
               conversation_id: row.conversation_id,

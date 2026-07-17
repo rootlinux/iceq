@@ -13,10 +13,9 @@ test("ensureOwnBundle does nothing when the remote bundle already exists", async
       signed_pre_key: { id: 1, public_key: "spk", signature: "sig" },
       registration_id: 7,
     }),
-    loadIdentity: async () => null,
-    restoreIdentity: () => {
-      throw new Error("restoreIdentity should not be called");
-    },
+    loadIdentity: async () => ({publicKey:"identity",privateKey:"private",registrationId:7}),
+    deriveStoredPublic:async()=>"identity",
+    restoreIdentity: () => ({publicKey:new Uint8Array(),privateKey:new Uint8Array(),registrationId:7}),
     generatePreKeyBundle: async () => {
       throw new Error("generatePreKeyBundle should not be called");
     },
@@ -94,10 +93,9 @@ test("ensureSignalProvisioning leaves healthy server-side prekey pools alone", a
       signed_pre_key: { id: 1, public_key: "spk", signature: "sig" },
       registration_id: 7,
     }),
-    loadIdentity: async () => null,
-    restoreIdentity: () => {
-      throw new Error("restoreIdentity should not be called");
-    },
+    loadIdentity: async () => ({publicKey:"identity",privateKey:"private",registrationId:7}),
+    deriveStoredPublic:async()=>"identity",
+    restoreIdentity: () => ({publicKey:new Uint8Array(),privateKey:new Uint8Array(),registrationId:7}),
     generatePreKeyBundle: async () => {
       throw new Error("generatePreKeyBundle should not be called");
     },
@@ -136,10 +134,9 @@ test("ensureSignalProvisioning tops up low server-side prekey pools with monoton
       signed_pre_key: { id: 1, public_key: "spk", signature: "sig" },
       registration_id: 7,
     }),
-    loadIdentity: async () => null,
-    restoreIdentity: () => {
-      throw new Error("restoreIdentity should not be called");
-    },
+    loadIdentity: async () => ({publicKey:"identity",privateKey:"private",registrationId:7}),
+    deriveStoredPublic:async()=>"identity",
+    restoreIdentity: () => ({publicKey:new Uint8Array(),privateKey:new Uint8Array(),registrationId:7}),
     generatePreKeyBundle: async () => {
       throw new Error("generatePreKeyBundle should not be called");
     },

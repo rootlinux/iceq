@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { loadIdentity } from "../../lib/indexeddb";
+import { getActiveCryptoNamespace, loadIdentity } from "../../lib/indexeddb";
 import { SafetyQr } from "./SafetyQr";
 import { fetchBundle } from "../../api/keys";
 import { computeSafetyNumber } from "../../lib/safetyFingerprint";
@@ -34,10 +34,10 @@ export function SecuritySettings(): JSX.Element {
       setPeerError(i18n.t("security.invalidUin")); return;
     }
     try {
-      const [local, remote] = await Promise.all([loadIdentity(), fetchBundle(parsed)]);
+      const [local, remote] = await Promise.all([loadIdentity(getActiveCryptoNamespace()), fetchBundle(parsed)]);
       if (!local) throw new Error(i18n.t("security.localUnavailable"));
       await verifySignedPreKeyBundle(remote);
-      const assessment = await assessPeerIdentity(parsed, remote.identity_key);
+      const assessment = await assessPeerIdentity(parsed, remote.identity_key,getActiveCryptoNamespace());
       const number = await computeSafetyNumber(
         { uin: selfUin, identityKey: local.publicKey },
         { uin: parsed, identityKey: remote.identity_key },
@@ -51,7 +51,7 @@ export function SecuritySettings(): JSX.Element {
     let cancelled = false;
     (async () => {
       try {
-        const identity = await loadIdentity();
+        const identity = await loadIdentity(getActiveCryptoNamespace());
         const fingerprint = identity
           ? await fingerprintIdentityKey(identity.publicKey)
           : null;
@@ -86,8 +86,8 @@ export function SecuritySettings(): JSX.Element {
               <div>{peerSafety.number}</div>
               <SafetyQr fingerprint={peerSafety.number} />
               {peerSafety.changed && <div role="alert">{i18n.t("security.identityChanged")}</div>}
-              {peerSafety.changed && <button type="button" onClick={async () => { await acceptPeerIdentity(peerSafety.uin, peerSafety.identityKey); await inspectPeer(); }}>{i18n.t("security.acceptIdentity")}</button>}
-              {!peerSafety.verified && !peerSafety.changed && <button type="button" onClick={async () => { await verifyPeerIdentity(peerSafety.uin, peerSafety.identityKey); await inspectPeer(); }}>{i18n.t("security.markVerified")}</button>}
+              {peerSafety.changed && <button type="button" onClick={async () => { await acceptPeerIdentity(peerSafety.uin, peerSafety.identityKey,getActiveCryptoNamespace()); await inspectPeer(); }}>{i18n.t("security.acceptIdentity")}</button>}
+              {!peerSafety.verified && !peerSafety.changed && <button type="button" onClick={async () => { await verifyPeerIdentity(peerSafety.uin, peerSafety.identityKey,getActiveCryptoNamespace()); await inspectPeer(); }}>{i18n.t("security.markVerified")}</button>}
               {peerSafety.verified && <div role="status">{i18n.t("security.verified")}</div>}
             </div>
           )}

@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import "fake-indexeddb/auto";
-import { saveAuthenticatedGroupContent, saveGroupCryptoState, loadGroupCryptoState, pruneObsoleteGroupEpochs } from "../src/lib/groupCryptoStore";
-import { authenticatedGroupMessageFields, ensureGroupSenderCAS, hydrateSenderKeyInbox, GROUP_CONTENT_KIND, GROUP_DISTRIBUTION_KIND, openGroupContent, processDirectControlMessage, sealGroupContent, sealGroupContentCAS } from "../src/lib/groupCrypto";
+import { saveAuthenticatedGroupContent as saveAuthenticatedGroupContentRaw, saveGroupCryptoState as saveGroupCryptoStateRaw, loadGroupCryptoState as loadGroupCryptoStateRaw, pruneObsoleteGroupEpochs as pruneObsoleteGroupEpochsRaw } from "../src/lib/groupCryptoStore";
+import { authenticatedGroupMessageFields, ensureGroupSenderCAS as ensureGroupSenderCASRaw, hydrateSenderKeyInbox as hydrateSenderKeyInboxRaw, GROUP_CONTENT_KIND, GROUP_DISTRIBUTION_KIND, openGroupContent as openGroupContentRaw, processDirectControlMessage as processDirectControlMessageRaw, sealGroupContent as sealGroupContentRaw, sealGroupContentCAS as sealGroupContentCASRaw } from "../src/lib/groupCrypto";
 import { createReceiverState, createSenderState, encryptGroupMessage } from "../src/lib/senderKeys";
-import { getGroupCryptoRecord } from "../src/lib/indexeddb";
+import { getGroupCryptoRecord as getGroupCryptoRecordRaw, setActiveCryptoNamespace } from "../src/lib/indexeddb";
+const NS={uin:7,deviceId:"group-crypto-test-device"};setActiveCryptoNamespace(NS);
+const saveAuthenticatedGroupContent=(...args:any[])=>(saveAuthenticatedGroupContentRaw as any)(NS,...args),saveGroupCryptoState=(...args:any[])=>(saveGroupCryptoStateRaw as any)(NS,...args),loadGroupCryptoState=(...args:any[])=>(loadGroupCryptoStateRaw as any)(NS,...args),pruneObsoleteGroupEpochs=(...args:any[])=>(pruneObsoleteGroupEpochsRaw as any)(NS,...args);
+const ensureGroupSenderCAS=(...args:any[])=>(ensureGroupSenderCASRaw as any)(NS,...args),hydrateSenderKeyInbox=(...args:any[])=>(hydrateSenderKeyInboxRaw as any)(NS,...args),openGroupContent=(...args:any[])=>(openGroupContentRaw as any)(NS,...args),processDirectControlMessage=(...args:any[])=>(processDirectControlMessageRaw as any)(NS,...args),sealGroupContent=(...args:any[])=>(sealGroupContentRaw as any)(NS,...args),sealGroupContentCAS=(...args:any[])=>(sealGroupContentCASRaw as any)(NS,...args);
+const getGroupCryptoRecord=(...args:any[])=>(getGroupCryptoRecordRaw as any)(NS,...args);
 
 test("group state is versioned and keyed by group, epoch, and sender", async () => {
   indexedDB.deleteDatabase("iceq");

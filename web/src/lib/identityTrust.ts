@@ -1,4 +1,4 @@
-import { acceptPendingPeerIdentity, loadPeerTrust, savePeerTrust, type StoredPeerTrust } from "./indexeddb";
+import { acceptPendingPeerIdentity, loadPeerTrust, savePeerTrust, type StoredPeerTrust, type CryptoNamespace } from "./indexeddb";
 
 const RAW_KEY_BYTES = 32;
 
@@ -8,38 +8,38 @@ export interface PeerTrustAssessment {
   record: StoredPeerTrust;
 }
 
-export async function assessPeerIdentity(peerUin: number, fingerprint: string): Promise<PeerTrustAssessment> {
+export async function assessPeerIdentity(peerUin: number, fingerprint: string, ns:CryptoNamespace): Promise<PeerTrustAssessment> {
   validate(peerUin, fingerprint);
-  const existing = await loadPeerTrust(peerUin);
+  const existing = await loadPeerTrust(peerUin,ns);
   if (!existing) {
     const now = Date.now();
     const record: StoredPeerTrust = { version: 1, peerUin, fingerprint, verified: false, firstSeenAt: now, updatedAt: now };
-    await savePeerTrust(record);
+    await savePeerTrust(record,ns);
     return { status: "trusted", sendAllowed: true, record };
   }
   if (existing.fingerprint !== fingerprint) {
     const blocked = { ...existing, pendingFingerprint: fingerprint, updatedAt: Date.now() };
-    await savePeerTrust(blocked);
+    await savePeerTrust(blocked,ns);
     return { status: "changed", sendAllowed: false, record: blocked };
   }
   return { status: "trusted", sendAllowed: true, record: existing };
 }
 
-export async function acceptPeerIdentity(peerUin: number, fingerprint: string): Promise<void> {
+export async function acceptPeerIdentity(peerUin: number, fingerprint: string, ns:CryptoNamespace): Promise<void> {
   validate(peerUin, fingerprint);
-  await acceptPendingPeerIdentity(peerUin, fingerprint);
+  await acceptPendingPeerIdentity(peerUin, fingerprint,ns);
 }
 
-export async function verifyPeerIdentity(peerUin: number, fingerprint: string): Promise<void> {
-  const assessment = await assessPeerIdentity(peerUin, fingerprint);
+export async function verifyPeerIdentity(peerUin: number, fingerprint: string,ns:CryptoNamespace): Promise<void> {
+  const assessment = await assessPeerIdentity(peerUin, fingerprint,ns);
   if (!assessment.sendAllowed) throw new Error("peer identity changed; accept it before verification");
-  await savePeerTrust({ ...assessment.record, verified: true, updatedAt: Date.now() });
+  await savePeerTrust({ ...assessment.record, verified: true, updatedAt: Date.now() },ns);
 }
 
 export const getPeerTrust = loadPeerTrust;
 
-export async function isPeerSendAllowed(peerUin: number): Promise<boolean> {
-  const trust = await loadPeerTrust(peerUin);
+export async function isPeerSendAllowed(peerUin: number,ns:CryptoNamespace): Promise<boolean> {
+  const trust = await loadPeerTrust(peerUin,ns);
   return !trust?.pendingFingerprint;
 }
 
