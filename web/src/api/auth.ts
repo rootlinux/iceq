@@ -75,12 +75,13 @@ export async function refresh(): Promise<AuthTokens> {
 	});
 }
 
-export async function logout(signal?: AbortSignal): Promise<void> {
+export async function logout(signal?: AbortSignal, accessToken?: string | null): Promise<void> {
 	await fetchWithAuth("/api/auth/logout", {
 		method: "POST",
 		body: {},
 		skipRefresh: true,
 		signal,
+		...(accessToken ? { headers: { Authorization: `Bearer ${accessToken}` } } : {}),
 	});
 }
 

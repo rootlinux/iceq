@@ -21,7 +21,6 @@ import { RegisterForm } from "./components/Auth/RegisterForm";
 import { MainLayout } from "./components/Layout/MainLayout";
 import { ChatShell } from "./components/Chat/ChatShell";
 import { useI18n } from "./i18n";
-import { clearAllIceQLocalData } from "./lib/localDataCleanup";
 
 export default function App(): JSX.Element {
   const isAuthed = useAuthStore((s) => s.isAuthenticated);
@@ -70,7 +69,7 @@ export default function App(): JSX.Element {
     <>
     {cleanupFailed && <div role="alert" className="fixed inset-x-0 top-0 z-50 bg-danger p-3 text-white">
       <span>{i18n.t("cleanup.failed")}</span>{" "}
-      <button type="button" onClick={() => void clearAllIceQLocalData("logout").then(() => setCleanupFailed(false)).catch(() => setCleanupFailed(true))}>{i18n.t("cleanup.retry")}</button>
+      <button type="button" onClick={() => void useAuthStore.getState().retryLocalCleanup().then(() => setCleanupFailed(false)).catch(() => setCleanupFailed(true))}>{i18n.t("cleanup.retry")}</button>
     </div>}
     <Routes>
       <Route path="/login" element={isAuthed ? <Navigate to="/app" replace /> : <LoginForm />} />

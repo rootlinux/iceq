@@ -20,9 +20,11 @@ test("logout attempts server revocation before clearing every local account stat
   let fetchCount = 0;
   let failPanicWipe = false;
   let panicDeleteCountAtCall = -1;
-  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
+  let logoutAuthorization: string | null = null;
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL, init?: RequestInit) => {
     fetchCount += 1;
     serverSawLocalState = values.has("iceq_privacy_settings") && deleteCount === 0;
+    if (String(input).includes("/api/auth/logout")) logoutAuthorization = new Headers(init?.headers).get("Authorization");
     if (failPanicWipe && String(input).includes("panic-wipe")) { panicDeleteCountAtCall = deleteCount; return new Response("failed", { status: 500 }); }
     return new Response(null, { status: 204 });
   } });
@@ -32,6 +34,7 @@ test("logout attempts server revocation before clearing every local account stat
   await useAuthStore.getState().logout();
 
   assert.equal(serverSawLocalState, true);
+  assert.equal(logoutAuthorization, "Bearer token");
   assert.equal(deleteCount, 1);
   assert.equal(values.has("iceq_privacy_settings"), false);
   assert.equal(values.get("iceq_logged_out"), "1");
@@ -193,11 +196,15 @@ test("logout attempts server revocation before clearing every local account stat
   // persistent retry signal; retrying local cleanup does not call panic again.
   let panicCalls = 0;
   let cleanupEvents = 0;
+  let blockedRegisterCalls = 0;
   const eventTarget = new EventTarget();
   eventTarget.addEventListener("iceq:local-cleanup-failed", () => { cleanupEvents += 1; });
   Object.defineProperty(globalThis, "window", { configurable: true, value: eventTarget });
+  let blockedLoginCalls = 0;
   Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
     if (String(input).includes("panic-wipe")) panicCalls += 1;
+    if (String(input).includes("/api/auth/login")) blockedLoginCalls += 1;
+    if (String(input).includes("/api/auth/register")) blockedRegisterCalls += 1;
     return new Response(null, { status: 204 });
   } });
   Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: { deleteDatabase() {
@@ -208,10 +215,22 @@ test("logout attempts server revocation before clearing every local account stat
   await assert.rejects(useAuthStore.getState().panicWipe());
   assert.equal(panicCalls, 1);
   assert.equal(cleanupEvents, 1);
+  await assert.rejects(useAuthStore.getState().login("must-wait", "password"), /cleanup must be retried/);
+  await assert.rejects(useAuthStore.getState().register({ username: "must-wait", password: "password", identityKey: "public" }), /cleanup must be retried/);
+  await assert.rejects(useAuthStore.getState().setSession({ uin: 30, username: "must-wait" }, "blocked", ""), /cleanup must be retried/);
+  assert.equal(blockedLoginCalls, 0);
+  assert.equal(blockedRegisterCalls, 0);
+  assert.equal(useAuthStore.getState().isAuthenticated, false);
   Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
-  const { clearAllIceQLocalData } = await import("../src/lib/localDataCleanup.ts");
-  await clearAllIceQLocalData("panic-wipe");
+  await useAuthStore.getState().retryLocalCleanup();
   assert.equal(panicCalls, 1);
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/auth/login")) return new Response(JSON.stringify({ user: { uin: 31, username: "after-retry" }, tokens: { access_token: "after-retry-token", refresh_token: "" } }), { status: 200, headers: { "Content-Type": "application/json" } });
+    return new Response(null, { status: 204 });
+  } });
+  await useAuthStore.getState().login("after-retry", "password");
+  assert.equal(useAuthStore.getState().uin, 31);
+  assert.equal(useAuthStore.getState().isAuthenticated, true);
 
   // A server-originated 4403 path performs the same synchronous demotion and
   // generation invalidation without calling the panic endpoint.

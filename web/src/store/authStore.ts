@@ -37,6 +37,7 @@ interface AuthState {
   logout: () => Promise<void>;
   panicWipe: () => Promise<void>;
   handleServerWipe: () => Promise<void>;
+  retryLocalCleanup: () => Promise<void>;
   expireSession: () => Promise<void>;
   setSession: (user: UserPublic, access: string, refresh: string) => Promise<void>;
 }
@@ -45,6 +46,8 @@ const EMPTY_AUTH = { uin: null, username: null, accessToken: null, refreshToken:
 const ATTACHMENT_REVOKE_GRACE_MS = 1_000;
 let authLifecycleGeneration = 0;
 let teardownFlight: Promise<void> | null = null;
+let cleanupRequired: CleanupReason | null = null;
+let cleanupRetryFlight: Promise<void> | null = null;
 
 function beginSessionTeardown(): void {
 	authLifecycleGeneration += 1;
@@ -91,14 +94,14 @@ function rememberAccountUin(uin: number): void {
   localStorage.setItem(ACCOUNT_UIN_KEY, String(uin));
 }
 
-async function observeLogoutBounded(): Promise<void> {
+async function observeLogoutBounded(accessToken: string | null): Promise<void> {
   await new Promise<void>((resolve) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => {
       controller.abort();
       resolve();
     }, 1_000);
-    void authApi.logout(controller.signal).catch(() => undefined).finally(() => {
+    void authApi.logout(controller.signal, accessToken).catch(() => undefined).finally(() => {
       clearTimeout(timeout);
       resolve();
     });
@@ -113,20 +116,24 @@ function reportCleanupFailure(error: unknown): void {
 
 async function waitForTeardown(): Promise<void> {
 	if (teardownFlight) await teardownFlight;
+	if (cleanupRequired) throw new Error("local cleanup must be retried before starting a new session");
 }
 
 function startSessionTeardown(reason: CleanupReason, logoutServer: boolean, set: (state: Partial<AuthState>) => void): Promise<void> {
 	if (teardownFlight) return teardownFlight;
+	const accessToken = tokenStore.accessToken;
 	beginSessionTeardown();
 	tokenStore.clear();
 	resetIceQMemory();
 	set(EMPTY_AUTH);
 	const ownerGeneration = authLifecycleGeneration;
 	teardownFlight = (async () => {
-		if (logoutServer) await observeLogoutBounded();
+		if (logoutServer) await observeLogoutBounded(accessToken);
 		try {
 			await cleanSession(reason);
+			cleanupRequired = null;
 		} catch (error) {
+			cleanupRequired = reason;
 			reportCleanupFailure(error);
 			throw error;
 		} finally {
@@ -266,6 +273,19 @@ export const useAuthStore = create<AuthState>((set) => ({
 	},
 
 	handleServerWipe: () => startSessionTeardown("panic-wipe", false, set),
+
+	retryLocalCleanup: () => {
+		if (!cleanupRequired) return Promise.resolve();
+		if (cleanupRetryFlight) return cleanupRetryFlight;
+		const reason = cleanupRequired;
+		cleanupRetryFlight = cleanSession(reason).then(() => {
+			if (cleanupRequired === reason) cleanupRequired = null;
+		}).catch((error) => {
+			reportCleanupFailure(error);
+			throw error;
+		}).finally(() => { cleanupRetryFlight = null; });
+		return cleanupRetryFlight;
+	},
 
 	expireSession: () => {
 		return startSessionTeardown("auth-expired", true, set);
