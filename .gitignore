@@ -4,6 +4,8 @@ deploy/.env.local
 web/node_modules/
 web/dist/
 web/.tmp-test-build/
+web/test-results/
+web/playwright-report/
 node_modules/
 dist/
 

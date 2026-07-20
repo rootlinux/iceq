@@ -33,7 +33,10 @@ export function Sidebar({ open, onClose }: SidebarProps): JSX.Element {
   return (
     <aside
       data-open={open ? "true" : "false"}
-      className="fixed inset-y-0 left-0 z-30 w-sidebar border-r border-border bg-surface-2 md:static md:translate-x-0"
+      className={
+        "fixed inset-y-0 left-0 z-30 w-sidebar border-r border-border bg-surface-2 transition-transform md:static md:translate-x-0 " +
+        (open ? "translate-x-0" : "-translate-x-full")
+      }
     >
       <div className="flex h-full flex-col">
         <div className="border-b border-border p-4">
