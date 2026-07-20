@@ -12,6 +12,8 @@ import { useAuthStore } from "../../store/authStore";
 import { useSignalStore } from "../../store/signalStore";
 import { ensureSignalProvisioning } from "../../lib/signalBootstrap";
 import { useI18n } from "../../i18n";
+import { InstallPrompt } from "../PWA/InstallPrompt";
+import { IOSInstallHint } from "../PWA/IOSInstallHint";
 
 interface MainLayoutProps {
   children: React.ReactNode;
@@ -140,6 +142,8 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
           </div>
         </main>
       </div>
+      <InstallPrompt />
+      <IOSInstallHint visible={selfUin !== null} />
     </div>
   );
 }
