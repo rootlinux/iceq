@@ -10,12 +10,31 @@
 //     /app/* -> /index.html so the SPA router takes over.
 //   - Production strips source maps; in dev we keep them for
 //     debugging.
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
 
+const E2E_PROBE_PATHS = new Set(["/api/e2e-cache-probe", "/ws/e2e-cache-probe"]);
+
+function e2eProbeSink(): Plugin {
+  return {
+    name: "iceq-e2e-probe-sink",
+    configureServer(server) {
+      server.middlewares.use((request, response, next) => {
+        const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+        if (request.headers["x-iceq-e2e-cache-probe"] !== "1" || !E2E_PROBE_PATHS.has(pathname)) {
+          next();
+          return;
+        }
+        response.statusCode = 204;
+        response.end();
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => ({
-  plugins: [react()],
+  plugins: [react(), ...(process.env.ICEQ_E2E === "1" ? [e2eProbeSink()] : [])],
   resolve: {
     alias: {
       "@privacyresearch/curve25519-typescript": path.resolve(

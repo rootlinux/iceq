@@ -14,6 +14,7 @@ export default defineConfig({
   },
   webServer: {
     command: "npm run dev -- --host 127.0.0.1 --port 4173",
+    env: { ICEQ_E2E: "1" },
     url: baseURL,
     reuseExistingServer: !process.env.CI,
   },

@@ -1,6 +1,8 @@
 import { expect, test } from "@playwright/test";
 import { assertNoSensitiveBody, authenticateSynthetic, installSyntheticAPI } from "./helpers";
 
+test.use({ serviceWorkers: "block" });
+
 async function expectNoHorizontalOverflow(page: import("@playwright/test").Page): Promise<void> {
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 }

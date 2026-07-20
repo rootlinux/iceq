@@ -1,60 +1,167 @@
-import { expect, type Page, type Request, type Route } from "@playwright/test";
+import { expect, type Page, type Request } from "@playwright/test";
 
-export const SYNTHETIC_USER = {
+export interface SyntheticUser {
+  uin: number;
+  username: string;
+  accessToken: string;
+  refreshToken: string;
+}
+
+export const SYNTHETIC_USER: SyntheticUser = {
   uin: 700000001,
   username: "synthetic_alice",
-  password: "synthetic-password-123",
   accessToken: "synthetic.access.token",
   refreshToken: "synthetic-refresh-token",
 };
 
 const FORBIDDEN_BODY_FIELDS = ["privateKey", "access_token", "refresh_token"] as const;
+interface BrowserNetworkEvidence {
+  apiAttempts: Array<{ path: string; method: string; body: string; handled: boolean }>;
+  websocketAttempts: Array<{ url: string; handled: boolean }>;
+  unhandled: string[];
+}
 
 export interface SyntheticNetwork {
   requestBodies: Array<{ url: string; body: string }>;
+  externalRequests: string[];
+  externalFailures: string[];
 }
 
-function json(route: Route, body: unknown, status = 200): Promise<void> {
-  return route.fulfill({
-    status,
-    contentType: "application/json",
-    body: JSON.stringify(body),
-  });
+declare global {
+  interface Window {
+    __iceqE2ENetwork: BrowserNetworkEvidence;
+    __iceqE2ENativeFetch: typeof fetch;
+  }
 }
 
-export async function installSyntheticAPI(page: Page): Promise<SyntheticNetwork> {
-  const requestBodies: SyntheticNetwork["requestBodies"] = [];
-  page.on("request", (request: Request) => {
-    if (!new URL(request.url()).pathname.startsWith("/api/")) return;
+function isProductionTraffic(request: Request): boolean {
+  const url = new URL(request.url());
+  return url.pathname === "/api" || url.pathname.startsWith("/api/") || url.pathname === "/ws" || url.pathname.startsWith("/ws/");
+}
+
+export async function installSyntheticAPI(
+  page: Page,
+  users: SyntheticUser[] = [SYNTHETIC_USER],
+): Promise<SyntheticNetwork> {
+  const network: SyntheticNetwork = { requestBodies: [], externalRequests: [], externalFailures: [] };
+  page.on("request", (request) => {
+    if (!isProductionTraffic(request)) return;
+    const path = new URL(request.url()).pathname;
+    network.externalRequests.push(`${request.method()} ${path}`);
     const body = request.postData();
-    if (body !== null) requestBodies.push({ url: request.url(), body });
+    if (body !== null) network.requestBodies.push({ url: request.url(), body });
+  });
+  page.on("requestfailed", (request) => {
+    if (isProductionTraffic(request)) network.externalFailures.push(`${request.method()} ${request.url()}`);
   });
 
-  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
-    const request = route.request();
-    const url = new URL(request.url());
-    const path = url.pathname;
+  await page.addInitScript((syntheticUsers) => {
+    const evidence: BrowserNetworkEvidence = { apiAttempts: [], websocketAttempts: [], unhandled: [] };
+    window.__iceqE2ENetwork = evidence;
+    const nativeFetch = window.fetch.bind(window);
+    window.__iceqE2ENativeFetch = nativeFetch;
 
-    if (path === "/api/auth/login" && request.method() === "POST") {
-      return json(route, {
-        user: { uin: SYNTHETIC_USER.uin, username: SYNTHETIC_USER.username },
-        tokens: {
-          access_token: SYNTHETIC_USER.accessToken,
-          refresh_token: SYNTHETIC_USER.refreshToken,
-        },
-      });
+    const respondJSON = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = new Request(input, init);
+      const url = new URL(request.url, window.location.href);
+      const isAPI = url.pathname === "/api" || url.pathname.startsWith("/api/");
+      const isWS = url.pathname === "/ws" || url.pathname.startsWith("/ws/");
+      if (!isAPI && !isWS) return nativeFetch(input, init);
+
+      const body = request.method === "GET" || request.method === "HEAD" ? "" : await request.clone().text();
+      const attempt = { path: url.pathname, method: request.method, body, handled: true };
+      evidence.apiAttempts.push(attempt);
+
+      if (isWS) {
+        attempt.handled = false;
+        evidence.unhandled.push(`${request.method} ${url.pathname}`);
+        return respondJSON({ error: "unhandled synthetic WebSocket HTTP route" }, 599);
+      }
+
+      if (url.pathname === "/api/auth/login" && request.method === "POST") {
+        const username = (JSON.parse(body || "{}") as { username?: string }).username;
+        const user = syntheticUsers.find((candidate) => candidate.username === username) ?? syntheticUsers[0];
+        return respondJSON({
+          user: { uin: user.uin, username: user.username },
+          tokens: { access_token: user.accessToken, refresh_token: user.refreshToken },
+        });
+      }
+      if (url.pathname === "/api/auth/refresh") return respondJSON({ error: "no synthetic session" }, 401);
+      if (url.pathname === "/api/auth/me") {
+        const remembered = Number(localStorage.getItem("iceq_account_uin"));
+        const user = syntheticUsers.find((candidate) => candidate.uin === remembered) ?? syntheticUsers[0];
+        return respondJSON({ uin: user.uin, username: user.username });
+      }
+      if (url.pathname === "/api/auth/logout") return respondJSON({});
+      if (url.pathname === "/api/contacts/" && request.method === "GET") return respondJSON({ contacts: [] });
+      if (url.pathname === "/api/groups/" && request.method === "GET") return respondJSON({ groups: [] });
+      if (/^\/api\/keys\/bundle\/\d+$/.test(url.pathname) && request.method === "GET") {
+        return respondJSON({ error: "no synthetic key bundle" }, 404);
+      }
+      if (url.pathname === "/api/keys/bundle" && request.method === "POST") return respondJSON({});
+      if (url.pathname === "/api/keys/prekeys/count" && request.method === "GET") return respondJSON({ count: 20 });
+      if (url.pathname === "/api/transport/poll" && request.method === "GET") {
+        return new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+        });
+      }
+
+      attempt.handled = false;
+      evidence.unhandled.push(`${request.method} ${url.pathname}`);
+      return respondJSON({ error: "unhandled synthetic route" }, 599);
+    };
+
+    class SyntheticWebSocket extends EventTarget {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      readonly CONNECTING = 0;
+      readonly OPEN = 1;
+      readonly CLOSING = 2;
+      readonly CLOSED = 3;
+      readonly url: string;
+      readonly protocol = "";
+      readonly extensions = "";
+      readonly bufferedAmount = 0;
+      readonly binaryType = "blob";
+      readyState = SyntheticWebSocket.CONNECTING;
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(url: string | URL) {
+        super();
+        this.url = String(url);
+        const target = new URL(this.url, window.location.href);
+        const sameOrigin = target.origin === window.location.origin.replace(/^http/, "ws");
+        const viteHMR = sameOrigin && target.pathname === "/" && target.searchParams.has("token");
+        if (viteHMR) return;
+        const handled = sameOrigin && target.pathname === "/ws";
+        evidence.websocketAttempts.push({ url: this.url, handled });
+        if (!handled) evidence.unhandled.push(`WEBSOCKET ${target.href}`);
+      }
+
+      send(): void { /* the synthetic socket intentionally never opens */ }
+      close(code = 1000, reason = "synthetic close"): void {
+        if (this.readyState === SyntheticWebSocket.CLOSED) return;
+        this.readyState = SyntheticWebSocket.CLOSED;
+        const event = new CloseEvent("close", { code, reason, wasClean: true });
+        this.onclose?.(event);
+        this.dispatchEvent(event);
+      }
     }
-    if (path === "/api/auth/refresh") return json(route, { error: "no synthetic session" }, 401);
-    if (path === "/api/auth/me") return json(route, { uin: SYNTHETIC_USER.uin, username: SYNTHETIC_USER.username });
-    if (path === "/api/auth/logout") return json(route, {});
-    if (path === "/api/contacts/") return json(route, { contacts: [] });
-    if (path === "/api/groups/") return json(route, { groups: [] });
-    if (path === `/api/keys/bundle/${SYNTHETIC_USER.uin}`) return json(route, { error: "no synthetic key bundle" }, 404);
-    if (path === "/api/keys/prekeys/count") return json(route, { count: 20 });
-    if (path === "/api/messages/poll") return json(route, { envelopes: [], cursor: null });
-    return json(route, { error: "unhandled synthetic route" }, 404);
-  });
-  return { requestBodies };
+
+    Object.defineProperty(window, "WebSocket", { configurable: true, writable: true, value: SyntheticWebSocket });
+  }, users);
+
+  return network;
 }
 
 export async function authenticateSynthetic(page: Page): Promise<SyntheticNetwork> {
@@ -73,16 +180,50 @@ export async function authenticateSynthetic(page: Page): Promise<SyntheticNetwor
   return network;
 }
 
+export async function assertHermeticNetwork(page: Page, network: SyntheticNetwork): Promise<void> {
+  const evidence = await page.evaluate(() => window.__iceqE2ENetwork);
+  expect(evidence.unhandled, "every production API attempt must match the synthetic allowlist").toEqual([]);
+  expect(evidence.apiAttempts.length, "the app must exercise the synthetic API boundary").toBeGreaterThan(0);
+  expect(evidence.apiAttempts.every((attempt) => attempt.handled)).toBe(true);
+  expect(evidence.websocketAttempts.every((attempt) => attempt.handled)).toBe(true);
+  expect(
+    network.externalFailures.filter((entry) => !["/api/e2e-cache-probe", "/ws/e2e-cache-probe"].some((path) => entry.endsWith(path))),
+    "no non-probe production API or WebSocket request may fail outside the harness",
+  ).toEqual([]);
+  expect(
+    network.externalRequests.filter((entry) => !["GET /api/e2e-cache-probe", "GET /ws/e2e-cache-probe"].includes(entry)),
+    "only explicit cache probes may reach the e2e loopback sink",
+  ).toEqual([]);
+}
+
+export async function nativeCacheProbe(page: Page, paths: string[]): Promise<number[]> {
+  return page.evaluate(async (probePaths) => Promise.all(probePaths.map(async (path) => {
+    try {
+      const response = await window.__iceqE2ENativeFetch(path, { headers: { "X-IceQ-E2E-Cache-Probe": "1" } });
+      return response.status;
+    } catch {
+      return 0;
+    }
+  })), paths);
+}
+
 export async function assertNoSensitiveBody(page: Page, network?: SyntheticNetwork): Promise<void> {
   const html = await page.locator("body").evaluate((body) => body.innerHTML);
+  const evidence = await page.evaluate(() => window.__iceqE2ENetwork);
   for (const field of FORBIDDEN_BODY_FIELDS) {
     expect(html, `rendered body must not expose ${field}`).not.toContain(field);
+  }
+  for (const request of evidence.apiAttempts) {
+    for (const field of FORBIDDEN_BODY_FIELDS) {
+      expect(request.body, `${request.method} ${request.path} body must not contain ${field}`).not.toContain(field);
+    }
   }
   for (const request of network?.requestBodies ?? []) {
     for (const field of FORBIDDEN_BODY_FIELDS) {
       expect(request.body, `${request.url} request body must not contain ${field}`).not.toContain(field);
     }
   }
+  if (network) await assertHermeticNetwork(page, network);
 }
 
 export async function dispatchInstallPrompt(

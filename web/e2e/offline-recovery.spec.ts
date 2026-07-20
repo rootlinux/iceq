@@ -1,12 +1,18 @@
 import { expect, test } from "@playwright/test";
-import { assertNoSensitiveBody, authenticateSynthetic } from "./helpers";
+import { assertNoSensitiveBody, authenticateSynthetic, nativeCacheProbe } from "./helpers";
 
 test("service worker registers and runtime caches exclude authenticated routes", async ({ page }) => {
   const network = await authenticateSynthetic(page);
+  const probePaths = ["/api/e2e-cache-probe", "/ws/e2e-cache-probe", "/login", "/app"];
   await page.evaluate(async () => {
     await navigator.serviceWorker.ready;
-    await fetch("/api/cache-sentinel").catch(() => undefined);
+    await new Promise<void>((resolve) => {
+      if (navigator.serviceWorker.controller) return resolve();
+      navigator.serviceWorker.addEventListener("controllerchange", () => resolve(), { once: true });
+    });
   });
+  const statuses = await nativeCacheProbe(page, probePaths);
+  expect(statuses).toEqual([204, 204, 200, 200]);
   const evidence = await page.evaluate(async () => {
     const registration = await navigator.serviceWorker.getRegistration("/");
     const cacheNames = await caches.keys();
@@ -18,6 +24,9 @@ test("service worker registers and runtime caches exclude authenticated routes",
   });
   expect(evidence.scope).toBe("http://127.0.0.1:4173/");
   expect(evidence.cacheNames).toContain("iceq-static-v3");
+  for (const path of probePaths) {
+    expect(evidence.cachedURLs).not.toContain(`http://127.0.0.1:4173${path}`);
+  }
   for (const url of evidence.cachedURLs) {
     const path = new URL(url).pathname;
     expect(path).not.toMatch(/^\/(?:api|ws)(?:\/|$)/);

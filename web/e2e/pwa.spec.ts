@@ -1,6 +1,8 @@
 import { expect, test } from "@playwright/test";
 import { assertNoSensitiveBody, authenticateSynthetic, dispatchInstallPrompt } from "./helpers";
 
+test.use({ serviceWorkers: "block" });
+
 test("install UI follows the project capability and clears after action", async ({ page }, testInfo) => {
   const network = await authenticateSynthetic(page);
   if (testInfo.project.name === "webkit-ios") {

@@ -1,49 +1,79 @@
 import { expect, test } from "@playwright/test";
 import { assertNoSensitiveBody, installSyntheticAPI } from "./helpers";
 
-const ACCOUNT_A = { uin: 700000011, deviceId: "synthetic_device_A_0001" };
-const ACCOUNT_B = { uin: 700000022, deviceId: "synthetic_device_B_0002" };
+test.use({ serviceWorkers: "block" });
 
-test("production IndexedDB boundary keeps two account-device namespaces isolated across reload", async ({ page }) => {
-  const network = await installSyntheticAPI(page);
+const ACCOUNT_A = {
+  uin: 700000011,
+  username: "synthetic_account_a",
+  accessToken: "synthetic.account.a",
+  refreshToken: "synthetic-refresh-a",
+};
+const ACCOUNT_B = {
+  uin: 700000022,
+  username: "synthetic_account_b",
+  accessToken: "synthetic.account.b",
+  refreshToken: "synthetic-refresh-b",
+};
+
+test("auth account change deletes prior IndexedDB identity before the next session survives reload", async ({ page }) => {
+  const network = await installSyntheticAPI(page, [ACCOUNT_A, ACCOUNT_B]);
   await page.goto("/login");
 
-  const seeded = await page.evaluate(async ({ accountA, accountB }) => {
+  const switched = await page.evaluate(async ({ accountA, accountB }) => {
+    const { useAuthStore } = await import("/src/store/authStore.ts");
     const idb = await import("/src/lib/indexeddb.ts");
     await idb.clearAll();
-    await idb.saveIdentity(accountA, { publicKey: "public-A", privateKey: "private-A", registrationId: 101 });
-    await idb.saveIdentity(accountB, { publicKey: "public-B", privateKey: "private-B", registrationId: 202 });
-    idb.setActiveCryptoNamespace(accountA);
-    const activeA = idb.getActiveCryptoNamespace();
-    idb.setActiveCryptoNamespace(accountB);
-    const activeB = idb.getActiveCryptoNamespace();
+
+    await useAuthStore.getState().setSession(
+      { uin: accountA.uin, username: accountA.username },
+      accountA.accessToken,
+      accountA.refreshToken,
+    );
+    const deviceId = await idb.loadOrCreateDeviceId();
+    const namespaceA = { uin: accountA.uin, deviceId };
+    await idb.saveIdentity(namespaceA, { publicKey: "public-A", privateKey: "private-A", registrationId: 101 });
+
+    await useAuthStore.getState().setSession(
+      { uin: accountB.uin, username: accountB.username },
+      accountB.accessToken,
+      accountB.refreshToken,
+    );
+    const namespaceB = { uin: accountB.uin, deviceId: await idb.loadOrCreateDeviceId() };
+    await idb.saveIdentity(namespaceB, { publicKey: "public-B", privateKey: "private-B", registrationId: 202 });
+    idb.setActiveCryptoNamespace(namespaceB);
+
     return {
-      a: await idb.loadIdentity(accountA),
-      b: await idb.loadIdentity(accountB),
-      activeA,
-      activeB,
+      namespaceA,
+      namespaceB,
+      priorIdentity: await idb.loadIdentity(namespaceA),
+      currentIdentity: await idb.loadIdentity(namespaceB),
+      mixedIdentity: await idb.loadIdentity({ uin: accountA.uin, deviceId: `${namespaceB.deviceId}_mixed` }),
     };
   }, { accountA: ACCOUNT_A, accountB: ACCOUNT_B });
-  expect(seeded.a?.publicKey).toBe("public-A");
-  expect(seeded.b?.publicKey).toBe("public-B");
-  expect(seeded.activeA).toEqual(ACCOUNT_A);
-  expect(seeded.activeB).toEqual(ACCOUNT_B);
+
+  expect(switched.priorIdentity).toBeNull();
+  expect(switched.currentIdentity?.publicKey).toBe("public-B");
+  expect(switched.currentIdentity?.privateKey).toBe("private-B");
+  expect(switched.mixedIdentity).toBeNull();
 
   await page.reload();
-  const reloaded = await page.evaluate(async ({ accountA, accountB }) => {
+  await expect(page.getByText(ACCOUNT_B.username, { exact: false })).toBeVisible();
+  const reloaded = await page.evaluate(async ({ namespaceA, namespaceB }) => {
     const idb = await import("/src/lib/indexeddb.ts");
-    idb.setActiveCryptoNamespace(accountB);
+    idb.setActiveCryptoNamespace(namespaceB);
     return {
-      selected: await idb.loadIdentity(idb.getActiveCryptoNamespace()),
-      other: await idb.loadIdentity(accountA),
-      missing: await idb.loadIdentity({ ...accountA, deviceId: accountB.deviceId }),
+      active: idb.getActiveCryptoNamespace(),
+      currentIdentity: await idb.loadIdentity(namespaceB),
+      priorIdentity: await idb.loadIdentity(namespaceA),
       localStorageValues: Object.values(localStorage),
     };
-  }, { accountA: ACCOUNT_A, accountB: ACCOUNT_B });
-  expect(reloaded.selected?.publicKey).toBe("public-B");
-  expect(reloaded.selected?.privateKey).toBe("private-B");
-  expect(reloaded.other?.publicKey).toBe("public-A");
-  expect(reloaded.missing).toBeNull();
+  }, { namespaceA: switched.namespaceA, namespaceB: switched.namespaceB });
+
+  expect(reloaded.active).toEqual(switched.namespaceB);
+  expect(reloaded.currentIdentity?.publicKey).toBe("public-B");
+  expect(reloaded.currentIdentity?.privateKey).toBe("private-B");
+  expect(reloaded.priorIdentity).toBeNull();
   expect(reloaded.localStorageValues.join(" ")).not.toContain("private-A");
   expect(reloaded.localStorageValues.join(" ")).not.toContain("private-B");
   await assertNoSensitiveBody(page, network);
