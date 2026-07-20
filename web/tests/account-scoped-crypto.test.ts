@@ -12,6 +12,8 @@ import {
   putGroupCryptoRecord,
   getGroupCryptoRecord,
   loadOrCreateDeviceId,
+  getActiveCryptoNamespace,
+  resetIndexedDBRuntime,
   reserveNextPreKeyIds,
   createRegistrationCryptoNamespace,
   commitCryptoNamespace,
@@ -113,6 +115,87 @@ test("device id creation and OPK reservations are atomic under concurrency",asyn
   const ns={uin:303,deviceId:ids[0]!};const reservations=await Promise.all([reserveNextPreKeyIds(ns,5,22),reserveNextPreKeyIds(ns,7,22),reserveNextPreKeyIds(ns,3,22)]);
   const ranges=reservations.map((start,index)=>[start,start+[5,7,3][index]!] as const).sort((x,y)=>x[0]-y[0]);
   for(let i=1;i<ranges.length;i++)assert.ok(ranges[i]![0]>=ranges[i-1]![1]);
+});
+
+test("runtime reset invalidates an old device-id flight without clearing the fresh flight", async () => {
+  const sharedIndexedDB = globalThis.indexedDB;
+  let releaseOldOpen!: () => void;
+  let openCount = 0;
+  let deleteCount = 0;
+  let oldClosed = false;
+  let freshClosed = false;
+  let persistedDeviceId = "";
+
+  const database = (markClosed: () => void): IDBDatabase => ({
+    close: markClosed,
+    transaction: () => {
+      const transaction: Partial<IDBTransaction> = { onabort: null, oncomplete: null, onerror: null };
+      const request: Partial<IDBRequest> = { onerror: null, onsuccess: null };
+      Object.defineProperty(request, "result", { get: () => persistedDeviceId || undefined });
+      const store = {
+        get: () => {
+          queueMicrotask(() => {
+            request.onsuccess?.call(request as IDBRequest, new Event("success"));
+            queueMicrotask(() => transaction.oncomplete?.call(transaction as IDBTransaction, new Event("complete")));
+          });
+          return request as IDBRequest;
+        },
+        put: (value: string) => { persistedDeviceId = value; },
+      };
+      transaction.objectStore = () => store as unknown as IDBObjectStore;
+      transaction.abort = () => queueMicrotask(() => transaction.onabort?.call(transaction as IDBTransaction, new Event("abort")));
+      return transaction as IDBTransaction;
+    },
+  } as unknown as IDBDatabase);
+
+  const fakeIndexedDB = {
+    open: () => {
+      openCount += 1;
+      const request: Partial<IDBOpenDBRequest> = { onerror: null, onsuccess: null, onupgradeneeded: null };
+      const db = openCount === 1
+        ? database(() => { oldClosed = true; })
+        : database(() => { freshClosed = true; });
+      Object.defineProperty(request, "result", { get: () => db });
+      if (openCount === 1) releaseOldOpen = () => queueMicrotask(() => request.onsuccess?.call(request as IDBOpenDBRequest, new Event("success")));
+      else queueMicrotask(() => request.onsuccess?.call(request as IDBOpenDBRequest, new Event("success")));
+      return request as IDBOpenDBRequest;
+    },
+    deleteDatabase: () => {
+      deleteCount += 1;
+      const request: Partial<IDBOpenDBRequest> = { onerror: null, onsuccess: null };
+      queueMicrotask(() => request.onsuccess?.call(request as IDBOpenDBRequest, new Event("success")));
+      return request as IDBOpenDBRequest;
+    },
+  } as unknown as IDBFactory;
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: fakeIndexedDB });
+
+  try {
+    resetIndexedDBRuntime();
+    setActiveCryptoNamespace(a);
+    const oldOutcome = loadOrCreateDeviceId().then(
+      (value) => ({ status: "resolved" as const, value }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+    resetIndexedDBRuntime();
+    assert.throws(() => getActiveCryptoNamespace(), /not initialized/);
+
+    const freshFlight = loadOrCreateDeviceId();
+    const freshId = await freshFlight;
+    releaseOldOpen();
+
+    const old = await oldOutcome;
+    assert.equal(old.status, "rejected");
+    assert.match(String("error" in old ? old.error : ""), /runtime reset during device id initialization/i);
+    assert.strictEqual(loadOrCreateDeviceId(), freshFlight, "the old rejection must not clear the fresh cached flight");
+    assert.equal(await loadOrCreateDeviceId(), freshId, "the stale flight must not restore another device id");
+    assert.equal(oldClosed, true, "the invalidated flight must close its database handle");
+    assert.equal(freshClosed, true, "the fresh flight must close its database handle");
+    await clearAll();
+    assert.equal(deleteCount, 1, "cleanup deletion must finish after both flight handles close");
+  } finally {
+    resetIndexedDBRuntime();
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: sharedIndexedDB });
+  }
 });
 
 test("registration staging never writes unscoped or stale-account private material",async()=>{

@@ -100,15 +100,47 @@ export async function commitCryptoNamespace(from:CryptoNamespace,to:CryptoNamesp
   try{await Promise.all(stores.map(name=>new Promise<void>((resolve,reject)=>{const store=tx.objectStore(name);const req=store.openCursor();req.onsuccess=()=>{const cursor=req.result;if(!cursor)return resolve();const key=String(cursor.key);if(!key.startsWith(prefix)){cursor.continue();return;}const next=`${CRYPTO_KEY_VERSION}:${to.uin}:${to.deviceId}:${key.slice(prefix.length)}`;const collision=store.get(next);collision.onerror=()=>reject(collision.error);collision.onsuccess=()=>{if(collision.result!==undefined){tx.abort();reject(new Error("crypto namespace destination collision"));return;}const value=cursor.value as Record<string,unknown>;if(name===STORE_PREKEYS||name===STORE_SIGNED_PREKEYS)store.put({...value,id:next});else store.put(value,next);cursor.delete();cursor.continue();};};req.onerror=()=>reject(req.error);})));await done;}catch(error){try{tx.abort();}catch{/* already complete */}await done.catch(()=>undefined);throw error;}finally{db.close();}
 }
 
+let indexedDBRuntimeGeneration = 0;
 let deviceIdFlight: Promise<string>|null=null;
+const DEVICE_ID_RUNTIME_RESET_ERROR = "IndexedDB runtime reset during device ID initialization";
+
 export function resetIndexedDBRuntime(): void {
+  indexedDBRuntimeGeneration += 1;
   deviceIdFlight = null;
   activeCryptoNamespace = null;
 }
 
 export function loadOrCreateDeviceId(): Promise<string> {
   if(deviceIdFlight)return deviceIdFlight;
-  deviceIdFlight=(async()=>{const db=await openDB();try{return await new Promise<string>((resolve,reject)=>{const tx=db.transaction(STORE_METADATA,"readwrite");const store=tx.objectStore(STORE_METADATA);const get=store.get(DEVICE_ID_KEY);let value="";get.onsuccess=()=>{if(typeof get.result==="string"&&get.result){value=get.result;return;}const bytes=new Uint8Array(24);globalThis.crypto.getRandomValues(bytes);let binary="";for(const byte of bytes)binary+=String.fromCharCode(byte);value=btoa(binary).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");store.put(value,DEVICE_ID_KEY);};tx.oncomplete=()=>resolve(value);tx.onerror=()=>reject(tx.error??new Error("device id transaction failed"));tx.onabort=()=>reject(tx.error??new Error("device id transaction aborted"));});}finally{db.close();}})().catch(error=>{deviceIdFlight=null;throw error;});return deviceIdFlight;
+  const generation = indexedDBRuntimeGeneration;
+  const resetError = (): Error => new Error(DEVICE_ID_RUNTIME_RESET_ERROR);
+  const operation = (async()=>{
+    const db=await openDB();
+    try {
+      if(generation!==indexedDBRuntimeGeneration)throw resetError();
+      return await new Promise<string>((resolve,reject)=>{
+        const tx=db.transaction(STORE_METADATA,"readwrite");
+        const store=tx.objectStore(STORE_METADATA);
+        const get=store.get(DEVICE_ID_KEY);
+        let value="";
+        get.onsuccess=()=>{
+          if(generation!==indexedDBRuntimeGeneration){try{tx.abort();}catch{/* already settled */}return;}
+          if(typeof get.result==="string"&&get.result){value=get.result;return;}
+          const bytes=new Uint8Array(24);globalThis.crypto.getRandomValues(bytes);let binary="";
+          for(const byte of bytes)binary+=String.fromCharCode(byte);
+          value=btoa(binary).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+          store.put(value,DEVICE_ID_KEY);
+        };
+        tx.oncomplete=()=>generation===indexedDBRuntimeGeneration?resolve(value):reject(resetError());
+        tx.onerror=()=>reject(generation===indexedDBRuntimeGeneration?(tx.error??new Error("device id transaction failed")):resetError());
+        tx.onabort=()=>reject(generation===indexedDBRuntimeGeneration?(tx.error??new Error("device id transaction aborted")):resetError());
+      });
+    } finally { db.close(); }
+  })();
+  let flight: Promise<string>;
+  flight=operation.catch(error=>{if(deviceIdFlight===flight)deviceIdFlight=null;throw error;});
+  deviceIdFlight=flight;
+  return flight;
 }
 
 export async function loadPendingRegistration<T>(): Promise<T | null> {

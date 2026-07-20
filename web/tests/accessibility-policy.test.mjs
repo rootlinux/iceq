@@ -33,6 +33,16 @@ test("closed mobile sidebar is translated offscreen and cannot cover the menu tr
   assert.match(layout, /sidebarToggleRef\.current\?\.focus\(\)/);
 });
 
+test("mobile menu toggle owns the drawer and opening naturally focuses its close control", () => {
+  const sidebar = read("src/components/Layout/Sidebar.tsx");
+  const layout = read("src/components/Layout/MainLayout.tsx");
+  assert.match(sidebar, /id="primary-navigation-drawer"/);
+  assert.match(layout, /aria-controls="primary-navigation-drawer"/);
+  assert.match(layout, /aria-expanded=\{sidebarOpen\}/);
+  assert.match(sidebar, /closeButtonRef/);
+  assert.match(sidebar, /closeButtonRef\.current\?\.focus\(\)/);
+});
+
 test("dialog keyboard helper wraps Tab in both directions", () => {
   const first = { focusCalls: 0, focus() { this.focusCalls += 1; } };
   const last = { focusCalls: 0, focus() { this.focusCalls += 1; } };

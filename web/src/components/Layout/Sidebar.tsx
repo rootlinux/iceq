@@ -18,16 +18,18 @@ import { useI18n } from "../../i18n";
 interface SidebarProps {
   open: boolean;
   hiddenFromNavigation: boolean;
+  focusCloseOnOpen: boolean;
   onClose: () => void;
 }
 
-export function Sidebar({ open, hiddenFromNavigation, onClose }: SidebarProps): JSX.Element {
+export function Sidebar({ open, hiddenFromNavigation, focusCloseOnOpen, onClose }: SidebarProps): JSX.Element {
   const username = useAuthStore((s) => s.username);
   const uin = useAuthStore((s) => s.uin);
   const logout = useAuthStore((s) => s.logout);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const i18n = useI18n();
   const sidebarRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
   const settingsDialogRef = useDialogFocus(settingsOpen, closeSettings, settingsTriggerRef);
@@ -37,8 +39,15 @@ export function Sidebar({ open, hiddenFromNavigation, onClose }: SidebarProps): 
     else sidebarRef.current?.removeAttribute("inert");
   }, [hiddenFromNavigation]);
 
+  useEffect(() => {
+    if (!focusCloseOnOpen) return;
+    const frame = requestAnimationFrame(() => closeButtonRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [focusCloseOnOpen]);
+
   return (
     <aside
+      id="primary-navigation-drawer"
       ref={sidebarRef}
       data-open={open ? "true" : "false"}
       aria-hidden={hiddenFromNavigation ? "true" : undefined}
@@ -59,6 +68,7 @@ export function Sidebar({ open, hiddenFromNavigation, onClose }: SidebarProps): 
             </div>
             <button
               type="button"
+              ref={closeButtonRef}
               aria-label={i18n.t("nav.closeMenu")}
               className="md:hidden iceq-btn-secondary"
               onClick={onClose}

@@ -41,6 +41,8 @@ test("authenticated navigation, settings focus, and mobile menu are keyboard saf
     await expect(sidebar).toHaveAttribute("data-open", "false");
     await expect(sidebar).toHaveAttribute("aria-hidden", "true");
     expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(true);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).toHaveAttribute("aria-controls", "primary-navigation-drawer");
     await toggle.focus();
     for (let index = 0; index < 8; index += 1) {
       await page.keyboard.press("Tab");
@@ -48,12 +50,12 @@ test("authenticated navigation, settings focus, and mobile menu are keyboard saf
     }
     await toggle.click();
     await expect(sidebar).toHaveAttribute("data-open", "true");
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
     await expect(sidebar).not.toHaveAttribute("aria-hidden");
     expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(false);
     const closeMenu = page.getByRole("button", { name: "Close menu" });
-    await closeMenu.focus();
-    expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(true);
     await expect(closeMenu).toBeFocused();
+    expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(true);
     await page.keyboard.press("Enter");
     await expect(sidebar).toHaveAttribute("data-open", "false");
     await expect(toggle).toBeFocused();

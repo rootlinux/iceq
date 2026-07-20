@@ -125,6 +125,7 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
         <Sidebar
           open={sidebarOpen}
           hiddenFromNavigation={mobileViewport && !sidebarOpen}
+          focusCloseOnOpen={mobileViewport && sidebarOpen}
           onClose={closeSidebar}
         />
         <main className="relative flex flex-1 flex-col bg-surface">
@@ -135,6 +136,8 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
               className="iceq-btn-secondary md:hidden"
               onClick={() => sidebarOpen ? closeSidebar() : setSidebarOpen(true)}
               aria-label={i18n.t("nav.toggleMenu")}
+              aria-expanded={sidebarOpen}
+              aria-controls="primary-navigation-drawer"
             >
               ☰
             </button>
