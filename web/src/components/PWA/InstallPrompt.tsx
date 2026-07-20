@@ -6,6 +6,17 @@ import { useEffect, useState } from "react";
 import { useI18n } from "../../i18n";
 import { installPromptLifecycle, type BeforeInstallPromptEvent } from "../../lib/installPromptLifecycle";
 
+export async function handleInstallPrompt(
+  prompt: () => Promise<unknown>,
+  report: (message: string) => void = (message) => console.warn(message),
+): Promise<void> {
+  try {
+    await prompt();
+  } catch {
+    report("PWA install prompt failed");
+  }
+}
+
 export function InstallPrompt(): JSX.Element | null {
   const i18n = useI18n();
   const [deferredPrompt, setDeferredPrompt] =
@@ -17,8 +28,8 @@ export function InstallPrompt(): JSX.Element | null {
 
   if (!deferredPrompt) return null;
 
-  const handleInstall = async (): Promise<void> => {
-    await installPromptLifecycle.prompt();
+  const handleInstall = (): void => {
+    void handleInstallPrompt(() => installPromptLifecycle.prompt());
   };
 
   const handleDismiss = (): void => {
