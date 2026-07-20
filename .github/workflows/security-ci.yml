@@ -61,9 +61,12 @@ jobs:
       - name: Build web
         working-directory: web
         run: npm run build
-      - name: Audit high-risk dependencies
+      - name: Audit all dependencies
         working-directory: web
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=moderate
+      - name: Audit production dependencies
+        working-directory: web
+        run: npm audit --audit-level=moderate --omit=dev
 
   configuration:
     name: Compose and secret validation
@@ -79,6 +82,8 @@ jobs:
           ./deploy/scripts/check-security-ci.test.sh
           ./deploy/scripts/check-compose-config.test.sh
           ./deploy/scripts/check-edge-identity.test.sh
+          ./deploy/scripts/check-clearnet-compose-command.test.sh
+          ./deploy/scripts/check-clearnet-compose.sh
       - name: Scan repository for secrets
         env:
           GITLEAKS_VERSION: 8.24.3
