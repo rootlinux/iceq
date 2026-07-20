@@ -4,7 +4,7 @@
 // the children (the chat window) fill the remaining area.
 // On mobile, the sidebar slides over the chat when open.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Sidebar } from "./Sidebar";
 import { useMessageTransport } from "../../hooks/useMessageTransport";
 import { useOnlineStatus } from "../../hooks/useOnlineStatus";
@@ -26,6 +26,8 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
   // call the hook directly.
   const { connected, send } = useMessageTransport();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [mobileViewport, setMobileViewport] = useState(() => window.matchMedia("(max-width: 767px)").matches);
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null);
   const { isOnline } = useOnlineStatus();
   const selfUin = useAuthStore((s) => s.uin);
   const setSignalReady = useSignalStore((s) => s.setReady);
@@ -34,14 +36,24 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
   const signalError = useSignalStore((s) => s.lastError);
   const i18n = useI18n();
 
-  // Close the sidebar on viewport widening so it doesn't
-  // stay slid in when the user rotates their phone.
+  const closeSidebar = useCallback((): void => {
+    setSidebarOpen(false);
+    if (mobileViewport) {
+      requestAnimationFrame(() => sidebarToggleRef.current?.focus());
+    }
+  }, [mobileViewport]);
+
+  // Keep the accessibility state aligned with the CSS breakpoint, and close
+  // the drawer on widening so it cannot stay open after device rotation.
   useEffect(() => {
-    const onResize = (): void => {
-      if (window.innerWidth >= 768) setSidebarOpen(false);
+    const media = window.matchMedia("(max-width: 767px)");
+    const onChange = (): void => {
+      setMobileViewport(media.matches);
+      if (!media.matches) setSidebarOpen(false);
     };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    onChange();
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
   }, []);
 
   useEffect(() => {
@@ -110,13 +122,18 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
         </div>
       )}
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+        <Sidebar
+          open={sidebarOpen}
+          hiddenFromNavigation={mobileViewport && !sidebarOpen}
+          onClose={closeSidebar}
+        />
         <main className="relative flex flex-1 flex-col bg-surface">
           <header className="flex h-12 items-center justify-between border-b border-border px-4">
             <button
               type="button"
+              ref={sidebarToggleRef}
               className="iceq-btn-secondary md:hidden"
-              onClick={() => setSidebarOpen((s) => !s)}
+              onClick={() => sidebarOpen ? closeSidebar() : setSidebarOpen(true)}
               aria-label={i18n.t("nav.toggleMenu")}
             >
               ☰

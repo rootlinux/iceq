@@ -63,14 +63,15 @@ test("iOS projects show manual install guidance and other projects do not", asyn
   await assertNoSensitiveBody(page, network);
 });
 
-test("standalone display mode suppresses synthetic install UI", async ({ page }) => {
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, "standalone", { configurable: true, value: true });
+test("platform-specific standalone signal independently suppresses install UI", async ({ page }, testInfo) => {
+  const iosStandalone = testInfo.project.name === "webkit-ios";
+  await page.addInitScript((useNavigatorStandalone) => {
+    Object.defineProperty(navigator, "standalone", { configurable: true, value: useNavigatorStandalone });
     const original = window.matchMedia.bind(window);
     window.matchMedia = (query: string): MediaQueryList => {
       if (query === "(display-mode: standalone)") {
         return {
-          matches: true,
+          matches: !useNavigatorStandalone,
           media: query,
           onchange: null,
           addListener: () => undefined,
@@ -82,8 +83,15 @@ test("standalone display mode suppresses synthetic install UI", async ({ page })
       }
       return original(query);
     };
-  });
+  }, iosStandalone);
   const network = await authenticateSynthetic(page);
+  const standaloneSignals = await page.evaluate(() => ({
+    navigator: Boolean((navigator as Navigator & { standalone?: boolean }).standalone),
+    media: window.matchMedia("(display-mode: standalone)").matches,
+  }));
+  expect(standaloneSignals).toEqual(iosStandalone
+    ? { navigator: true, media: false }
+    : { navigator: false, media: true });
   await dispatchInstallPrompt(page);
   await expect(page.getByRole("button", { name: "Install", exact: true })).toBeHidden();
   await expect(page.getByRole("dialog", { name: "Install IceQ" })).toBeHidden();

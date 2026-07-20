@@ -8,7 +8,7 @@ import {
   trackObjectURL,
   untrackObjectURL,
 } from "../src/lib/localDataCleanup.ts";
-import { ICEQ_INDEXEDDB_NAME } from "../src/lib/indexeddb.ts";
+import { ICEQ_INDEXEDDB_NAME, getActiveCryptoNamespace, setActiveCryptoNamespace } from "../src/lib/indexeddb.ts";
 
 function storage(values: Record<string, string>) {
   const entries = new Map(Object.entries(values));
@@ -60,8 +60,10 @@ test("clears every IceQ-owned browser and registered in-memory state without tou
   } } } });
 
   const unregister = registerMemoryReset(() => { resets += 1; });
+  setActiveCryptoNamespace({ uin: 101, deviceId: "cleanup_device_0001" });
   trackObjectURL("blob:iceq-secret");
   await clearAllIceQLocalData("logout");
+  assert.throws(() => getActiveCryptoNamespace(), /not initialized/);
   await clearAllIceQLocalData("logout");
   unregister();
 

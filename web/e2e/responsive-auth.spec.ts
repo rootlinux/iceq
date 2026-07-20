@@ -25,6 +25,8 @@ test("login and register remain usable without horizontal overflow", async ({ pa
 
 test("authenticated navigation, settings focus, and mobile menu are keyboard safe", async ({ page }, testInfo) => {
   const network = await authenticateSynthetic(page);
+  await expect.poll(() => page.evaluate(async () => (await import("/src/store/signalStore.ts")).useSignalStore.getState().ready)).toBe(true);
+  await expect(page.getByRole("alert")).toHaveCount(0);
   const mobile = testInfo.project.name.endsWith("android") || testInfo.project.name.endsWith("ios");
   if (testInfo.project.name === "webkit-ios") {
     const hint = page.getByRole("dialog", { name: "Install IceQ" });
@@ -37,11 +39,36 @@ test("authenticated navigation, settings focus, and mobile menu are keyboard saf
   if (mobile) {
     await expect(toggle).toBeVisible();
     await expect(sidebar).toHaveAttribute("data-open", "false");
+    await expect(sidebar).toHaveAttribute("aria-hidden", "true");
+    expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(true);
+    await toggle.focus();
+    for (let index = 0; index < 8; index += 1) {
+      await page.keyboard.press("Tab");
+      expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(false);
+    }
+    await toggle.click();
+    await expect(sidebar).toHaveAttribute("data-open", "true");
+    await expect(sidebar).not.toHaveAttribute("aria-hidden");
+    expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(false);
+    const closeMenu = page.getByRole("button", { name: "Close menu" });
+    await closeMenu.focus();
+    expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+    await expect(closeMenu).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(sidebar).toHaveAttribute("data-open", "false");
+    await expect(toggle).toBeFocused();
+    expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(true);
+    for (let index = 0; index < 8; index += 1) {
+      await page.keyboard.press("Tab");
+      expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(false);
+    }
     await toggle.click();
     await expect(sidebar).toHaveAttribute("data-open", "true");
   } else {
     await expect(toggle).toBeHidden();
     await expect(sidebar).toBeVisible();
+    await expect(sidebar).not.toHaveAttribute("aria-hidden");
+    expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(false);
   }
 
   const settingsTrigger = page.getByRole("button", { name: "Settings", exact: true });

@@ -7,7 +7,7 @@
 // slides in from the left when the user opens it. The
 // hamburger button lives in MainLayout's top bar.
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuthStore } from "../../store/authStore";
 import { ContactList } from "../Contacts/ContactList";
 import { GroupList } from "../Groups/GroupList";
@@ -17,22 +17,31 @@ import { useI18n } from "../../i18n";
 
 interface SidebarProps {
   open: boolean;
+  hiddenFromNavigation: boolean;
   onClose: () => void;
 }
 
-export function Sidebar({ open, onClose }: SidebarProps): JSX.Element {
+export function Sidebar({ open, hiddenFromNavigation, onClose }: SidebarProps): JSX.Element {
   const username = useAuthStore((s) => s.username);
   const uin = useAuthStore((s) => s.uin);
   const logout = useAuthStore((s) => s.logout);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const i18n = useI18n();
+  const sidebarRef = useRef<HTMLElement>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
   const settingsDialogRef = useDialogFocus(settingsOpen, closeSettings, settingsTriggerRef);
 
+  useEffect(() => {
+    if (hiddenFromNavigation) sidebarRef.current?.setAttribute("inert", "");
+    else sidebarRef.current?.removeAttribute("inert");
+  }, [hiddenFromNavigation]);
+
   return (
     <aside
+      ref={sidebarRef}
       data-open={open ? "true" : "false"}
+      aria-hidden={hiddenFromNavigation ? "true" : undefined}
       className={
         "fixed inset-y-0 left-0 z-30 w-sidebar border-r border-border bg-surface-2 transition-transform md:static md:translate-x-0 " +
         (open ? "translate-x-0" : "-translate-x-full")

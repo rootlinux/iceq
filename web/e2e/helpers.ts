@@ -15,6 +15,14 @@ export const SYNTHETIC_USER: SyntheticUser = {
 };
 
 const FORBIDDEN_BODY_FIELDS = ["privateKey", "access_token", "refresh_token"] as const;
+const PUBLIC_DIRECTORY_KEY = "__iceq_e2e_public_directory";
+
+export interface SyntheticDirectoryEntry {
+  identity_key: string;
+  signed_pre_key: { id: number; public_key: string; signature: string };
+  pre_key?: { id: number; public_key: string };
+  registration_id: number;
+}
 interface BrowserNetworkEvidence {
   apiAttempts: Array<{ path: string; method: string; body: string; handled: boolean }>;
   websocketAttempts: Array<{ url: string; handled: boolean }>;
@@ -101,6 +109,10 @@ export async function installSyntheticAPI(
       if (url.pathname === "/api/contacts/" && request.method === "GET") return respondJSON({ contacts: [] });
       if (url.pathname === "/api/groups/" && request.method === "GET") return respondJSON({ groups: [] });
       if (/^\/api\/keys\/bundle\/\d+$/.test(url.pathname) && request.method === "GET") {
+        const uin = url.pathname.split("/").at(-1) ?? "";
+        const directory = JSON.parse(localStorage.getItem("__iceq_e2e_public_directory") ?? "{}") as Record<string, SyntheticDirectoryEntry>;
+        const entry = directory[uin];
+        if (entry) return respondJSON(entry);
         return respondJSON({ error: "no synthetic key bundle" }, 404);
       }
       if (url.pathname === "/api/keys/bundle" && request.method === "POST") return respondJSON({});
@@ -164,9 +176,49 @@ export async function installSyntheticAPI(
   return network;
 }
 
+export async function publishSyntheticDirectory(
+  page: Page,
+  uin: number,
+  entry: SyntheticDirectoryEntry,
+): Promise<void> {
+  await page.evaluate(({ key, accountUin, directoryEntry }) => {
+    const directory = JSON.parse(localStorage.getItem(key) ?? "{}") as Record<string, SyntheticDirectoryEntry>;
+    directory[String(accountUin)] = directoryEntry;
+    localStorage.setItem(key, JSON.stringify(directory));
+  }, { key: PUBLIC_DIRECTORY_KEY, accountUin: uin, directoryEntry: entry });
+}
+
+export async function seedSyntheticIdentity(page: Page, user: SyntheticUser): Promise<void> {
+  const seeded = await page.evaluate(async (account) => {
+    const idb = await import("/src/lib/indexeddb.ts");
+    const signal = await import("/src/lib/signal.ts");
+    const namespace = { uin: account.uin, deviceId: await idb.loadOrCreateDeviceId() };
+    const identity = await signal.generateIdentityKeyPair();
+    const registrationId = signal.generateRegistrationId();
+    await signal.saveOwnIdentity(identity, registrationId, namespace);
+    const bundle = await signal.generatePreKeyBundle(identity, 1, 1, registrationId, namespace);
+    return {
+      identity_key: bundle.identity_key,
+      signed_pre_key: bundle.signed_pre_key,
+      pre_key: bundle.one_time_pre_keys[0],
+      registration_id: bundle.registration_id,
+    };
+  }, user);
+  await publishSyntheticDirectory(page, user.uin, seeded);
+}
+
+export async function assertSignalHealthy(page: Page): Promise<void> {
+  await expect.poll(() => page.evaluate(async () => (
+    await import("/src/store/signalStore.ts")
+  ).useSignalStore.getState().ready)).toBe(true);
+  await expect(page.getByRole("alert"), "authenticated synthetic shell must not surface bootstrap errors").toHaveCount(0);
+}
+
 export async function authenticateSynthetic(page: Page): Promise<SyntheticNetwork> {
   const network = await installSyntheticAPI(page);
   await page.goto("/login");
+  await expect(page.getByRole("heading", { name: "Sign in to IceQ" })).toBeVisible();
+  await seedSyntheticIdentity(page, SYNTHETIC_USER);
   await page.evaluate(async (user) => {
     const { useAuthStore } = await import("/src/store/authStore.ts");
     await useAuthStore.getState().setSession(
@@ -177,6 +229,7 @@ export async function authenticateSynthetic(page: Page): Promise<SyntheticNetwor
   }, SYNTHETIC_USER);
   await expect(page).toHaveURL(/\/app(?:\/|$)/);
   await expect(page.getByText(SYNTHETIC_USER.username, { exact: false })).toBeVisible();
+  await assertSignalHealthy(page);
   return network;
 }
 
@@ -224,6 +277,7 @@ export async function assertNoSensitiveBody(page: Page, network?: SyntheticNetwo
     }
   }
   if (network) await assertHermeticNetwork(page, network);
+  if (/\/app(?:\/|$)/.test(new URL(page.url()).pathname)) await assertSignalHealthy(page);
 }
 
 export async function dispatchInstallPrompt(

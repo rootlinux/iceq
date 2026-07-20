@@ -23,8 +23,14 @@ test("all dialog surfaces use managed dialog focus", () => {
 
 test("closed mobile sidebar is translated offscreen and cannot cover the menu trigger", () => {
   const sidebar = read("src/components/Layout/Sidebar.tsx");
+  const layout = read("src/components/Layout/MainLayout.tsx");
   assert.match(sidebar, /open \? "translate-x-0" : "-translate-x-full"/);
   assert.match(sidebar, /md:translate-x-0/);
+  assert.match(sidebar, /setAttribute\("inert", ""\)/);
+  assert.match(sidebar, /removeAttribute\("inert"\)/);
+  assert.match(sidebar, /aria-hidden=/);
+  assert.match(layout, /sidebarToggleRef/);
+  assert.match(layout, /sidebarToggleRef\.current\?\.focus\(\)/);
 });
 
 test("dialog keyboard helper wraps Tab in both directions", () => {

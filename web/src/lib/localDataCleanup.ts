@@ -1,4 +1,4 @@
-import { ICEQ_INDEXEDDB_NAME } from "./indexeddb";
+import { ICEQ_INDEXEDDB_NAME, resetIndexedDBRuntime } from "./indexeddb";
 
 export type CleanupReason = "logout" | "panic-wipe" | "account-change" | "auth-expired";
 export type CleanupFailure = { area: string; cause: unknown };
@@ -93,6 +93,7 @@ async function performCleanup(_reason: CleanupReason): Promise<void> {
     try { await operation(); } catch (cause) { failures.push({ area, cause }); }
   };
 
+  await capture("indexeddb-memory", resetIndexedDBRuntime);
   for (const reset of memoryResetters) await capture("memory", reset);
   if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
     for (const url of [...objectUrls]) await capture("object-urls", () => {

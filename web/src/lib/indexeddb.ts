@@ -101,6 +101,11 @@ export async function commitCryptoNamespace(from:CryptoNamespace,to:CryptoNamesp
 }
 
 let deviceIdFlight: Promise<string>|null=null;
+export function resetIndexedDBRuntime(): void {
+  deviceIdFlight = null;
+  activeCryptoNamespace = null;
+}
+
 export function loadOrCreateDeviceId(): Promise<string> {
   if(deviceIdFlight)return deviceIdFlight;
   deviceIdFlight=(async()=>{const db=await openDB();try{return await new Promise<string>((resolve,reject)=>{const tx=db.transaction(STORE_METADATA,"readwrite");const store=tx.objectStore(STORE_METADATA);const get=store.get(DEVICE_ID_KEY);let value="";get.onsuccess=()=>{if(typeof get.result==="string"&&get.result){value=get.result;return;}const bytes=new Uint8Array(24);globalThis.crypto.getRandomValues(bytes);let binary="";for(const byte of bytes)binary+=String.fromCharCode(byte);value=btoa(binary).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");store.put(value,DEVICE_ID_KEY);};tx.oncomplete=()=>resolve(value);tx.onerror=()=>reject(tx.error??new Error("device id transaction failed"));tx.onabort=()=>reject(tx.error??new Error("device id transaction aborted"));});}finally{db.close();}})().catch(error=>{deviceIdFlight=null;throw error;});return deviceIdFlight;
@@ -604,7 +609,7 @@ export async function deleteGroupCryptoRecord(ns:CryptoNamespace,key: string): P
 // resurrect a wiped state from a stale version.
 // ----------------------------------------------------------------------------
 export async function clearAll(): Promise<void> {
-  deviceIdFlight=null;
+  resetIndexedDBRuntime();
   await new Promise<void>((resolve, reject) => {
     const req = indexedDB.deleteDatabase(ICEQ_INDEXEDDB_NAME);
     req.onsuccess = () => resolve();
