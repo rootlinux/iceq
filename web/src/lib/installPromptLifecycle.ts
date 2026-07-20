@@ -41,6 +41,7 @@ export function createInstallPromptLifecycle(options: InstallPromptLifecycleOpti
   const isStandalone = options.isStandalone ?? (() => false);
   const subscribers = new Set<InstallPromptSubscriber>();
   let deferredPrompt: BeforeInstallPromptEvent | null = null;
+  let promptFlight: Promise<"accepted" | "dismissed" | null> | null = null;
   let started = false;
 
   const isDismissed = (): boolean => {
@@ -58,8 +59,9 @@ export function createInstallPromptLifecycle(options: InstallPromptLifecycleOpti
     for (const subscriber of subscribers) subscriber(deferredPrompt);
   };
 
-  const clear = (): void => {
+  const clear = (expected?: BeforeInstallPromptEvent): void => {
     if (deferredPrompt === null) return;
+    if (expected && deferredPrompt !== expected) return;
     deferredPrompt = null;
     publish();
   };
@@ -79,15 +81,21 @@ export function createInstallPromptLifecycle(options: InstallPromptLifecycleOpti
     publish();
   };
 
+  const onAppInstalled: EventListener = () => {
+    clear();
+  };
+
   return {
     start(): void {
       if (started || !target) return;
       target.addEventListener("beforeinstallprompt", onBeforeInstallPrompt);
+      target.addEventListener("appinstalled", onAppInstalled);
       started = true;
     },
     stop(): void {
       if (!started || !target) return;
       target.removeEventListener("beforeinstallprompt", onBeforeInstallPrompt);
+      target.removeEventListener("appinstalled", onAppInstalled);
       started = false;
     },
     subscribe(subscriber: InstallPromptSubscriber): () => void {
@@ -101,17 +109,26 @@ export function createInstallPromptLifecycle(options: InstallPromptLifecycleOpti
       }
       return deferredPrompt;
     },
-    async prompt(): Promise<"accepted" | "dismissed" | null> {
+    prompt(): Promise<"accepted" | "dismissed" | null> {
+      if (promptFlight) return promptFlight;
       const event = this.current();
-      if (!event) return null;
-      try {
-        await event.prompt();
-        const { outcome } = await event.userChoice;
-        if (outcome === "dismissed") rememberDismissal();
-        return outcome;
-      } finally {
-        clear();
-      }
+      if (!event) return Promise.resolve(null);
+      const flight = Promise.resolve()
+        .then(async () => {
+          try {
+            await event.prompt();
+            const { outcome } = await event.userChoice;
+            if (outcome === "dismissed") rememberDismissal();
+            return outcome;
+          } finally {
+            clear(event);
+          }
+        })
+        .finally(() => {
+          if (promptFlight === flight) promptFlight = null;
+        });
+      promptFlight = flight;
+      return flight;
     },
     dismiss(): void {
       rememberDismissal();
