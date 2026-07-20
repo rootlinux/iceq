@@ -276,7 +276,7 @@ cd backend && go run ./cmd_smoke_step10/
 
 The current implementation status for the requested Tor, E2EE, backend-hardening, anonymity, frontend, and delivery work is tracked in [`docs/security-status.md`](docs/security-status.md).
 
-GitHub Actions workflow [`security-ci.yml`](.github/workflows/security-ci.yml) runs Go tests/vet/govulncheck, web tests/typecheck/build/high-severity audit, secret scanning, and Docker Compose model validation. Compose validation does not start the stack or prove runtime behavior.
+GitHub Actions workflow [`security-ci.yml`](.github/workflows/security-ci.yml) runs Go tests/vet/govulncheck, web tests/typecheck/build, moderate-severity release audits of all and production dependencies, secret scanning, and Docker Compose model validation. Compose validation does not start the stack or prove runtime behavior.
 
 ## Known Limitations
 
