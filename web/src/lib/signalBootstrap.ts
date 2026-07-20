@@ -43,6 +43,11 @@ interface GeneratedBundle extends PreKeyBundleUpload {}
 export interface SignalBootstrapDeps {
   fetchBundle: (uin: number) => Promise<RemotePreKeyBundle>;
   loadIdentity: (ns?: CryptoNamespace) => Promise<StoredIdentity | null>;
+  migrateLegacyIdentity?: (
+    ns: CryptoNamespace,
+    authenticatedPublicKey: string,
+    derivePublic: (privateKey: string) => Promise<string>,
+  ) => Promise<StoredIdentity | null>;
   loadOrCreateDeviceId?: () => Promise<string>;
   deriveStoredPublic?: (privateKey:string)=>Promise<string>;
   restoreIdentity: (stored: StoredIdentity) => RestoredIdentity;
@@ -65,6 +70,7 @@ export interface SignalBootstrapDeps {
 const defaultDeps: SignalBootstrapDeps = {
   fetchBundle,
   loadIdentity: (ns) => loadIdentity(ns!),
+  migrateLegacyIdentity: migrateVerifiedLegacyIdentity,
   loadOrCreateDeviceId,
   deriveStoredPublic: deriveIdentityPublicKey,
   restoreIdentity: restoreOwnIdentity,
@@ -95,8 +101,8 @@ export async function ensureOwnBundle(
   }
 
   let stored = await deps.loadIdentity(ns);
-  if (!stored && directory && deps === defaultDeps) {
-    try { stored = await migrateVerifiedLegacyIdentity(ns, directory.identity_key, deriveIdentityPublicKey); }
+  if (directory && deps.migrateLegacyIdentity) {
+    try { stored = await deps.migrateLegacyIdentity(ns, directory.identity_key, deriveIdentityPublicKey); }
     catch (error) { if (error instanceof LegacyIdentityMismatchError) throw new IdentityKeyMismatchError(); throw error; }
   }
   if(!stored&&!directory&&deps===defaultDeps)await quarantineUnverifiedLegacyCrypto();

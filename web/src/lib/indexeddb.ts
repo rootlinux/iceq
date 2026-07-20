@@ -158,20 +158,201 @@ export async function loadIdentity(ns: CryptoNamespace): Promise<StoredIdentity 
 }
 
 export async function migrateVerifiedLegacyIdentity(ns: CryptoNamespace, authenticatedPublicKey: string, derivePublic: (privateKey:string)=>Promise<string>): Promise<StoredIdentity | null> {
-  const scoped = await loadIdentity(ns); if (scoped) return scoped;
+  const scoped = await loadIdentity(ns);
+  if (scoped) {
+    let scopedPublic: string;
+    try { scopedPublic = await derivePublic(scoped.privateKey); } catch { throw new LegacyIdentityMismatchError(); }
+    if (
+      !constantTimeStringEqual(scopedPublic, authenticatedPublicKey) ||
+      !constantTimeStringEqual(scopedPublic, scoped.publicKey)
+    ) throw new LegacyIdentityMismatchError();
+  }
   const db = await openDB();
   const legacy = await idbGet<StoredIdentity>(db, STORE_IDENTITY, SELF_KEY);
-  if (!legacy) { db.close(); await deleteUnscopedLegacyCryptoRecords(); return null; }
+  if (!legacy) { db.close(); await deleteUnscopedLegacyCryptoRecords(); return scoped; }
   let derived: string;
   try { derived=await derivePublic(legacy.privateKey); } catch { await idbDelete(db, STORE_IDENTITY, SELF_KEY); db.close(); await deleteUnscopedLegacyCryptoRecords(); throw new LegacyIdentityMismatchError(); }
   if (!constantTimeStringEqual(derived, authenticatedPublicKey)) {
     await idbDelete(db, STORE_IDENTITY, SELF_KEY);
     db.close(); await deleteUnscopedLegacyCryptoRecords(); throw new LegacyIdentityMismatchError();
   }
-  const normalized={...legacy,publicKey:derived};await idbPut(db, STORE_IDENTITY, normalized, cryptoRecordKey(ns, "identity", SELF_KEY));
-  await idbDelete(db, STORE_IDENTITY, SELF_KEY); db.close(); await deleteUnscopedLegacyCryptoRecords(); return normalized;
+  db.close();
+  if (scoped && (
+    scoped.registrationId !== legacy.registrationId ||
+    !constantTimeStringEqual(scoped.privateKey, legacy.privateKey)
+  )) {
+    throw new Error("legacy crypto destination collision");
+  }
+  const normalized=scoped??{...legacy,publicKey:derived};
+  await migrateLegacyCryptoRecordsAtomically(ns, legacy, normalized);
+  return normalized;
 }
 export class LegacyIdentityMismatchError extends Error { constructor(){super("legacy identity mismatch");this.name="LegacyIdentityMismatchError";} }
+
+interface LegacyMigrationStore {
+  name: string;
+  kind: string;
+  keyPath: boolean;
+  shouldMigrate?: (key: IDBValidKey) => boolean;
+}
+
+const LEGACY_MIGRATION_STORES: LegacyMigrationStore[] = [
+  { name: STORE_IDENTITY, kind: "identity", keyPath: false },
+  { name: STORE_SESSIONS, kind: "session", keyPath: false },
+  { name: STORE_PREKEYS, kind: "prekey", keyPath: true },
+  { name: STORE_SIGNED_PREKEYS, kind: "signed-prekey", keyPath: true },
+  { name: STORE_PEER_IDENTITIES, kind: "peer-identity", keyPath: false },
+  {
+    name: STORE_METADATA,
+    kind: "metadata",
+    keyPath: false,
+    shouldMigrate: (key) => key !== DEVICE_ID_KEY && key !== PENDING_REGISTRATION_KEY,
+  },
+  { name: STORE_PEER_TRUST, kind: "peer-trust", keyPath: false },
+  { name: STORE_GROUP_CRYPTO, kind: "sender-key", keyPath: false },
+];
+
+interface LegacyMigrationRecord {
+  store: LegacyMigrationStore;
+  sourceKey: IDBValidKey;
+  destinationKey: string;
+  value: unknown;
+}
+
+function migrateLegacyCryptoRecordsAtomically(
+  ns: CryptoNamespace,
+  verifiedLegacyIdentity: StoredIdentity,
+  normalizedIdentity: StoredIdentity,
+): Promise<void> {
+  return openDB().then((db) => new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(LEGACY_MIGRATION_STORES.map(({ name }) => name), "readwrite");
+    const keys = new Map<string, IDBValidKey[]>();
+    const values = new Map<string, unknown[]>();
+    let pendingSnapshots = LEGACY_MIGRATION_STORES.length * 2;
+    let migrationError: Error | null = null;
+
+    const abort = (error: Error): void => {
+      migrationError = error;
+      try { tx.abort(); } catch { /* transaction already settled */ }
+    };
+
+    const applyMigration = (records: LegacyMigrationRecord[]): void => {
+      try {
+        for (const record of records) {
+          const objectStore = tx.objectStore(record.store.name);
+          const value = record.store.name === STORE_IDENTITY && record.sourceKey === SELF_KEY
+            ? normalizedIdentity
+            : record.value;
+          if (record.store.keyPath) {
+            if (typeof value !== "object" || value === null) {
+              abort(new Error("invalid legacy key record"));
+              return;
+            }
+            objectStore.put({ ...value, id: record.destinationKey });
+          } else {
+            objectStore.put(value, record.destinationKey);
+          }
+          objectStore.delete(record.sourceKey);
+        }
+      } catch (error) {
+        abort(error instanceof Error ? error : new Error("legacy crypto migration write failed"));
+      }
+    };
+
+    const preflightDestinations = (records: LegacyMigrationRecord[]): void => {
+      if (records.length === 0) {
+        abort(new Error("verified legacy identity disappeared during migration"));
+        return;
+      }
+      let pendingCollisions = records.length;
+      let collisionFound = false;
+      for (const record of records) {
+        const request = tx.objectStore(record.store.name).getKey(record.destinationKey);
+        request.onerror = () => abort(request.error ?? new Error("legacy crypto collision check failed"));
+        request.onsuccess = () => {
+          const identityKeys = keys.get(STORE_IDENTITY) ?? [];
+          const identityValues = values.get(STORE_IDENTITY) ?? [];
+          const destinationIdentityIndex = identityKeys.findIndex((key) => key === record.destinationKey);
+          const transactionalScopedIdentity = identityValues[destinationIdentityIndex] as StoredIdentity | undefined;
+          const identicalScopedIdentity =
+            record.store.name === STORE_IDENTITY &&
+            record.sourceKey === SELF_KEY &&
+            transactionalScopedIdentity !== undefined &&
+            transactionalScopedIdentity.registrationId === normalizedIdentity.registrationId &&
+            constantTimeStringEqual(transactionalScopedIdentity.privateKey, normalizedIdentity.privateKey) &&
+            constantTimeStringEqual(transactionalScopedIdentity.publicKey, normalizedIdentity.publicKey);
+          if (request.result !== undefined && !identicalScopedIdentity) collisionFound = true;
+          pendingCollisions -= 1;
+          if (pendingCollisions !== 0) return;
+          if (collisionFound) {
+            abort(new Error("legacy crypto destination collision"));
+            return;
+          }
+          applyMigration(records);
+        };
+      }
+    };
+
+    const buildMigration = (): void => {
+      const currentIdentityKeys = keys.get(STORE_IDENTITY) ?? [];
+      const currentIdentityValues = values.get(STORE_IDENTITY) ?? [];
+      const identityIndex = currentIdentityKeys.findIndex((key) => key === SELF_KEY);
+      const currentIdentity = currentIdentityValues[identityIndex] as StoredIdentity | undefined;
+      if (
+        !currentIdentity ||
+        currentIdentity.registrationId !== verifiedLegacyIdentity.registrationId ||
+        !constantTimeStringEqual(currentIdentity.privateKey, verifiedLegacyIdentity.privateKey)
+      ) {
+        abort(new Error("verified legacy identity changed during migration"));
+        return;
+      }
+
+      const records: LegacyMigrationRecord[] = [];
+      for (const store of LEGACY_MIGRATION_STORES) {
+        const storeKeys = keys.get(store.name) ?? [];
+        const storeValues = values.get(store.name) ?? [];
+        for (let index = 0; index < storeKeys.length; index += 1) {
+          const sourceKey = storeKeys[index]!;
+          if (typeof sourceKey !== "string" && typeof sourceKey !== "number") {
+            abort(new Error("invalid legacy crypto record key"));
+            return;
+          }
+          if (String(sourceKey).startsWith(`${CRYPTO_KEY_VERSION}:`)) continue;
+          if (store.shouldMigrate && !store.shouldMigrate(sourceKey)) continue;
+          records.push({
+            store,
+            sourceKey,
+            destinationKey: cryptoRecordKey(ns, store.kind, sourceKey),
+            value: storeValues[index],
+          });
+        }
+      }
+      preflightDestinations(records);
+    };
+
+    const snapshotComplete = (): void => {
+      pendingSnapshots -= 1;
+      if (pendingSnapshots === 0) buildMigration();
+    };
+
+    for (const store of LEGACY_MIGRATION_STORES) {
+      const objectStore = tx.objectStore(store.name);
+      const keyRequest = objectStore.getAllKeys();
+      const valueRequest = objectStore.getAll();
+      keyRequest.onerror = () => abort(keyRequest.error ?? new Error("legacy crypto key scan failed"));
+      valueRequest.onerror = () => abort(valueRequest.error ?? new Error("legacy crypto value scan failed"));
+      keyRequest.onsuccess = () => { keys.set(store.name, keyRequest.result); snapshotComplete(); };
+      valueRequest.onsuccess = () => { values.set(store.name, valueRequest.result); snapshotComplete(); };
+    }
+
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { /* onabort reports the stable error */ };
+    tx.onabort = () => {
+      db.close();
+      reject(migrationError ?? tx.error ?? new Error("legacy crypto migration aborted"));
+    };
+  }));
+}
 
 async function deleteUnscopedLegacyCryptoRecords(): Promise<void> {
   const db=await openDB(); const stores=[STORE_IDENTITY,STORE_SESSIONS,STORE_PREKEYS,STORE_SIGNED_PREKEYS,STORE_PEER_IDENTITIES,STORE_PEER_TRUST,STORE_GROUP_CRYPTO];

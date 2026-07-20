@@ -28,6 +28,24 @@ test("ensureOwnBundle does nothing when the remote bundle already exists", async
   assert.equal(uploaded, false);
 });
 
+test("ensureOwnBundle reconciles legacy crypto even when a scoped identity already exists", async () => {
+  const identity={publicKey:"identity",privateKey:"private",registrationId:7};
+  let migrated=false;
+
+  const result=await ensureOwnBundle(42,{
+    fetchBundle:async()=>({identity_key:"identity",signed_pre_key:{id:1,public_key:"spk",signature:"sig"},registration_id:7}),
+    loadIdentity:async()=>identity,
+    migrateLegacyIdentity:async()=>{migrated=true;return identity;},
+    deriveStoredPublic:async()=>"identity",
+    restoreIdentity:()=>({publicKey:new Uint8Array(),privateKey:new Uint8Array(),registrationId:7}),
+    generatePreKeyBundle:async()=>{throw new Error("generatePreKeyBundle should not be called");},
+    uploadBundle:async()=>{throw new Error("uploadBundle should not be called");},
+  });
+
+  assert.equal(result,"ok");
+  assert.equal(migrated,true);
+});
+
 test("ensureOwnBundle repairs a missing remote bundle when local identity exists", async () => {
   let uploaded = false;
 
