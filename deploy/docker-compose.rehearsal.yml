@@ -1,0 +1,38 @@
+networks:
+  iceq-net:
+    name: iceq-clearnet-rehearsal-net
+
+services:
+  edge-identity:
+    restart: "no"
+  postgres:
+    restart: "no"
+  scylla:
+    restart: "no"
+  scylla-init:
+    restart: "no"
+  redis:
+    restart: "no"
+  nats:
+    restart: "no"
+  minio:
+    restart: "no"
+  minio-init:
+    restart: "no"
+  caddy:
+    restart: "no"
+    ports: !override
+      - "127.0.0.1:8443:443"
+      - "127.0.0.1:8443:443/udp"
+  auth-service:
+    restart: "no"
+  key-service:
+    restart: "no"
+  ws-gateway:
+    restart: "no"
+  presence-service:
+    restart: "no"
+  message-service:
+    restart: "no"
+  file-service:
+    restart: "no"
