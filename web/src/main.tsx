@@ -14,6 +14,12 @@ import { BrowserRouter } from "react-router-dom";
 import App from "./App";
 import "./index.css";
 import { useAuthStore } from "./store/authStore";
+import { initializeInstallPromptCapture } from "./lib/installPromptLifecycle";
+
+const stopInstallPromptCapture = initializeInstallPromptCapture();
+if (import.meta.hot) {
+  import.meta.hot.dispose(stopInstallPromptCapture);
+}
 
 // Hydrate the auth store from localStorage before the first
 // render. We do this synchronously here (rather than in a

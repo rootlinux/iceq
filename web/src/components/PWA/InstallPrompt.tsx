@@ -4,48 +4,25 @@
 
 import { useEffect, useState } from "react";
 import { useI18n } from "../../i18n";
-
-const DISMISS_KEY = "iceq_install_dismissed";
-const DISMISS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-interface BeforeInstallPromptEvent extends Event {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
-}
-
-function isDismissed(): boolean {
-  const ts = localStorage.getItem(DISMISS_KEY);
-  if (!ts) return false;
-  return Date.now() - Number(ts) < DISMISS_TTL_MS;
-}
+import { installPromptLifecycle, type BeforeInstallPromptEvent } from "../../lib/installPromptLifecycle";
 
 export function InstallPrompt(): JSX.Element | null {
   const i18n = useI18n();
   const [deferredPrompt, setDeferredPrompt] =
-    useState<BeforeInstallPromptEvent | null>(null);
+    useState<BeforeInstallPromptEvent | null>(() => installPromptLifecycle.current());
 
   useEffect(() => {
-    const handler = (e: Event): void => {
-      e.preventDefault();
-      if (!isDismissed()) {
-        setDeferredPrompt(e as BeforeInstallPromptEvent);
-      }
-    };
-    window.addEventListener("beforeinstallprompt", handler);
-    return () => window.removeEventListener("beforeinstallprompt", handler);
+    return installPromptLifecycle.subscribe(setDeferredPrompt);
   }, []);
 
   if (!deferredPrompt) return null;
 
   const handleInstall = async (): Promise<void> => {
-    await deferredPrompt.prompt();
-    await deferredPrompt.userChoice;
-    setDeferredPrompt(null);
+    await installPromptLifecycle.prompt();
   };
 
   const handleDismiss = (): void => {
-    localStorage.setItem(DISMISS_KEY, String(Date.now()));
-    setDeferredPrompt(null);
+    installPromptLifecycle.dismiss();
   };
 
   return (

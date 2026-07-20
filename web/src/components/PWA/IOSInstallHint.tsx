@@ -3,8 +3,9 @@
 // iOS Safari doesn't support beforeinstallprompt, so we show
 // manual instructions instead.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "../../i18n";
+import { useDialogFocus } from "../../hooks/useDialogFocus";
 
 const HINT_KEY = "iceq_ios_hint_shown";
 
@@ -45,6 +46,14 @@ interface IOSInstallHintProps {
 export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | null {
   const i18n = useI18n();
   const [show, setShow] = useState(false);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const dismissButtonRef = useRef<HTMLButtonElement>(null);
+
+  const handleGotIt = useCallback((): void => {
+    localStorage.setItem(HINT_KEY, "1");
+    setShow(false);
+  }, []);
+  const dialogRef = useDialogFocus(show, handleGotIt, returnFocusRef, dismissButtonRef);
 
   useEffect(() => {
     if (
@@ -53,19 +62,18 @@ export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | 
       !isStandalone() &&
       !localStorage.getItem(HINT_KEY)
     ) {
+      returnFocusRef.current = document.activeElement as HTMLElement | null;
       setShow(true);
     }
   }, [visible]);
 
   if (!show) return null;
 
-  const handleGotIt = (): void => {
-    localStorage.setItem(HINT_KEY, "1");
-    setShow(false);
-  };
-
   return (
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="ios-install-hint-title"
       style={{
         position: "fixed",
         inset: 0,
@@ -78,6 +86,7 @@ export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | 
       onClick={handleGotIt}
     >
       <div
+        ref={dialogRef}
         style={{
           background: "#141414",
           borderRadius: "16px 16px 0 0",
@@ -89,6 +98,7 @@ export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | 
         onClick={(e) => e.stopPropagation()}
       >
         <h2
+          id="ios-install-hint-title"
           style={{
             margin: "0 0 12px",
             fontSize: 18,
@@ -102,6 +112,8 @@ export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | 
           {i18n.t("pwa.iosHelp")}
         </p>
         <button
+          ref={dismissButtonRef}
+          type="button"
           onClick={handleGotIt}
           style={{
             width: "100%",
