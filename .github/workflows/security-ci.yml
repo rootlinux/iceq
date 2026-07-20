@@ -61,10 +61,10 @@ jobs:
       - name: Build web
         working-directory: web
         run: npm run build
-      - name: Audit all dependencies
+      - name: Audit all dependencies at release severity
         working-directory: web
         run: npm audit --audit-level=moderate
-      - name: Audit production dependencies
+      - name: Audit production dependencies at release severity
         working-directory: web
         run: npm audit --audit-level=moderate --omit=dev
 
