@@ -26,4 +26,3 @@ backend/cmd_smoke_msgsvc/smoke
 
 # Local isolated development worktrees
 .worktrees/
-    
