@@ -44,6 +44,7 @@ import {
 import { assessPeerIdentity, isPeerSendAllowed } from "./identityTrust";
 import { assertInboundIdentityTrusted } from "./indexeddb";
 import { PreKeyWhisperMessage } from "@privacyresearch/libsignal-protocol-protobuf-ts";
+import { padPlaintext, unpadPlaintext } from "./messagePadding";
 
 // ============================================================================
 // Library bootstrap.
@@ -448,9 +449,15 @@ export async function encryptMessage(
 
     // 2. Encrypt. The cipher writes the updated session back
     //    into the store via storeSession(), which our
-    //    IndexedDB-backed StorageType handles.
+    //    IndexedDB-backed StorageType handles. Plaintext is
+    //    padded to a fixed bucket size first (see
+    //    messagePadding.ts) so the resulting ciphertext length
+    //    doesn't reveal the original message length — to a
+    //    network observer watching encrypted traffic sizes, or
+    //    to anyone reading the server's own stored ciphertext
+    //    row size.
     const cipher = new runtime.SessionCipher(store, remoteAddress);
-    const plainBuffer = uint8ToArrayBuffer(plaintext);
+    const plainBuffer = uint8ToArrayBuffer(padPlaintext(plaintext));
     const result = await cipher.encrypt(plainBuffer);
     if (!result.body) {
       throw new SignalError("cipher returned empty body");
@@ -545,7 +552,7 @@ export async function decryptMessage(
       // Subsequent message. Pure ratchet step.
       plain = await cipher.decryptWhisperMessage(bytes);
     }
-    return new Uint8Array(plain);
+    return unpadPlaintext(new Uint8Array(plain));
   } catch (e) {
     if (e instanceof SignalError) throw e;
     if ((e as Error).message === "peer identity changed") throw new SignalError("peer identity changed; decrypt blocked", e);

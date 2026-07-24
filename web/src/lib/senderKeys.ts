@@ -1,4 +1,5 @@
 import { AsyncCurve25519Wrapper } from "./vendor/curve25519";
+import { padPlaintext, unpadPlaintext } from "./messagePadding";
 
 export const SENDER_KEY_VERSION = 1 as const;
 const INFO = new TextEncoder().encode("iceq.sender-keys.v1");
@@ -48,7 +49,10 @@ export async function encryptGroupMessage(state: SenderState, plaintext: Uint8Ar
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const header = headerBytes(state, state.iteration);
   const aes = await crypto.subtle.importKey("raw", toBuffer(messageKey), "AES-GCM", false, ["encrypt"]);
-  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: toBuffer(nonce), additionalData: toBuffer(header) }, aes, toBuffer(plaintext)));
+  // Pad to a fixed bucket before sealing (see messagePadding.ts) so
+  // the ciphertext length doesn't reveal the original message length.
+  const padded = padPlaintext(plaintext);
+  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: toBuffer(nonce), additionalData: toBuffer(header) }, aes, toBuffer(padded)));
   const combined = new Uint8Array(nonce.length + sealed.length); combined.set(nonce); combined.set(sealed, nonce.length);
   const unsigned: Omit<SenderKeyCiphertext, "signature"> = {
     version: 1, group_id: state.group_id, epoch: state.epoch, sender_uin: state.sender_uin,
@@ -91,7 +95,7 @@ export async function decryptGroupMessage(state: ReceiverState, envelope: Sender
     const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: toBuffer(nonce), additionalData: toBuffer(header) }, aes, toBuffer(body));
     state.seen[String(envelope.iteration)] = true;
     for(const key of Object.keys(state.seen)) if(Number(key)<state.iteration-state.max_skip) delete state.seen[key];
-    return new Uint8Array(plain);
+    return unpadPlaintext(new Uint8Array(plain));
   } catch { throw new Error("sender-key authentication failed"); }
   finally{messageKey.fill(0);combined.fill(0);nonce.fill(0);body.fill(0);header.fill(0);}
 }

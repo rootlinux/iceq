@@ -27,6 +27,7 @@ import { getGroupMembersWithEpoch, putSenderKeyDistribution } from "../../api/gr
 import { ensureGroupSender, sealGroupContent, encodeGroupCiphertext, GROUP_CONTENT_KIND } from "../../lib/groupCrypto";
 import { loadDisappearingSeconds, permitsPrivacySignal } from "../../lib/privacySettings";
 import { useI18n } from "../../i18n";
+import { delay, randomSendJitterMs } from "../../lib/messagePadding";
 
 interface MessageInputProps {
   peerUin?: number;
@@ -141,6 +142,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
           ts: Date.now(),
           payload,
         };
+        await delay(randomSendJitterMs());
         send(frame);
         return;
       }
@@ -165,6 +167,10 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         ts: Date.now(),
         payload,
       };
+      // Small random delay before the frame hits the wire: makes
+      // "user pressed send" harder to correlate precisely with a
+      // specific packet timestamp for a network-level observer.
+      await delay(randomSendJitterMs());
       send(frame);
       // The server's first ack (state=delivered) will move
       // the optimistic message from "sending" to "delivered"
@@ -259,6 +265,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         msg_type: sealed.msgType,
         expires_in_seconds: loadDisappearingSeconds(),
       };
+      await delay(randomSendJitterMs());
       if (!send({
         type: "message",
         id: cryptoRandomId(),
