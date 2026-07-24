@@ -15,29 +15,30 @@
 //
 // Privacy contract for this package:
 //
-//   1. Original filenames are NEVER persisted, logged, or
-//      included in object keys. A caller that hands us a
-//      filename gets a UUID-only key in return; the field is
-//      accepted on the request struct only because clients
-//      send it and we don't want to break the wire shape, not
-//      because we use it for anything server-side.
+//  1. Original filenames are NEVER persisted, logged, or
+//     included in object keys. A caller that hands us a
+//     filename gets a UUID-only key in return; the field is
+//     accepted on the request struct only because clients
+//     send it and we don't want to break the wire shape, not
+//     because we use it for anything server-side.
 //
-//   2. UINs appear in object keys only for the avatar bucket
-//      (deterministic overwrite). They NEVER appear in
-//      general-file object keys, and they NEVER appear in
-//      any log line or error message.
+//  2. UINs appear in object keys only for the avatar bucket
+//     (deterministic overwrite). They NEVER appear in
+//     general-file object keys, and they NEVER appear in
+//     any log line or error message.
 //
-//   3. Error messages from this package do not echo
-//      caller-supplied strings (filenames, content types,
-//      object keys). The exposed sentinel errors let the
-//      HTTP layer map validation failures to 413/415
-//      without leaking user input into the log.
+//  3. Error messages from this package do not echo
+//     caller-supplied strings (filenames, content types,
+//     object keys). The exposed sentinel errors let the
+//     HTTP layer map validation failures to 413/415
+//     without leaking user input into the log.
 package minio
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
@@ -79,6 +80,18 @@ const (
 	// the pre-signed URL can be rejected before any bytes
 	// are pushed to MinIO.
 	MaxFileSize int64 = 100 * 1024 * 1024
+
+	// filesProxyPrefix is the same-origin path Caddy reverse-proxies to
+	// MinIO (see deploy/Caddyfile's /files-proxy/* block, which forces
+	// the Host header back to cfg.MinioEndpoint so MinIO's SigV4
+	// signature check still validates). PresignedPutObject/
+	// PresignedGetObject build a URL against cfg.MinioEndpoint — by
+	// default the Docker-internal hostname "minio:9000", which no real
+	// client (browser, Tor or otherwise) can resolve or reach, and MinIO
+	// has no port published to the host. toProxyPath rewrites the
+	// signed URL to this relative path so it works from any origin the
+	// app itself is reachable from.
+	filesProxyPrefix = "/files-proxy"
 )
 
 // ----------------------------------------------------------------------------
@@ -136,9 +149,9 @@ type UploadURLResponse struct {
 // DownloadURLResponse is the JSON the HTTP handler returns
 // for a download URL request.
 type DownloadURLResponse struct {
-	ObjectKey  string    `json:"object_key"`
-	DownloadURL string   `json:"download_url"`
-	ExpiresAt  time.Time `json:"expires_at"`
+	ObjectKey   string    `json:"object_key"`
+	DownloadURL string    `json:"download_url"`
+	ExpiresAt   time.Time `json:"expires_at"`
 }
 
 // ----------------------------------------------------------------------------
@@ -204,13 +217,13 @@ func (m *MinioClient) GenerateUploadURL(ctx context.Context, req UploadRequest) 
 	objectKey := uuid.NewString()
 	expiresAt := time.Now().Add(UploadTTLDuration)
 
-	url, err := m.client.PresignedPutObject(ctx, BucketFiles, objectKey, UploadTTLDuration)
+	signed, err := m.client.PresignedPutObject(ctx, BucketFiles, objectKey, UploadTTLDuration)
 	if err != nil {
 		return nil, fmt.Errorf("presigned put: %w", err)
 	}
 	return &UploadURLResponse{
 		ObjectKey: objectKey,
-		UploadURL: url.String(),
+		UploadURL: toProxyPath(signed),
 		ExpiresAt: expiresAt,
 	}, nil
 }
@@ -228,14 +241,14 @@ func (m *MinioClient) GenerateDownloadURL(ctx context.Context, objectKey string)
 	// transfer: the recipient's browser opens the URL
 	// and the file preview / download prompt is
 	// determined by the browser's MIME sniffing.
-	url, err := m.client.PresignedGetObject(ctx, BucketFiles, objectKey, DownloadTTLDuration, nil)
+	signed, err := m.client.PresignedGetObject(ctx, BucketFiles, objectKey, DownloadTTLDuration, nil)
 	if err != nil {
 		return nil, fmt.Errorf("presigned get: %w", err)
 	}
 	return &DownloadURLResponse{
-		ObjectKey:  objectKey,
-		DownloadURL: url.String(),
-		ExpiresAt:  expiresAt,
+		ObjectKey:   objectKey,
+		DownloadURL: toProxyPath(signed),
+		ExpiresAt:   expiresAt,
 	}, nil
 }
 
@@ -252,13 +265,13 @@ func (m *MinioClient) GenerateDownloadURL(ctx context.Context, objectKey string)
 func (m *MinioClient) GenerateAvatarUploadURL(ctx context.Context, uin int64) (*UploadURLResponse, error) {
 	objectKey := avatarKey(uin)
 	expiresAt := time.Now().Add(UploadTTLDuration)
-	url, err := m.client.PresignedPutObject(ctx, BucketAvatars, objectKey, UploadTTLDuration)
+	signed, err := m.client.PresignedPutObject(ctx, BucketAvatars, objectKey, UploadTTLDuration)
 	if err != nil {
 		return nil, fmt.Errorf("presigned put avatar: %w", err)
 	}
 	return &UploadURLResponse{
 		ObjectKey: objectKey,
-		UploadURL: url.String(),
+		UploadURL: toProxyPath(signed),
 		ExpiresAt: expiresAt,
 	}, nil
 }
@@ -266,6 +279,21 @@ func (m *MinioClient) GenerateAvatarUploadURL(ctx context.Context, uin int64) (*
 // ----------------------------------------------------------------------------
 // Internal helpers.
 // ----------------------------------------------------------------------------
+
+// toProxyPath rewrites an absolute presigned MinIO URL to a
+// same-origin relative path under filesProxyPrefix, preserving the
+// full path and query string (the query carries the SigV4
+// signature, expiry, and credential params — none of that is
+// touched, only the scheme+host prefix is dropped). Caddy's
+// /files-proxy/* block strips this prefix and forwards to MinIO
+// with the Host header forced back to what was actually signed.
+func toProxyPath(u *url.URL) string {
+	rewritten := filesProxyPrefix + u.Path
+	if u.RawQuery != "" {
+		rewritten += "?" + u.RawQuery
+	}
+	return rewritten
+}
 
 // avatarKey is the deterministic object key for a user's
 // avatar. Exposed as its own function so the smoke test

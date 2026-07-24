@@ -247,7 +247,13 @@ func DecodeSignedPrekeyJSON(raw json.RawMessage) (SignedPrekey, error) {
 // padded (URLEncoding) and unpadded (RawURLEncoding) forms.
 func isBase64URLBytes(s string, wantLen int) bool {
 	for _, c := range s {
-		if !isBase64URLChar(byte(c)) {
+		// c > 127 rejects any non-ASCII rune before the byte(c)
+		// truncation can fold it onto a valid base64url byte value
+		// (e.g. codepoint 0x141 truncating to a byte that happens
+		// to equal 'A'). Not currently exploitable — the subsequent
+		// DecodeString call independently rejects non-ASCII UTF-8 —
+		// but this loop shouldn't rely on that second check alone.
+		if c > 127 || !isBase64URLChar(byte(c)) { // #nosec G115
 			return false
 		}
 	}

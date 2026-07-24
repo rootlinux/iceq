@@ -67,6 +67,9 @@ const (
 	// it. If we ever need to revoke a refresh token by JTI (e.g.
 	// in a "log out all sessions" flow) we extend this table with
 	// a jti column and add an index on it.
+	// #nosec G101 -- this is a SQL statement (the column name
+	// "token_hash" is what gosec's heuristic matches), not a
+	// credential literal. See the doc comment above.
 	qInsertRefreshToken = `
 		INSERT INTO refresh_tokens (uin, token_hash, expires_at)
 		VALUES ($1, $2, $3)
@@ -75,6 +78,7 @@ const (
 	// qSelectRefreshTokenByHash looks up an active refresh token
 	// by its SHA-256 hash. We use SCAN, not QueryRow + ErrNoRows,
 	// via the handler-side helper checkRefreshToken.
+	// #nosec G101 -- SQL statement, not a credential literal.
 	qSelectRefreshTokenByHash = `
 		SELECT uin, expires_at
 		FROM refresh_tokens
@@ -84,6 +88,7 @@ const (
 	// qDeleteRefreshTokenByHash removes a refresh token. Used by
 	// logout (revoke one) and by refresh-rotation (consume the
 	// old one before issuing the new).
+	// #nosec G101 -- SQL statement, not a credential literal.
 	qDeleteRefreshTokenByHash = `
 		DELETE FROM refresh_tokens
 		WHERE token_hash = $1
@@ -92,6 +97,7 @@ const (
 	// qConsumeRefreshTokenByHash is the rotation compare-and-delete. PostgreSQL
 	// serializes concurrent DELETEs of the same row; RETURNING therefore gives
 	// exactly one caller the consumed token metadata and all losers ErrNoRows.
+	// #nosec G101 -- SQL statement, not a credential literal.
 	qConsumeRefreshTokenByHash = `
 		DELETE FROM refresh_tokens
 		WHERE token_hash = $1
@@ -129,7 +135,7 @@ const (
 	// qWipeRefreshTokens removes every persisted refresh token
 	// for the user. After this, the user cannot refresh their
 	// session even if they still hold a valid access token.
-	qWipeRefreshTokens = `DELETE FROM refresh_tokens WHERE uin = $1`
+	qWipeRefreshTokens = `DELETE FROM refresh_tokens WHERE uin = $1` // #nosec G101 -- SQL statement, not a credential literal.
 
 	// qWipeGroupMemberships removes the user from every group,
 	// promotes the deterministic successor when the owner is wiped,

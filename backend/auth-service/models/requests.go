@@ -157,7 +157,12 @@ func isBase64URL32(s string) bool {
 	// Decode, because the decoder is permissive about
 	// non-canonical inputs (whitespace, mixed padding).
 	for _, c := range s {
-		if !isBase64URLChar(byte(c)) {
+		// c > 127 rejects any non-ASCII rune before the byte(c)
+		// truncation can fold it onto a valid base64url byte value.
+		// Not currently exploitable — the subsequent DecodeString
+		// call independently rejects non-ASCII UTF-8 — but this
+		// loop shouldn't rely on that second check alone.
+		if c > 127 || !isBase64URLChar(byte(c)) { // #nosec G115
 			return false
 		}
 	}

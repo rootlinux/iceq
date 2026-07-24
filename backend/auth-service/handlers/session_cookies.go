@@ -61,6 +61,12 @@ func setSessionCookies(w http.ResponseWriter, tokens models.AuthTokens) {
 		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
 	})
+	// #nosec G124 -- HttpOnly is intentionally false on the
+	// access-token cookie: the web client's WebSocket bearer-auth
+	// handshake reads this cookie from JavaScript to attach the
+	// token to the WS upgrade request, which HttpOnly would block.
+	// The refresh token (the higher-value credential) stays
+	// HttpOnly above. Secure and SameSite are both still set.
 	http.SetCookie(w, &http.Cookie{
 		Name:     accessCookieName,
 		Value:    tokens.AccessToken,
@@ -73,17 +79,35 @@ func setSessionCookies(w http.ResponseWriter, tokens models.AuthTokens) {
 	})
 }
 
+// clearSessionCookies expires both session cookies. Built as two
+// explicit full http.Cookie literals (mirroring setSessionCookies)
+// rather than a loop that mutates a shared partial literal — gosec's
+// G124 check can only verify Secure/HttpOnly/SameSite when they're
+// set directly in the composite literal, not via a later field
+// assignment on a loop variable.
 func clearSessionCookies(w http.ResponseWriter) {
-	for _, c := range []*http.Cookie{
-		{Name: refreshCookieName, Path: "/api/auth"},
-		{Name: accessCookieName, Path: "/"},
-	} {
-		c.Value = ""
-		c.MaxAge = -1
-		c.Expires = time.Unix(0, 0).UTC()
-		c.HttpOnly = c.Name == refreshCookieName
-		c.Secure = true
-		c.SameSite = http.SameSiteStrictMode
-		http.SetCookie(w, c)
-	}
+	expired := time.Unix(0, 0).UTC()
+	http.SetCookie(w, &http.Cookie{
+		Name:     refreshCookieName,
+		Path:     "/api/auth",
+		Value:    "",
+		MaxAge:   -1,
+		Expires:  expired,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+	// #nosec G124 -- see setSessionCookies: matches the non-HttpOnly
+	// access-token cookie it's clearing. Secure and SameSite are both
+	// still set.
+	http.SetCookie(w, &http.Cookie{
+		Name:     accessCookieName,
+		Path:     "/",
+		Value:    "",
+		MaxAge:   -1,
+		Expires:  expired,
+		HttpOnly: false,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
 }

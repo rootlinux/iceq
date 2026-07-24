@@ -416,6 +416,10 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 		wakeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = deps.WakeAccepted(wakeCtx, uin)
 		cancel()
+		// #nosec G118 -- this goroutine's lifetime is the WebSocket
+		// connection's, not this ServeHTTP request's; it must keep
+		// running (and keep using a fresh context.Background per
+		// tick) long after the request that started it has returned.
 		go func() {
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
@@ -471,6 +475,7 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 	// 8. Launch the read/write loops. They exit when the
 	// connection closes; we return from ServeHTTP after
 	// starting them (the loops outlive the request scope).
+	// #nosec G118 -- intentionally non-request-scoped; see comment above.
 	go c.writeLoop()
 	c.readLoop()
 

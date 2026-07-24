@@ -67,6 +67,9 @@ end
 return maximum
 `
 
+// #nosec G101 -- this is a SQL statement (the column name
+// "password_hash" is what gosec's heuristic matches), not a
+// credential literal.
 const qUpdateUserPasswordHash = `
 	UPDATE users
 	SET password_hash = $1,

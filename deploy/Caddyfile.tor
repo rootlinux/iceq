@@ -17,5 +17,27 @@
             # Validate the default edge's public certificate against the
             # container system trust store; never disable upstream TLS checks.
         }
+
+        # The main edge's (security_headers) snippet is written for the
+        # real-TLS listeners and is wrong for this one: an onion address can
+        # never get a CA certificate, so this response reaches the Tor Browser
+        # over plain HTTP no matter what headers say otherwise.
+        #
+        # - Strict-Transport-Security is spec-inert here (browsers only honor
+        #   HSTS received over an actual secure transport, RFC 6797 §7.2), but
+        #   stripping it avoids shipping a misleading header for a promise the
+        #   connection can't keep.
+        # - Content-Security-Policy's `upgrade-insecure-requests` is NOT
+        #   inert: browsers apply it to a document regardless of the
+        #   document's own transport, rewriting the app's own same-origin
+        #   fetch()/WebSocket calls from http:// to https://. On an onion
+        #   address there is no TLS terminator to answer that upgraded
+        #   request, so every API call and the WebSocket connection itself
+        #   would break for anyone loading the app via .onion. Replaced here
+        #   with the same policy minus that directive, and with `ws:` added
+        #   to connect-src (the client picks ws:/wss: based on the page's own
+        #   protocol, and this page is only ever plain http:// at this edge).
+        header_down -Strict-Transport-Security
+        header_down Content-Security-Policy "default-src 'self'; script-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
     }
 }

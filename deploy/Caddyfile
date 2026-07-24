@@ -279,6 +279,29 @@
         }
     }
 
+    # ── MinIO presigned-URL proxy ─────────────────────────────────────
+    # file-service mints presigned PUT/GET URLs against
+    # ICEQ_MINIO_ENDPOINT (default "minio:9000", a Docker-internal
+    # hostname MinIO has no published host port for) and rewrites them
+    # to this same-origin path (see backend/file-service/minio/client.go
+    # toProxyPath). AWS SigV4 signatures cover the Host header, so the
+    # Host forwarded upstream must be forced back to exactly what was
+    # signed — reverse_proxy_common's Host passthrough would send the
+    # public-facing Host instead and every signature check would fail.
+    handle_path /files-proxy/* {
+        rate_limit {
+            zone files_proxy {
+                key    {remote_host}
+                window 1m
+                events 60
+            }
+        }
+        reverse_proxy {$ICEQ_MINIO_ENDPOINT:minio:9000} {
+            header_up Host {$ICEQ_MINIO_ENDPOINT:minio:9000}
+            import proxy_transport
+        }
+    }
+
     # ── WebSocket — 10 connections/min per IP ─────────────────────────
     handle @websockets {
         rate_limit {

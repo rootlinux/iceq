@@ -81,6 +81,11 @@ func verifyArgon2idPassword(storedHash, password string) passwordVerifyResult {
 		params.iterations,
 		params.memory,
 		params.parallelism,
+		// #nosec G115 -- expected is base64-decoded from our own
+		// previously-stored hash (see hashPassword's fixed output
+		// length); it is never long enough to approach the uint32
+		// range, and Go slice lengths can't exceed available memory
+		// regardless.
 		uint32(len(expected)),
 	)
 	if subtle.ConstantTimeCompare(actual, expected) != 1 {
@@ -141,9 +146,12 @@ func parseArgon2idParams(raw string) (argon2idParams, bool) {
 		return argon2idParams{}, false
 	}
 
+	// memory and iterations were parsed by strconv.ParseUint(value,
+	// 10, 32) above, which already rejects any value that doesn't
+	// fit in 32 bits; the casts below can never truncate.
 	return argon2idParams{
-		memory:      uint32(memory),
-		iterations:  uint32(iterations),
+		memory:      uint32(memory),     // #nosec G115
+		iterations:  uint32(iterations), // #nosec G115
 		parallelism: uint8(parallelism),
 	}, true
 }
