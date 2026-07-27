@@ -98,14 +98,18 @@ Direct-message safety numbers are computed client-side from the two users' UINs 
 - **JWT rotation** — short-lived access tokens (15 min) + refresh rotation; revoked tokens blocklisted in Redis
 - **Prekey replenishment contract** — frontend accepts key-service `204 No Content` responses when uploading one-time prekeys
 - **HSTS + CSP** - strict self-hosted browser policy enforced by Caddy; no third-party fonts or scripts
-- **Panic wipe** — duress password triggers async deletion of messages, keys, contacts, and account
+- **Panic wipe** — an authenticated, strongly confirmed challenge-signature request starts durable asynchronous deletion of the account across managed storage layers
 - **Read-only containers** — all services run with `read_only: true`; only `/tmp` tmpfs is writable
 - **No-new-privileges** — `no-new-privileges:true` on every container prevents privilege escalation
 - **Resource limits** — each container is capped at CPU and memory to limit blast radius
 
 ### Existing database volumes: required security migrations
 
-Docker initdb mounts run only when a fresh, empty volume is created. Before deploying this revision onto existing PostgreSQL or Scylla volumes, compare a recorded migration ledger and the live schema with `deploy/init/migrations/`, take an encrypted backup, and run each missing migration below in numeric order. Migration 013 and the other guarded additive statements use retry-safe `IF NOT EXISTS`, but that is not a blanket idempotency claim for every historical migration, and a successful retry does not prove that a pre-existing object has the expected definition; always run the schema checks that follow.
+Docker initdb mounts run only when a fresh, empty volume is created. Before deploying this revision onto existing PostgreSQL or Scylla volumes, compare a recorded migration ledger and the live schema with `deploy/init/migrations/`, take an encrypted backup, and run each missing migration below in numeric order.
+
+**Guarded migrations** (retry-safe `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` / exception handling): 004, 005, 006, 007, 008, 009, 012, 014, 015, 016, 017. A successful retry does not prove that a pre-existing object has the expected definition.
+
+**Unguarded migrations** (require schema inspection before applying): 010, 011, 013. These are ScyllaDB CQL `ALTER TABLE ADD` operations. CQL does not support `IF NOT EXISTS` on column additions; applying them against a schema where the column already exists will fail. Before running these, inspect the target schema with `cqlsh -e "DESCRIBE TABLE iceq.<table>;"` and skip any column that already exists.
 
 ```bash
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
@@ -115,17 +119,46 @@ docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
   cqlsh < deploy/init/migrations/004_panic_wipe_message_indexes.cql
 
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'exec psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iceq}"' \
+  < deploy/init/migrations/006_file_object_owners.sql
+
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'exec psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iceq}"' \
+  < deploy/init/migrations/007_file_object_grants.sql
+
+# UNGUARDED — inspect schema first; skip columns that already exist
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
+  cqlsh < deploy/init/migrations/010_group_message_crypto_epoch.cql
+
+# UNGUARDED — inspect schema first; skip columns that already exist
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
   cqlsh < deploy/init/migrations/011_disappearing_messages.cql
 
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
   cqlsh < deploy/init/migrations/012_durable_message_ingest.cql
 
+# UNGUARDED — inspect schema first; skip columns that already exist
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
   cqlsh < deploy/init/migrations/013_group_recipient_snapshot.cql
+
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'psql --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < deploy/init/migrations/014_panic_wipe_pin.sql
+
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'psql --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < deploy/init/migrations/015_wipe_public_key.sql
+
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
+  sh -c 'psql --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < deploy/init/migrations/016_wipe_jobs.sql
+
+docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
+  cqlsh < deploy/init/migrations/017_user_erasure_indexes.cql
 ```
 
-Credentials expand only inside the containers and passwords are not printed. Both commands are safe to retry because the migrations use `CREATE TABLE IF NOT EXISTS`. Verify PostgreSQL before restarting authenticated services:
+Credentials expand only inside the containers and passwords are not printed. Verify PostgreSQL before restarting authenticated services; migration 016 also contains the exact `wipe_jobs` column query:
 
 ```bash
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T postgres \
@@ -136,13 +169,14 @@ Verify the deletion indexes, expiry columns, durable ingest receipt, and outbox 
 
 ```bash
 docker compose --env-file deploy/.env.local -f deploy/docker-compose.yml exec -T scylla \
-  sh -ec 'tables="$(cqlsh --no-color -e "SELECT table_name FROM system_schema.tables WHERE keyspace_name = '\''iceq'\'';")"; columns="$(cqlsh --no-color -e "SELECT table_name, column_name FROM system_schema.columns WHERE keyspace_name = '\''iceq'\'' AND column_name = '\''expires_at'\'';")"; for table in message_deletion_index group_message_deletion_index message_ingest message_outbox group_message_outbox; do printf "%s\n" "$tables" | grep -qw "$table"; done; printf "%s\n" "$columns" | grep -E '\''messages[[:space:]]*\\|[[:space:]]*expires_at'\''; printf "%s\n" "$columns" | grep -E '\''group_messages[[:space:]]*\\|[[:space:]]*expires_at'\'''
+  sh -ec 'tables="$(cqlsh --no-color -e "SELECT table_name FROM system_schema.tables WHERE keyspace_name = '\''iceq'\'';")"; columns="$(cqlsh --no-color -e "SELECT table_name, column_name FROM system_schema.columns WHERE keyspace_name = '\''iceq'\'' AND column_name = '\''expires_at'\'';")"; for table in message_deletion_index group_message_deletion_index message_ingest message_outbox group_message_outbox message_ingest_erasure_index message_outbox_erasure_index group_message_outbox_erasure_index; do printf "%s\n" "$tables" | grep -qw "$table"; done; printf "%s\n" "$columns" | grep -E '\''messages[[:space:]]*\\|[[:space:]]*expires_at'\''; printf "%s\n" "$columns" | grep -E '\''group_messages[[:space:]]*\\|[[:space:]]*expires_at'\'''
 ```
 
 Rollout ordering is service-specific:
 
-1. Apply and verify migrations `004_panic_wipe_message_indexes.cql`, `011_disappearing_messages.cql`, `012_durable_message_ingest.cql`, and `013_group_recipient_snapshot.cql` **before starting the updated message-service**; otherwise it fails closed because durable receipts/outbox, immutable group recipient snapshots, or required message metadata are unavailable.
+1. Apply and verify migrations `004_panic_wipe_message_indexes.cql`, `010_group_message_crypto_epoch.cql`, `011_disappearing_messages.cql`, `012_durable_message_ingest.cql`, `013_group_recipient_snapshot.cql`, and `017_user_erasure_indexes.cql` **before starting the updated message-service and auth-service cleanup worker**; otherwise durable receipts/outbox, immutable group recipient snapshots, required message metadata, or bounded user erasure may be unavailable.
 2. Apply and verify migration `005_wiped_accounts.sql` **before starting the updated auth-service or ws-gateway**. Until 005 exists, JWT validation cannot prove durable revocation and fails closed, so authenticated REST requests and WebSocket authentication/message checks are rejected.
+3. Apply and verify migrations `014_panic_wipe_pin.sql`, `015_wipe_public_key.sql`, and `016_wipe_jobs.sql` **before starting the updated auth-service**. Migration 016 is a startup requirement: the background wipe worker fails closed if the durable job table is missing or malformed.
 
 ## Optional Tor Hidden Service
 

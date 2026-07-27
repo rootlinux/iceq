@@ -82,6 +82,19 @@
     }
 }
 
+# Poll-specific transport: same as proxy_transport but with a
+# response_header_timeout that exceeds MaxPollWait (25 s). Used
+# only for /api/transport/* so long-poll requests are not killed
+# by the proxy before the gateway finishes its wait.
+(proxy_transport_poll) {
+    transport http {
+        dial_timeout            5s
+        response_header_timeout 35s
+        read_timeout            30s
+        write_timeout           30s
+    }
+}
+
 # ── Shared IceQ route table ───────────────────────────────────────────────────
 # Imported by BOTH the :80 (Tor) and https://localhost (direct) site blocks.
 # Anything in here runs identically regardless of how the client reached us,
@@ -230,10 +243,14 @@
         }
     }
 
+    # Transport poll is the only route that intentionally blocks for
+    # seconds (up to MaxPollWait=25s) waiting for new messages. The
+    # standard 10s response_header_timeout would kill a valid empty
+    # poll with a 504 before the gateway finishes its wait.
     handle /api/transport/* {
         reverse_proxy ws-gateway:8082 {
             import reverse_proxy_common
-            import proxy_transport
+            import proxy_transport_poll
         }
     }
 

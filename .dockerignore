@@ -1,0 +1,55 @@
+# IceQ — Docker build-context exclusions
+#
+# Build contexts: Caddy/web (deploy/Dockerfile.caddy) and Go services
+# (backend/*/Dockerfile) all use the repository root as context.
+#
+# RULES OF THUMB:
+#   - Never include real secrets, credentials, or environment files.
+#   - Never include AI/editor/OS development-tool directories.
+#   - Never include node_modules, dist, coverage, or test artifacts.
+#   - Keep everything needed for `npm ci && npm run build` and `go build`.
+
+# ── Version control ──────────────────────────────────────────────────
+.git
+.github
+
+# ── Secrets and environment ──────────────────────────────────────────
+.env
+.env.*
+!.env.example
+deploy/.env
+deploy/.env.*
+
+# ── Dependencies ─────────────────────────────────────────────────────
+node_modules
+web/node_modules
+
+# ── Build output ─────────────────────────────────────────────────────
+dist
+web/dist
+*.tsbuildinfo
+
+# ── Test and coverage artifacts ──────────────────────────────────────
+coverage
+*.coverage
+web/coverage
+web/test-results
+web/playwright-report
+web/playwright/.cache
+*.out
+
+# ── Logs ─────────────────────────────────────────────────────────────
+*.log
+logs
+
+# ── Temporary and editor files ───────────────────────────────────────
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# ── OS metadata ──────────────────────────────────────────────────────
+__MACOSX

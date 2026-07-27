@@ -96,11 +96,11 @@ if docker image inspect iceq/caddy:dev >/dev/null 2>&1; then
   docker run --rm \
     -e ICEQ_ONION_LOCATION= \
     -v "$caddyfile:/etc/caddy/Caddyfile:ro" \
-    iceq/caddy:dev validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
+    iceq/caddy:dev caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
     fail "Caddy failed to validate the clearnet configuration"
   docker run --rm \
     -v "$tor_caddyfile:/etc/caddy/Caddyfile:ro" \
-    iceq/caddy:dev validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
+    iceq/caddy:dev caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
     fail "Caddy failed to validate the isolated Tor-edge configuration"
   printf 'PASS: Caddy runtime syntax validation completed for both edge configurations.\n'
 else

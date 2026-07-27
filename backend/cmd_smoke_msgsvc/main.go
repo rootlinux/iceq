@@ -16,7 +16,9 @@
 //
 //	docker run --rm --network iceq-net \
 //	  -v /path/to/iceq:/src \
-//	  -w /src/backend -e ICEQ_JWT_SECRET=dev-secret-not-for-prod \
+//	  -w /src/backend \
+//	  -e ICEQ_JWT_SECRET=dev-secret-not-for-prod \
+//	  -e ICEQ_NATS_TOKEN -e ICEQ_REDIS_PASSWORD \
 //	  alpine:3.20 /src/backend/cmd_smoke_msgsvc/smoke
 package main
 
@@ -50,6 +52,13 @@ const (
 	scyllaHosts = "scylla:9042"
 )
 
+func natsTokenOption() []nats.Option {
+	if token := os.Getenv("ICEQ_NATS_TOKEN"); token != "" {
+		return []nats.Option{nats.Token(token)}
+	}
+	return nil
+}
+
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -67,7 +76,7 @@ func main() {
 	accessA := mintAccessToken(mgr, uinA)
 	_ = mintAccessToken(mgr, uinB) // minted for parity; not used by this test
 
-	nc, err := nats.Connect(natsURL)
+	nc, err := nats.Connect(natsURL, natsTokenOption()...)
 	must(err, "nats connect")
 	defer nc.Drain()
 

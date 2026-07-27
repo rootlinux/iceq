@@ -20,7 +20,9 @@
 //
 //	docker run --rm --network iceq-net \
 //	    -v /path/to/iceq:/src \
-//	    -w /src/backend -e ICEQ_JWT_SECRET=dev-only-jwt-secret-change-in-prod \
+//	    -w /src/backend \
+//	    -e ICEQ_JWT_SECRET=dev-only-jwt-secret-change-in-prod \
+//	    -e ICEQ_NATS_TOKEN -e ICEQ_REDIS_PASSWORD \
 //	    golang:1.25-alpine \
 //	    go run ./cmd_smoke_step6
 package main
@@ -48,6 +50,13 @@ const (
 	defaultPGDSN = "postgres://postgres:postgres@postgres:5432/iceq?sslmode=disable"
 )
 
+func natsTokenOption() []nats.Option {
+	if token := os.Getenv("ICEQ_NATS_TOKEN"); token != "" {
+		return []nats.Option{nats.Token(token)}
+	}
+	return nil
+}
+
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -72,7 +81,7 @@ func main() {
 	mustInsertContact(ctx, uinB, uinA)
 	fmt.Println("[smoke] contact: uinB watches uinA")
 
-	nc, err := nats.Connect(natsURL)
+	nc, err := nats.Connect(natsURL, natsTokenOption()...)
 	must(err, "nats connect")
 	defer nc.Drain()
 	notifyHits := make(chan *nats.Msg, 4)
@@ -258,7 +267,7 @@ func mintTokensFor(uins ...int64) map[int64]string {
 		// of any knownWeakSecrets entry.
 		secret = "step6-smoketest-secret-not-for-prod-32"
 	}
-	rdb := redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	rdb := redis.NewClient(&redis.Options{Addr: "redis:6379", Password: os.Getenv("ICEQ_REDIS_PASSWORD")})
 	defer func() { _ = rdb.Close() }()
 	// F-5: NewManager requires a pg pool for the
 	// session_epoch check in Verify. The smoke test

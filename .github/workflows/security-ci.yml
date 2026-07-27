@@ -61,12 +61,12 @@ jobs:
       - name: Build web
         working-directory: web
         run: npm run build
-      - name: Audit all dependencies at release severity
+      - name: Audit all dependencies (policy gate)
         working-directory: web
-        run: npm audit --audit-level=moderate
-      - name: Audit production dependencies at release severity
+        run: node --import tsx scripts/audit-policy.mts
+      - name: Audit production dependencies (policy gate)
         working-directory: web
-        run: npm audit --audit-level=moderate --omit=dev
+        run: node --import tsx scripts/audit-policy.mts --production
 
   configuration:
     name: Compose and secret validation
@@ -104,3 +104,92 @@ jobs:
           gitleaks detect --source . --redact --no-banner
       - name: Validate Compose model
         run: ./deploy/scripts/check-compose-config.sh
+
+  e2e:
+    name: Playwright E2E (Chromium + WebKit)
+    runs-on: ubuntu-latest
+    needs: [web]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Start disposable acceptance stack
+        run: |
+          docker compose -f deploy/docker-compose.acceptance.yml up -d --wait
+          docker compose -f deploy/docker-compose.acceptance.yml ps
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      - name: Install Playwright browsers
+        working-directory: web
+        run: npx playwright install chromium webkit --with-deps
+      - name: Build web
+        working-directory: web
+        run: npm run build
+      - name: Run Playwright E2E
+        working-directory: web
+        run: npm run test:e2e
+      - name: Upload Playwright traces on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playwright-traces
+          path: web/test-results/
+          retention-days: 7
+      - name: Tear down acceptance stack
+        if: always()
+        run: docker compose -f deploy/docker-compose.acceptance.yml down -v
+
+  acceptance:
+    name: Panic Wipe five-storage acceptance
+    runs-on: ubuntu-latest
+    needs: [backend]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Start disposable acceptance stack
+        run: |
+          docker compose -f deploy/docker-compose.acceptance.yml up -d --wait
+          docker compose -f deploy/docker-compose.acceptance.yml ps
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Initialize PostgreSQL schema
+        run: |
+          cat deploy/init/postgres-init.sql | \
+            docker compose -f deploy/docker-compose.acceptance.yml exec -T postgres \
+            psql -U postgres -d iceq
+      - name: Run five-storage acceptance test
+        working-directory: backend
+        env:
+          ICEQ_ACCEPTANCE: "1"
+          ICEQ_ACCEPTANCE_PG_URL: "postgres://postgres:postgres@localhost:5434/iceq?sslmode=disable"
+          ICEQ_ACCEPTANCE_REDIS_ADDR: "localhost:6380"
+          ICEQ_ACCEPTANCE_REDIS_PASSWORD: "iceq-acceptance-redis"
+          ICEQ_ACCEPTANCE_SCYLLA_HOSTS: "localhost:9043"
+          ICEQ_ACCEPTANCE_NATS_URL: "nats://localhost:4223"
+          ICEQ_ACCEPTANCE_NATS_TOKEN: "iceq-acceptance-nats"
+          ICEQ_ACCEPTANCE_MINIO_ENDPOINT: "localhost:9002"
+          ICEQ_ACCEPTANCE_MINIO_ACCESS_KEY: "minioadmin"
+          ICEQ_ACCEPTANCE_MINIO_SECRET_KEY: "minioadmin"
+        run: |
+          set -o pipefail
+          go test -count=1 -race -tags=integration -run TestAcceptanceFullStack -v ./auth-service/handlers/ 2>&1 | tee acceptance-output.txt
+      - name: Print failure output
+        if: failure()
+        working-directory: backend
+        run: cat acceptance-output.txt
+      - name: Tear down acceptance stack
+        if: always()
+        run: docker compose -f deploy/docker-compose.acceptance.yml down -v
