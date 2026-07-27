@@ -25,6 +25,8 @@ import { AddContact } from "./AddContact";
 import { ContactItem } from "./ContactItem";
 import type { Contact } from "../../types/models";
 import { useI18n } from "../../i18n";
+import { getBulkPresence } from "../../api/presence";
+import { permitsPrivacySignal } from "../../lib/privacySettings";
 
 interface ContactListProps {
   onContactSelected?: () => void;
@@ -41,6 +43,17 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
   const removeContactAsync = useContactStore((s) => s.removeContactAsync);
   const [showBlocked, setShowBlocked] = useState(false);
   const [busyUin, setBusyUin] = useState<number | null>(null);
+  const [privacyGeneration, setPrivacyGeneration] = useState(0);
+
+  // Re-run the presence snapshot fetch below when the user flips the
+  // "presence" privacy toggle on -- otherwise turning it on mid-session
+  // would only take effect the next time the accepted-contacts list
+  // itself changes.
+  useEffect(() => {
+    const onPrivacyChanged = (): void => setPrivacyGeneration((g) => g + 1);
+    window.addEventListener("iceq:privacy-changed", onPrivacyChanged);
+    return () => window.removeEventListener("iceq:privacy-changed", onPrivacyChanged);
+  }, []);
 
   // Re-fetch the wire data on mount. The contact list is
   // the source of truth for the sidebar so a fresh load
@@ -84,6 +97,34 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
     blocked.sort((a, b) => a.uin - b.uin);
     return { incoming, outgoing, accepted, blocked };
   }, [contacts, statuses, directions]);
+
+  // Snapshot fetch: the real-time "presence" WS case only delivers
+  // transitions that happen after this client is connected, so a
+  // contact who was already online beforehand is otherwise stuck at
+  // the store's "offline" fallback until their next status change.
+  // Mirrors the "presence" privacy toggle that already gates the
+  // real-time subscription (see useWebSocket.ts) for consistency.
+  const acceptedUinsKey = accepted.map((c) => c.uin).join(",");
+  useEffect(() => {
+    if (!permitsPrivacySignal("presence") || acceptedUinsKey === "") return;
+    const uins = acceptedUinsKey.split(",").map(Number);
+    let cancelled = false;
+    void getBulkPresence(uins)
+      .then((snapshot) => {
+        if (cancelled) return;
+        const updatePresence = useContactStore.getState().updatePresence;
+        for (const [uinStr, entry] of Object.entries(snapshot)) {
+          updatePresence(Number(uinStr), entry.status, entry.last_seen);
+        }
+      })
+      .catch(() => {
+        // Best-effort: the real-time subscription still covers future
+        // transitions even if this initial snapshot fetch fails.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [acceptedUinsKey, privacyGeneration]);
 
   async function onAccept(uin: number): Promise<void> {
     setBusyUin(uin);

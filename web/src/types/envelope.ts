@@ -55,7 +55,10 @@ export type EnvelopeType =
   | "pong"
   // Server-to-client error. Rendered as a console error by
   // the dispatcher; UI is intentionally minimal.
-  | "error";
+  | "error"
+  // Server-originated user-visible event (e.g. an incoming contact
+  // request or group invite). See NotificationPayload below.
+  | "notification";
 
 // ----------------------------------------------------------------------------
 // Envelope — the wire shape. The server wraps every WS frame in
@@ -177,6 +180,15 @@ export type PongPayload = PingPayload;
 export interface ErrorPayload {
   code: string;
   message: string;
+}
+
+// Kind is one of the NotificationKind* constants defined on the Go side
+// (backend/shared/models/envelope.go): "contact_request" | "group_invite".
+export interface NotificationPayload {
+  kind: string;
+  title: string;
+  body: string;
+  data?: Record<string, unknown>;
 }
 
 // ----------------------------------------------------------------------------

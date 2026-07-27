@@ -97,6 +97,11 @@ const (
 	// NotificationKindGroupInvite is fired when someone adds the
 	// recipient to a group with role=member.
 	NotificationKindGroupInvite = "group_invite"
+
+	// NotificationKindContactAccepted is fired when a pending contact
+	// request is accepted so the original requester sees the accepted
+	// relationship without reloading.
+	NotificationKindContactAccepted = "contact_accepted"
 )
 
 // ----------------------------------------------------------------------------

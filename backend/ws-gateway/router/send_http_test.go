@@ -59,7 +59,7 @@ func TestHTTPSendDoesNotDependOnGatewayRedisCommit(t *testing.T) {
 	// There is deliberately no Redis/deduper dependency here: a persisted ACK
 	// comes only from the durable message-service request/reply boundary.
 	ingest := &publisherStub{}
-	body := `{"type":"message","payload":{"conversation_id":"dm:7:42","to_uin":42,"ciphertext":"YQ","msg_type":"signal_message","client_id":"durable-client"}}`
+	body := `{"type":"message","payload":{"conversation_id":"dm:7:42","to_uin":42,"ciphertext":"YQ","msg_type":"signal_message","client_id":"durable-client","expires_in_seconds":3600}}`
 	req := httptest.NewRequest(http.MethodPost, "/send", strings.NewReader(body))
 	req = req.WithContext(middleware.WithUIN(req.Context(), 7))
 	rr := httptest.NewRecorder()
@@ -73,7 +73,7 @@ func TestHTTPSendRejectsNonDurableIngestReply(t *testing.T) {
 	bad, _ := models.NewEnvelope(models.EnvelopeTypeAck, models.AckPayload{MessageID: "c", State: models.AckStateDelivered})
 	reply, _ := json.Marshal(bad)
 	ingest := &publisherStub{reply: reply}
-	body := `{"type":"message","payload":{"conversation_id":"dm:7:42","to_uin":42,"ciphertext":"YQ","msg_type":"signal_message","client_id":"c"}}`
+	body := `{"type":"message","payload":{"conversation_id":"dm:7:42","to_uin":42,"ciphertext":"YQ","msg_type":"signal_message","client_id":"c","expires_in_seconds":3600}}`
 	req := httptest.NewRequest(http.MethodPost, "/send", strings.NewReader(body))
 	req = req.WithContext(middleware.WithUIN(req.Context(), 7))
 	rr := httptest.NewRecorder()
@@ -85,7 +85,7 @@ func TestHTTPSendRejectsNonDurableIngestReply(t *testing.T) {
 
 func TestHTTPSendBindsActorAndPublishesOpaqueEnvelopeOnce(t *testing.T) {
 	pub := &publisherStub{}
-	payload := `{"conversation_id":"dm:7:42","sender_uin":999,"to_uin":42,"ciphertext":"` + base64.RawURLEncoding.EncodeToString([]byte("opaque")) + `","msg_type":"signal_message","client_id":"client-1"}`
+	payload := `{"conversation_id":"dm:7:42","sender_uin":999,"to_uin":42,"ciphertext":"` + base64.RawURLEncoding.EncodeToString([]byte("opaque")) + `","msg_type":"signal_message","client_id":"client-1","expires_in_seconds":3600}`
 	body := `{"type":"message","id":"wire-id","ts":1,"payload":` + payload + `}`
 	req := httptest.NewRequest(http.MethodPost, "/send", strings.NewReader(body))
 	req = req.WithContext(middleware.WithUIN(req.Context(), 7))
@@ -115,7 +115,7 @@ func TestHTTPSendBindsActorAndPublishesOpaqueEnvelopeOnce(t *testing.T) {
 
 func TestHTTPSendReturnsOnlyDurableIngestAck(t *testing.T) {
 	pub := &publisherStub{}
-	body := `{"type":"message","id":"wire-id","ts":1,"payload":{"conversation_id":"dm:7:42","to_uin":42,"ciphertext":"b3BhcXVl","msg_type":"signal_message","client_id":"client-1"}}`
+	body := `{"type":"message","id":"wire-id","ts":1,"payload":{"conversation_id":"dm:7:42","to_uin":42,"ciphertext":"b3BhcXVl","msg_type":"signal_message","client_id":"client-1","expires_in_seconds":3600}}`
 	req := httptest.NewRequest(http.MethodPost, "/send", strings.NewReader(body))
 	req = req.WithContext(middleware.WithUIN(context.Background(), 7))
 	rr := httptest.NewRecorder()

@@ -39,6 +39,15 @@ func (b *ScyllaIngestBackend) Claim(ctx context.Context, proposed IngestRecord, 
 		return IngestRecord{}, 0, fmt.Errorf("store: claim ingest: %w", err)
 	}
 	if applied {
+		// Write the erasure index so panic-wipe can find this ingest row
+		// without ALLOW FILTERING. The erasure index is idempotent (same
+		// PK, same values — Scylla INSERT is an upsert).
+		if err := b.session.Query(
+			`INSERT INTO iceq.message_ingest_erasure_index (uin, sender_uin, client_id) VALUES (?, ?, ?)`,
+			proposed.Key.SenderUIN, proposed.Key.SenderUIN, proposed.Key.ClientID,
+		).WithContext(ctx).Consistency(gocql.Quorum).Exec(); err != nil {
+			return IngestRecord{}, 0, fmt.Errorf("store: write ingest erasure index: %w", err)
+		}
 		return proposed, ClaimAcquired, nil
 	}
 	current, err := b.load(ctx, proposed.Key)
@@ -215,6 +224,10 @@ func (w *ScyllaDurableDirectWriter) WriteDirect(ctx context.Context, write Durab
 		batch.Query(`INSERT INTO iceq.message_outbox
 		  (bucket, created_at, message_id, receiver_uin, sender_uin, client_id, conversation_id, envelope, envelope_hash, state, expires_at)
 		  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`, outboxBucket(req.ID), req.CreatedAt, req.ID, req.ReceiverUIN, req.SenderUIN, write.Key.ClientID, req.ConversationID, write.Envelope, write.EnvelopeHash[:], "pending", expiresAt, seconds)
+		batch.Query(`INSERT INTO iceq.message_outbox_erasure_index (uin, bucket, created_at, message_id) VALUES (?, ?, ?, ?) USING TTL ?`, req.SenderUIN, outboxBucket(req.ID), req.CreatedAt, req.ID, seconds)
+		if req.ReceiverUIN != req.SenderUIN {
+			batch.Query(`INSERT INTO iceq.message_outbox_erasure_index (uin, bucket, created_at, message_id) VALUES (?, ?, ?, ?) USING TTL ?`, req.ReceiverUIN, outboxBucket(req.ID), req.CreatedAt, req.ID, seconds)
+		}
 	} else {
 		batch.Query(`INSERT INTO iceq.messages
 		  (conversation_id, created_at, id, sender_uin, receiver_uin, ciphertext, msg_type, status)
@@ -226,6 +239,10 @@ func (w *ScyllaDurableDirectWriter) WriteDirect(ctx context.Context, write Durab
 		batch.Query(`INSERT INTO iceq.message_outbox
 		  (bucket, created_at, message_id, receiver_uin, sender_uin, client_id, conversation_id, envelope, envelope_hash, state)
 		  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, outboxBucket(req.ID), req.CreatedAt, req.ID, req.ReceiverUIN, req.SenderUIN, write.Key.ClientID, req.ConversationID, write.Envelope, write.EnvelopeHash[:], "pending")
+		batch.Query(`INSERT INTO iceq.message_outbox_erasure_index (uin, bucket, created_at, message_id) VALUES (?, ?, ?, ?)`, req.SenderUIN, outboxBucket(req.ID), req.CreatedAt, req.ID)
+		if req.ReceiverUIN != req.SenderUIN {
+			batch.Query(`INSERT INTO iceq.message_outbox_erasure_index (uin, bucket, created_at, message_id) VALUES (?, ?, ?, ?)`, req.ReceiverUIN, outboxBucket(req.ID), req.CreatedAt, req.ID)
+		}
 	}
 	if err := w.session.ExecuteBatch(batch); err != nil {
 		return fmt.Errorf("store: execute durable direct batch: %w", err)
@@ -237,6 +254,26 @@ func (w *ScyllaDurableDirectWriter) WriteGroup(ctx context.Context, write Durabl
 	req := write.Message
 	batch := w.session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
 	batch.SetConsistency(gocql.Quorum)
+
+	ob := outboxBucket(req.ID)
+	erasureInsert := func(uin int64, role string) {
+		// Group outbox erasure index entries must be committed in the same
+		// batch as the outbox row so the index is always consistent with
+		// the data. Sender uses role='sender'; every recipient uses
+		// role='recipient'.
+		if req.ExpiresInSeconds > 0 {
+			seconds := int(remainingTTLSeconds(write.ExpiresAt, time.Now().UTC()))
+			if seconds <= 0 {
+				return
+			}
+			batch.Query(`INSERT INTO iceq.group_message_outbox_erasure_index (uin, bucket, created_at, message_id, role) VALUES (?, ?, ?, ?, ?) USING TTL ?`,
+				uin, ob, req.CreatedAt, req.ID, role, seconds)
+		} else {
+			batch.Query(`INSERT INTO iceq.group_message_outbox_erasure_index (uin, bucket, created_at, message_id, role) VALUES (?, ?, ?, ?, ?)`,
+				uin, ob, req.CreatedAt, req.ID, role)
+		}
+	}
+
 	if req.ExpiresInSeconds > 0 {
 		seconds := int(remainingTTLSeconds(write.ExpiresAt, time.Now().UTC()))
 		if seconds <= 0 {
@@ -244,12 +281,23 @@ func (w *ScyllaDurableDirectWriter) WriteGroup(ctx context.Context, write Durabl
 		}
 		batch.Query(`INSERT INTO iceq.group_messages (group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`, req.GroupID, req.CreatedAt, req.ID, req.SenderUIN, req.CryptoEpoch, req.Ciphertext, req.MsgType, write.ExpiresAt, seconds)
 		batch.Query(`INSERT INTO iceq.group_message_deletion_index (uin, group_id, created_at, id) VALUES (?, ?, ?, ?) USING TTL ?`, req.SenderUIN, req.GroupID, req.CreatedAt, req.ID, seconds)
-		batch.Query(`INSERT INTO iceq.group_message_outbox (bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`, outboxBucket(req.ID), req.CreatedAt, req.ID, req.GroupID, req.SenderUIN, write.Key.ClientID, req.CryptoEpoch, write.RecipientUINs, write.Envelope, write.EnvelopeHash[:], "pending", write.ExpiresAt, seconds)
+		batch.Query(`INSERT INTO iceq.group_message_outbox (bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`, ob, req.CreatedAt, req.ID, req.GroupID, req.SenderUIN, write.Key.ClientID, req.CryptoEpoch, write.RecipientUINs, write.Envelope, write.EnvelopeHash[:], "pending", write.ExpiresAt, seconds)
 	} else {
 		batch.Query(`INSERT INTO iceq.group_messages (group_id, created_at, id, sender_uin, crypto_epoch, ciphertext, msg_type) VALUES (?, ?, ?, ?, ?, ?, ?)`, req.GroupID, req.CreatedAt, req.ID, req.SenderUIN, req.CryptoEpoch, req.Ciphertext, req.MsgType)
 		batch.Query(`INSERT INTO iceq.group_message_deletion_index (uin, group_id, created_at, id) VALUES (?, ?, ?, ?)`, req.SenderUIN, req.GroupID, req.CreatedAt, req.ID)
-		batch.Query(`INSERT INTO iceq.group_message_outbox (bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, outboxBucket(req.ID), req.CreatedAt, req.ID, req.GroupID, req.SenderUIN, write.Key.ClientID, req.CryptoEpoch, write.RecipientUINs, write.Envelope, write.EnvelopeHash[:], "pending")
+		batch.Query(`INSERT INTO iceq.group_message_outbox (bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, ob, req.CreatedAt, req.ID, req.GroupID, req.SenderUIN, write.Key.ClientID, req.CryptoEpoch, write.RecipientUINs, write.Envelope, write.EnvelopeHash[:], "pending")
 	}
+
+	// Index the sender.
+	erasureInsert(req.SenderUIN, "sender")
+	// Index every recipient so that a wiped recipient can be removed from
+	// the recipient_uins snapshot without affecting other recipients.
+	for _, recipientUIN := range write.RecipientUINs {
+		if recipientUIN != req.SenderUIN {
+			erasureInsert(recipientUIN, "recipient")
+		}
+	}
+
 	if err := w.session.ExecuteBatch(batch); err != nil {
 		return fmt.Errorf("store: execute durable group batch: %w", err)
 	}

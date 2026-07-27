@@ -158,11 +158,12 @@ func NewDurableIngestStore(backend IngestBackend, writer DurableDirectWriter, no
 	return store
 }
 
+// durableTTL shares the same bounded-retention policy as effectiveMessageTTL
+// (messagestore.go): an unset/zero request gets defaultMessageTTL, and any
+// request above maxMessageTTL is clamped down. There is no "keep forever"
+// path — a modified client cannot request indefinite retention.
 func durableTTL(seconds int64) time.Duration {
-	if seconds <= 0 {
-		return 0
-	}
-	return time.Duration(seconds) * time.Second
+	return effectiveMessageTTL(seconds)
 }
 
 func newIngestRecord(key IngestKey, envelope []byte, hash [sha256.Size]byte, now time.Time, lease time.Duration) IngestRecord {

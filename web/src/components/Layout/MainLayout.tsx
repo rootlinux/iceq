@@ -5,6 +5,7 @@
 // On mobile, the sidebar slides over the chat when open.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Sidebar } from "./Sidebar";
 import { useMessageTransport } from "../../hooks/useMessageTransport";
 import { useOnlineStatus } from "../../hooks/useOnlineStatus";
@@ -20,6 +21,7 @@ interface MainLayoutProps {
 }
 
 export function MainLayout({ children }: MainLayoutProps): JSX.Element {
+  const navigate = useNavigate();
   // Mount the WebSocket here, at the top of the authenticated
   // tree. The hook's send() is what components use to publish
   // frames; we don't propagate it via context — components
@@ -34,6 +36,7 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
   const setSignalError = useSignalStore((s) => s.setError);
   const refreshPrekeyCount = useSignalStore((s) => s.refreshPrekeyCount);
   const signalError = useSignalStore((s) => s.lastError);
+  const isMissingIdentity = signalError !== null && signalError.includes("missing this device");
   const i18n = useI18n();
 
   const closeSidebar = useCallback((): void => {
@@ -111,6 +114,8 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
+            flexWrap: "wrap",
+            gap: 8,
             fontSize: 13,
             padding: "8px 12px",
             textAlign: "center",
@@ -118,7 +123,25 @@ export function MainLayout({ children }: MainLayoutProps): JSX.Element {
             flexShrink: 0,
           }}
         >
-          {signalError}
+          <span>{signalError}</span>
+          {isMissingIdentity && (
+            <button
+              type="button"
+              onClick={() => navigate("/recovery")}
+              style={{
+                background: "rgba(255,255,255,0.15)",
+                color: "#fef2f2",
+                border: "1px solid rgba(255,255,255,0.3)",
+                borderRadius: 4,
+                padding: "2px 10px",
+                fontSize: 13,
+                fontWeight: 500,
+                cursor: "pointer",
+              }}
+            >
+              {i18n.t("auth.recoveryLink")}
+            </button>
+          )}
         </div>
       )}
       <div className="flex flex-1 overflow-hidden">

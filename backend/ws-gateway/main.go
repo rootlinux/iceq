@@ -175,6 +175,14 @@ func main() {
 		log.Fatalf("durable delivery consumer: %v", err)
 	}
 
+	// Wire Core NATS subscribers for real-time fanout. Without these,
+	// msg.direct.*, msg.group.*, and notification.* are dead letters —
+	// the auth-service's publish to notification.<uin> reaches nobody,
+	// and contact requests/acceptances are invisible until manual reload.
+	if err := startNATSSubscribers(nc, h, pgPool); err != nil {
+		log.Fatalf("nats subscribers: %v", err)
+	}
+
 	// --- Shared client deps (passed to every WebSocket) ---------------
 	deps := client.Deps{
 		NATS:                nc,
@@ -352,6 +360,27 @@ func startNATSSubscribers(nc *natsclient.Client, h *hub.Hub, pg *pgxpool.Pool) e
 			return
 		}
 		h.Broadcast(ctx, uins, m.Data)
+	}); err != nil {
+		return err
+	}
+
+	// 3. notification.* — server-originated user-visible events (contact
+	//    requests, group invites; see NotificationKind* in
+	//    shared/models/envelope.go). Without this subscription the
+	//    auth-service's publish to notification.<uin> is a dead end: the
+	//    recipient only learns about the pending row on their next manual
+	//    GET /api/contacts or /api/groups poll. Hub.Send gives us the same
+	//    live-delivery + bounded offline-queue semantics as msg.direct.
+	if _, err := nc.Subscribe("notification.*", func(m *natsMsg) {
+		uin, ok := parseTailUIN(m.Subject, "notification.")
+		if !ok {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := h.Send(ctx, uin, m.Data); err != nil {
+			log.Printf("[ws-gateway] notification fanout: %v", err)
+		}
 	}); err != nil {
 		return err
 	}

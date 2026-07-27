@@ -27,7 +27,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { refreshSession, tokenStore } from "../api/client";
 import { useAuthStore } from "../store/authStore";
 import { useChatStore, conversationIdForPair } from "../store/chatStore";
-import { useContactStore } from "../store/contactStore";
+import { refreshContactStatuses, useContactStore } from "../store/contactStore";
 import { classifyClose } from "../lib/wsCloseCodes";
 import { decryptMessage } from "../lib/signal";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
@@ -40,6 +40,7 @@ import type {
   ErrorPayload,
   GroupMessagePayload,
   MessagePayload,
+  NotificationPayload,
   PingPayload,
   PongPayload,
   PresencePayload,
@@ -474,6 +475,20 @@ export function useWebSocket(): UseWebSocketResult {
         // safe terminal action is to revoke every grant that is still pending.
         void attachmentGrantLifecycle.revokeAll();
         if (__DEV__) console.error("[ws] error frame:", p);
+        return;
+      }
+      case "notification": {
+        // Real-time contact-request / group-invite push. Without this, the
+        // recipient only sees the new pending row after a manual page
+        // reload (loadContacts()/loadGroups() run once on ChatShell mount).
+        const p = env.payload as NotificationPayload;
+        if (p.kind === "contact_request") {
+          void refreshContactStatuses().catch((e) => { if (__DEV__) console.error("[ws] contact refresh failed:", e); });
+        } else if (p.kind === "contact_accepted") {
+          void refreshContactStatuses().catch((e) => { if (__DEV__) console.error("[ws] contact accepted refresh failed:", e); });
+        } else if (p.kind === "group_invite") {
+          void useGroupStore.getState().loadGroups().catch((e) => { if (__DEV__) console.error("[ws] group refresh failed:", e); });
+        }
         return;
       }
 	  case "transport_ack": {

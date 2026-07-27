@@ -23,9 +23,10 @@ func TestDecodeWireCiphertextAcceptsBase64URL(t *testing.T) {
 
 func TestValidateDirectPayloadAllowsCiphertextOnlyE2EEMessage(t *testing.T) {
 	err := validateDirectPayload(models.DirectMessagePayload{
-		ReceiverUIN: 99,
-		Ciphertext:  []byte("ciphertext"),
-		MsgType:     "prekey_message",
+		ReceiverUIN:      99,
+		Ciphertext:       []byte("ciphertext"),
+		MsgType:          "prekey_message",
+		ExpiresInSeconds: 3600,
 	})
 	if err != nil {
 		t.Fatalf("validateDirectPayload rejected ciphertext-only message: %v", err)
@@ -110,7 +111,7 @@ func TestAuthenticatedOpaqueDirectRejectsPlaintextAndBindsActor(t *testing.T) {
 			t.Fatalf("accepted non-opaque payload %s", raw)
 		}
 	}
-	got, err := authenticatedOpaqueDirect(json.RawMessage(`{"conversation_id":"dm:7:42","sender_uin":999,"to_uin":42,"ciphertext":"YQ","msg_type":"signal_message","client_id":"c"}`), 7)
+	got, err := authenticatedOpaqueDirect(json.RawMessage(`{"conversation_id":"dm:7:42","sender_uin":999,"to_uin":42,"ciphertext":"YQ","msg_type":"signal_message","client_id":"c","expires_in_seconds":3600}`), 7)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,14 +120,16 @@ func TestAuthenticatedOpaqueDirectRejectsPlaintextAndBindsActor(t *testing.T) {
 	}
 }
 
-func TestDisappearingPolicyAcceptsOffAndBoundedDurationsOnly(t *testing.T) {
-	allowed := []int64{0, 3600, 86400, 604800, 2592000}
+func TestDisappearingPolicyAcceptsOnlyBoundedDurationsUpToOneWeek(t *testing.T) {
+	allowed := []int64{3600, 86400, 259200, 604800}
 	for _, seconds := range allowed {
 		if err := validateDisappearingSeconds(seconds); err != nil {
 			t.Fatalf("%d rejected: %v", seconds, err)
 		}
 	}
-	for _, seconds := range []int64{-1, 1, 3599, 2592001} {
+	// 0 ("keep forever") and anything past the 7-day menu ceiling must be
+	// rejected -- IceQ has no indefinite-retention choice.
+	for _, seconds := range []int64{-1, 0, 1, 3599, 2592000, 604801} {
 		if validateDisappearingSeconds(seconds) == nil {
 			t.Fatalf("%d accepted", seconds)
 		}

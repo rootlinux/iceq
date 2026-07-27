@@ -164,52 +164,30 @@ const (
 	// user can re-register with the same UIN in the future, but
 	// the panic-wipe flag should not be inherited.
 	qWipeSecuritySettings = `DELETE FROM user_security_settings WHERE uin = $1`
-	qMarkAccountWiped     = `INSERT INTO wiped_accounts (uin) VALUES ($1) ON CONFLICT (uin) DO NOTHING`
+	qWipeFileGrants       = `DELETE FROM file_object_grants WHERE owner_uin = $1 OR grantee_uin = $1`
+	qWipeFileObjects      = `DELETE FROM file_objects WHERE owner_uin = $1`
+	qSelectFileObjectKeys = `SELECT object_key FROM file_objects WHERE owner_uin = $1`
+	qNullPanicPinHash     = `UPDATE user_security_settings SET panic_pin_hash = NULL WHERE uin = $1 AND wipe_public_key IS NOT NULL`
+	qSelectPasswordHash   = `SELECT password_hash FROM users WHERE uin = $1`
+	// qEnrollWipePublicKey inserts or sets the wipe key only if no key is
+	// currently enrolled (atomic set-if-null). ON CONFLICT DO UPDATE with a
+	// WHERE clause ensures: new row → INSERT, existing row with NULL key →
+	// UPDATE, existing row with non-NULL key → no-op (RowsAffected=0).
+	qEnrollWipePublicKey = `INSERT INTO user_security_settings (uin, wipe_public_key) VALUES ($1, $2) ON CONFLICT (uin) DO UPDATE SET wipe_public_key = EXCLUDED.wipe_public_key WHERE user_security_settings.wipe_public_key IS NULL`
+	qUpdateWipePublicKey  = `UPDATE user_security_settings SET wipe_public_key = $3 WHERE uin = $1 AND wipe_public_key = $2`
 
-	// qWipeUserAnonymizes the users row. The shell record
-	// stays (so FKs into it still resolve to something) but
-	// every identifying field is scrubbed:
-	//   - identity_key = ''  : the X25519 public key is gone,
-	//                          so a future client cannot be
-	//                          identified as the same party
-	//                          even if they knew the username.
-	//   - avatar_url = NULL  : the URL pointed to MinIO; we
-	//                          don't delete the object here
-	//                          because Scylla/MinIO deletes are
-	//                          a separate concern (the addendum
-	//                          leaves object cleanup as future
-	//                          work).
-	//   - username = 'deleted_' || uin : the original username
-	//                          is replaced with a deterministic
-	//                          placeholder. We pick a
-	//                          recognizable name (not a hash) so
-	//                          operators inspecting the DB can
-	//                          see at a glance which rows have
-	//                          been wiped.
-	//   - password_hash = '' : a future login attempt with
-	//                          the original password will
-	//                          fail at the bcrypt layer (the
-	//                          stored hash is no longer a
-	//                          valid bcrypt-encoded string).
-	//                          We deliberately don't drop the
-	//                          user from the table because
-	//                          that would break FK integrity
-	//                          in messages, group_members, etc.
-	//   - email = NULL       : the original email is removed
-	//                          so a future attacker can't
-	//                          even start a re-registration
-	//                          with it.
-	qWipeUser = `
-		UPDATE users
-		SET identity_key  = '',
-		    avatar_url    = NULL,
-		    username      = 'deleted_' || $1::text,
-		    password_hash = '',
-		    email         = NULL,
-		    session_epoch = NOW(),
-		    updated_at    = NOW()
-		WHERE uin = $1
-	`
+	// Account erasure design:
+	//
+	// PanicWipe deletes every FK-referencing row and disables the account
+	// (advances session_epoch) inside a single PG transaction. The user row
+	// is NOT anonymized — it stays in place temporarily so the wipe_job row
+	// can reference it.
+	//
+	// After the background worker confirms all external storage deletion
+	// (Scylla, NATS, MinIO), it executes a final PG transaction that
+	// permanently deletes the user row, wiped_accounts entries, and the
+	// completed wipe-job row. Zero rows associated with the wiped UIN
+	// remain in any PostgreSQL table. There is no "deleted_<UIN>" tombstone.
 
 	// ------------------------------------------------------------------------
 	// Contact management queries (added by the contacts addendum,

@@ -30,11 +30,19 @@ export function shouldProcessPrivacyEnvelope(type: string, state?: string, value
   if (type === "ack" && state === "read") return value.readReceipts;
   return true;
 }
+// IceQ does not offer indefinite server-side message retention: the server
+// always enforces a bounded TTL (see backend/message-service/store), and the
+// client only chooses how short that window is. DEFAULT_DISAPPEARING_SECONDS
+// must match the server's defaultMessageTTL so the UI reflects reality even
+// before the user picks a shorter option.
+export const DEFAULT_DISAPPEARING_SECONDS = 86400; // 1 day
+export const ALLOWED_DISAPPEARING_SECONDS = [3600, 86400, 259200, 604800]; // 1h, 1d, 3d, 7d (server max)
+
 export function loadDisappearingSeconds(): number {
-  const n = Number(localStorage.getItem(EXPIRY_KEY) ?? 0);
-  return [0, 3600, 86400, 604800, 2592000].includes(n) ? n : 0;
+  const n = Number(localStorage.getItem(EXPIRY_KEY) ?? DEFAULT_DISAPPEARING_SECONDS);
+  return ALLOWED_DISAPPEARING_SECONDS.includes(n) ? n : DEFAULT_DISAPPEARING_SECONDS;
 }
 export function saveDisappearingSeconds(seconds: number): void {
-  if (![0, 3600, 86400, 604800, 2592000].includes(seconds)) throw new Error("unsupported disappearing duration");
+  if (!ALLOWED_DISAPPEARING_SECONDS.includes(seconds)) throw new Error("unsupported disappearing duration");
   localStorage.setItem(EXPIRY_KEY, String(seconds));
 }

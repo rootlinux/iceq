@@ -84,6 +84,13 @@ func NewRedisClient(cfg Config) (*redis.Client, error) {
 	if addr == "" {
 		return nil, errors.New("db: RedisAddr is empty (set ICEQ_REDIS_ADDR or Config.RedisAddr)")
 	}
+	// Production deployments MUST authenticate every Redis connection.
+	// When ICEQ_REDIS_REQUIRE_AUTH=1 the password must be non-empty or
+	// the service refuses to start. Acceptance/development may omit this
+	// guard and rely on the Redis server's NOAUTH rejection instead.
+	if envOr("ICEQ_REDIS_REQUIRE_AUTH", "") == "1" && password == "" {
+		return nil, errors.New("db: ICEQ_REDIS_PASSWORD is required when ICEQ_REDIS_REQUIRE_AUTH=1 (production Redis must be password-protected)")
+	}
 	if db < 0 {
 		return nil, fmt.Errorf("db: RedisDB is negative: %d", db)
 	}

@@ -177,9 +177,9 @@ func TestCrashAfterStoredReturnsCommittedWithoutSecondWrite(t *testing.T) {
 	}
 }
 
-func TestExpiryPolicyKeepsOffRowsTTLlessAndAlignsExpiringWrites(t *testing.T) {
-	if ttl := durableTTL(0); ttl != 0 {
-		t.Fatalf("off TTL = %v, want zero", ttl)
+func TestExpiryPolicyHasNoIndefiniteRetentionAndAlignsExpiringWrites(t *testing.T) {
+	if ttl := durableTTL(0); ttl != defaultMessageTTL {
+		t.Fatalf("unset TTL = %v, want bounded default %v", ttl, defaultMessageTTL)
 	}
 	if ttl := durableTTL(3600); ttl != time.Hour {
 		t.Fatalf("expiring TTL = %v, want 1h", ttl)

@@ -253,12 +253,19 @@ func authenticatedOpaqueDirect(raw json.RawMessage, actor int64) (models.DirectM
 	return p, nil
 }
 
+// validateDisappearingSeconds enforces the same bounded-retention menu the
+// web client offers (see web/src/lib/privacySettings.ts): 1h, 1d, 3d, or 7d.
+// There is no "off"/forever choice -- the message-service store applies this
+// same 1-day-default/7-day-max policy even if a value slipped past this
+// check (defense in depth against a modified client), but rejecting
+// out-of-menu values here gives the sender an immediate, clear error instead
+// of a silently shortened retention.
 func validateDisappearingSeconds(seconds int64) error {
 	switch seconds {
-	case 0, 3600, 86400, 604800, 2592000:
+	case 3600, 86400, 259200, 604800:
 		return nil
 	default:
-		return fmt.Errorf("expires_in_seconds must be off, 1h, 1d, 7d, or 30d")
+		return fmt.Errorf("expires_in_seconds must be 1h, 1d, 3d, or 7d")
 	}
 }
 

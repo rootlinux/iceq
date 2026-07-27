@@ -45,6 +45,7 @@ test("auth account change deletes prior IndexedDB identity before the next sessi
     const identityB = await signal.generateIdentityKeyPair();
     await signal.saveOwnIdentity(identityB, 202, namespaceB);
     const bundleB = await signal.generatePreKeyBundle(identityB, 1, 1, 202, namespaceB);
+    await idb.setSecuritySetupCompleted(namespaceB);
     idb.setActiveCryptoNamespace(namespaceB);
 
     const priorIdentity = await idb.loadIdentity(namespaceA);

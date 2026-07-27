@@ -211,13 +211,34 @@ func New(s *gocql.Session) *MessageStore {
 	return &MessageStore{session: s}
 }
 
+const (
+	// defaultMessageTTL applies when the sender's client does not request an
+	// explicit expiry. IceQ does not offer indefinite server-side retention:
+	// every message durably stored is deleted after this window unless the
+	// sender's disappearing-message setting picks a shorter one.
+	defaultMessageTTL = 24 * time.Hour
+	// maxMessageTTL is the longest retention any request may obtain. Values
+	// above this are clamped down rather than rejected, so a modified or
+	// compromised client cannot force indefinite retention by sending 0 or
+	// an unbounded value.
+	maxMessageTTL = 7 * 24 * time.Hour
+)
+
 func effectiveMessageTTL(requestedSeconds int64) time.Duration {
-	if requestedSeconds > 0 {
-		return time.Duration(requestedSeconds) * time.Second
+	if requestedSeconds <= 0 {
+		return defaultMessageTTL
 	}
-	// Zero is the explicit public "off" policy. A deployment-wide legacy TTL
-	// must never silently override the sender's visible choice.
-	return 0
+	// Compare in seconds before converting to a Duration (nanoseconds) --
+	// a large requestedSeconds from a modified client would otherwise
+	// overflow int64 nanoseconds and wrap around to a negative duration.
+	if requestedSeconds > int64(maxMessageTTL/time.Second) {
+		return maxMessageTTL
+	}
+	requested := time.Duration(requestedSeconds) * time.Second
+	if requested > maxMessageTTL {
+		return maxMessageTTL
+	}
+	return requested
 }
 
 func expiryAt(created time.Time, ttl time.Duration) time.Time {

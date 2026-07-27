@@ -22,12 +22,19 @@
 // The wrapper does not attempt to abstract Publish / Subscribe semantics;
 // callers can fall back to the embedded *nats.Conn via Conn() if they
 // need JetStream, request/reply, or any other feature not exposed here.
+//
+// Authentication: NewClient reads ICEQ_NATS_TOKEN from the environment.
+// When set, it is used as a NATS token credential.  NATS token auth is
+// the smallest mechanism consistent with IceQ's internal bus model.
 package natsclient
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -41,6 +48,12 @@ import (
 // ----------------------------------------------------------------------------
 
 const (
+	// DeliveryStreamName is the JetStream stream name used for
+	// durable message delivery. Centralized here so the wipe
+	// path in the auth-service can reference it without
+	// importing the message-service or ws-gateway packages.
+	DeliveryStreamName = "ICEQ_DELIVERY"
+
 	// initialReconnectDelay is the wait between the first reconnect
 	// attempt and the second. The library doubles this on each failed
 	// attempt, up to maxReconnectDelay.
@@ -110,6 +123,12 @@ func NewClient(url, clientName string) (*Client, error) {
 		nats.ClosedHandler(func(_ *nats.Conn) {
 			log.Printf("[natsclient] connection closed")
 		}),
+	}
+
+	// Internal NATS auth via shared token. All IceQ services use the same
+	// token; external clients (none at present) must be separately authorized.
+	if token := os.Getenv("ICEQ_NATS_TOKEN"); token != "" {
+		opts = append(opts, nats.Token(token))
 	}
 
 	conn, err := nats.Connect(url, opts...)
@@ -288,6 +307,35 @@ func (c *Client) IsConnected() bool {
 		return false
 	}
 	return c.conn.IsConnected()
+}
+
+// PurgeUserStreams deletes every JetStream message on the
+// ICEQ_DELIVERY stream whose subject matches a per-user pattern
+// ("msg.direct.<uin>" for direct traffic and any "msg.group.*"
+// subject is left intact — group messages must survive the
+// individual's wipe because other group members still have keys
+// for the same ciphertext epoch).
+//
+// Returns an error if JetStream is unreachable or the purge fails
+// for any reason other than the stream not existing (which is a
+// success case — the data is already gone). The caller (panicwipe)
+// uses this error to determine whether durable cleanup succeeded.
+func (c *Client) PurgeUserStreams(ctx context.Context, uin int64) error {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	js, err := c.conn.JetStream()
+	if err != nil {
+		return fmt.Errorf("natsclient: jetstream unavailable: %w", err)
+	}
+	directSubject := "msg.direct." + strconv.FormatInt(uin, 10)
+	err = js.PurgeStream(DeliveryStreamName, nats.Context(ctx), &nats.StreamPurgeRequest{
+		Subject: directSubject,
+	})
+	if err != nil && !errors.Is(err, nats.ErrNoStreamResponse) {
+		return fmt.Errorf("natsclient: purge user stream %q: %w", directSubject, err)
+	}
+	return nil
 }
 
 // URL returns the URL the client was configured with. Exposed for

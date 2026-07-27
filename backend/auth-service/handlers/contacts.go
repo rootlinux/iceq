@@ -338,6 +338,12 @@ func NewAcceptContactHandler(deps ContactsDeps) http.HandlerFunc {
 			return
 		}
 
+		// Notify the original requester that their request was
+		// accepted, so their UI updates without a manual reload.
+		// Best-effort: NATS failures are logged but don't fail
+		// the handler — the DB is already committed.
+		publishContactAcceptedNotification(r.Context(), deps.Bus, targetUIN, ownerUIN)
+
 		writeJSON(w, http.StatusOK, contactStatusResponse{Status: "accepted"})
 	}
 }
@@ -491,5 +497,46 @@ func publishContactRequestNotification(
 	subject := "notification." + strconv.FormatInt(targetUIN, 10)
 	if err := bus.Publish(subject, raw); err != nil {
 		log.Printf("[auth-service] publish contact-request notification: %v", err)
+	}
+}
+
+// publishContactAcceptedNotification tells the original requester that
+// their pending contact request was accepted. Best-effort — an error is
+// logged but does not fail the caller because the contact rows are
+// already committed.
+func publishContactAcceptedNotification(
+	parentCtx context.Context,
+	bus *natsclient.Client,
+	requesterUIN, acceptorUIN int64,
+) {
+	if bus == nil {
+		return
+	}
+	_, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	_ = parentCtx
+
+	payload := models.NotificationPayload{
+		Kind:  models.NotificationKindContactAccepted,
+		Title: "Contact request accepted",
+		Body:  "Your contact request was accepted",
+		Data: map[string]any{
+			"from_uin": acceptorUIN,
+		},
+	}
+	env, err := models.NewEnvelope(models.EnvelopeTypeNotification, payload)
+	if err != nil {
+		log.Printf("[auth-service] build contact-accepted envelope: %v", err)
+		return
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		log.Printf("[auth-service] marshal contact-accepted envelope: %v", err)
+		return
+	}
+
+	subject := "notification." + strconv.FormatInt(requesterUIN, 10)
+	if err := bus.Publish(subject, raw); err != nil {
+		log.Printf("[auth-service] publish contact-accepted notification: %v", err)
 	}
 }
