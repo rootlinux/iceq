@@ -41,15 +41,19 @@ ReactDOM.createRoot(root).render(
   </React.StrictMode>,
 );
 
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
+if (!__DEV__ && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
     navigator.serviceWorker
-      .register('/sw.js', { scope: '/' })
-      .then(reg => {
-        console.log('[IceQ SW] registered', reg.scope);
+      .register("/sw.js", { scope: "/" })
+      .then((reg) => {
+        console.log("[IceQ SW] registered", reg.scope);
       })
-      .catch(err => {
-        console.error('[IceQ SW] registration failed', err);
+      .catch((err) => {
+        console.error("[IceQ SW] registration failed", err);
       });
   });
 }
+
+// The __DEV__ global is set in vite.config.ts. We declare
+// it here so TypeScript doesn't flag the references.
+declare const __DEV__: boolean;
