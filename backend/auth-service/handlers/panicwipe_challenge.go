@@ -122,10 +122,31 @@ func NewSetWipePublicKeyHandler(deps SetWipePublicKeyDeps) http.HandlerFunc {
 				return
 			}
 		} else {
-			// ---- ROTATION ----
-			// Existing key present: require a domain-separated signature from
-			// the current key over the rotation payload. This binds the
-			// authorization to the new key, the challenge, and the actor.
+			// ---- ROTATION (or idempotent resubmission) ----
+			newPubKeyB64 := base64.StdEncoding.EncodeToString(pubBytes)
+			oldPubKeyB64 := base64.StdEncoding.EncodeToString(existingKey)
+
+			// If the resubmitted key is byte-for-byte identical to what's
+			// already stored, this is a retry of a prior successful
+			// enrollment whose response the client never saw — not a
+			// rotation attempt — so it needs no signature. Checking this
+			// BEFORE the signature requirement is what makes the client's
+			// retry-on-any-error path safe: requiring proof of the OLD key
+			// to resubmit the SAME key would strand a client that has no
+			// reason to believe it's rotating anything. This does not
+			// weaken rotation protection: an attacker without the existing
+			// wipe private key still cannot install any key OTHER than the
+			// one already enrolled, which is the only thing that requires
+			// a signature in the first place.
+			if newPubKeyB64 == oldPubKeyB64 {
+				writeError(w, http.StatusConflict, "WIPE_KEY_EXISTS", "a wipe key is already enrolled; use rotation to change it")
+				return
+			}
+
+			// A genuinely different key: this is a real rotation, and
+			// requires a domain-separated signature from the current key
+			// over the rotation payload. This binds the authorization to
+			// the new key, the challenge, and the actor.
 			if req.ChallengeID == "" || req.Signature == "" {
 				writeError(w, http.StatusUnauthorized, "SIGNATURE_REQUIRED", "challenge_id and signature are required for rotation")
 				return
@@ -148,7 +169,6 @@ func NewSetWipePublicKeyHandler(deps SetWipePublicKeyDeps) http.HandlerFunc {
 			}
 
 			// Verify the domain-separated rotation payload.
-			newPubKeyB64 := base64.StdEncoding.EncodeToString(pubBytes)
 			rotationPayload := fmt.Sprintf("iceq-wipe-key-rotation-v1|%d|%s|%s|%s",
 				uin, req.ChallengeID, storedChallengeB64, newPubKeyB64)
 
@@ -166,7 +186,6 @@ func NewSetWipePublicKeyHandler(deps SetWipePublicKeyDeps) http.HandlerFunc {
 			// Compare-and-swap: update only if the key is exactly the one
 			// that signed the rotation payload. Two concurrent rotations
 			// with the same old key cannot both succeed.
-			oldPubKeyB64 := base64.StdEncoding.EncodeToString(existingKey)
 			tag, err := deps.Pool.Exec(r.Context(), qUpdateWipePublicKey, uin, oldPubKeyB64, newPubKeyB64)
 			if err != nil {
 				log.Printf("[auth-service] set-wipe-public-key update failed: %v", err)
@@ -180,6 +199,45 @@ func NewSetWipePublicKeyHandler(deps SetWipePublicKeyDeps) http.HandlerFunc {
 		}
 
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GetWipePublicKeyDeps wires the read-only endpoint that reports whether an
+// account already has a wipe key enrolled and, if so, exactly which public
+// key it is. The client uses this to reconcile a locally-held wipe key pair
+// against server state after any ambiguous PUT outcome (network drop, lost
+// response) instead of guessing from an HTTP status code — see
+// reconcileWipeKey() in web/src/lib/panicWipeKey.ts.
+// ---------------------------------------------------------------------------
+
+type GetWipePublicKeyDeps struct {
+	LookupWipePublicKey func(ctx context.Context, uin int64) (ed25519.PublicKey, error)
+}
+
+type getWipePublicKeyResponse struct {
+	PublicKey *string `json:"public_key"`
+}
+
+func NewGetWipePublicKeyHandler(deps GetWipePublicKeyDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uin, ok := middleware.GetUIN(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "AUTH_MISSING_BEARER", "Authorization header is required")
+			return
+		}
+		existingKey, err := deps.LookupWipePublicKey(r.Context(), uin)
+		if err != nil {
+			log.Printf("[auth-service] get-wipe-public-key lookup failed: %v", err)
+			writeError(w, http.StatusServiceUnavailable, "WIPE_KEY_UNAVAILABLE", "could not verify account state")
+			return
+		}
+		if existingKey == nil {
+			writeJSON(w, http.StatusOK, getWipePublicKeyResponse{PublicKey: nil})
+			return
+		}
+		encoded := base64.StdEncoding.EncodeToString(existingKey)
+		writeJSON(w, http.StatusOK, getWipePublicKeyResponse{PublicKey: &encoded})
 	}
 }
 

@@ -205,6 +205,7 @@ export const tr: Record<MessageKey, string> = {
   "setup.completing": "Tamamlanıyor…",
   "setup.recoveryFailed": "Kurtarma paketi oluşturulamadı. Tekrar dene.",
   "setup.completeFailed": "Kurulum tamamlanamadı. Tekrar dene.",
+  "setup.wipeKeyMismatch": "Bu hesap için farklı bir güvenlik anahtarı zaten kayıtlı. Lütfen kurulumu tekrar deneyin.",
   "recovery.title": "Kurtarma İçe Aktar",
   "recovery.help": "Daha önce kaydettiğin Kurtarma Paketi ve Kurtarma Anahtarını kullanarak şifreleme kimliğini geri yükle. Önce doğru hesaba giriş yapmış olmalısın.",
   "recovery.wrongAccountWarning": "Yanlış hesabın kurtarma paketi reddedilir. Paket, oluşturulduğu hesaba kriptografik olarak bağlıdır.",

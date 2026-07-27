@@ -4,7 +4,13 @@ import { useAuthStore } from "../../store/authStore";
 import { getActiveCryptoNamespace, hasSecuritySetupCompleted, setSecuritySetupCompleted } from "../../lib/indexeddb";
 import { createSecurityPassphrase } from "../../lib/securityVault";
 import { generateRecoveryKey, createRecoveryPackage } from "../../lib/recoveryPackage";
-import { generateWipeKeyPair, storeEncryptedWipePrivateKey } from "../../lib/panicWipeKey";
+import {
+  loadOrCreateWipeKeyPair,
+  storeEncryptedWipePrivateKey,
+  reconcileWipeKey,
+  clearLocalWipeKey,
+  bytesToBase64std,
+} from "../../lib/panicWipeKey";
 import { uploadWipePublicKey } from "../../api/auth";
 import { useI18n } from "../../i18n";
 import QRCode from "qrcode";
@@ -105,11 +111,46 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
     setBusy(true);
     try {
       const ns = getActiveCryptoNamespace();
-      const { publicKeyBytes, encryptedPrivateBlob } = await generateWipeKeyPair();
-      await storeEncryptedWipePrivateKey(encryptedPrivateBlob);
+      // Load-or-create implements the retry-safe enrollment pattern:
+      // if a prior attempt generated a key but the server response was lost,
+      // we reuse the same key instead of generating a new one.
+      const { publicKeyBytes, encryptedPrivateBlob, isNew } = await loadOrCreateWipeKeyPair();
+      if (isNew) {
+        await storeEncryptedWipePrivateKey(encryptedPrivateBlob, publicKeyBytes);
+      }
 
       const pubB64 = bytesToBase64std(publicKeyBytes);
-      await uploadWipePublicKey(pubB64, accountPassword || undefined);
+      try {
+        await uploadWipePublicKey(pubB64, accountPassword || undefined);
+      } catch (uploadErr) {
+        // The upload's own success/failure is not trusted on its own --
+        // ask the server what it actually has enrolled and act on that,
+        // not on the HTTP status code. A 409 (or, before the server-side
+        // compare-before-rotate fix, even a 401) can mean "this exact key
+        // already landed and the response was lost" just as easily as it
+        // can mean something genuinely failed.
+        const reconciliation = await reconcileWipeKey(publicKeyBytes);
+        if (reconciliation.status === "match") {
+          // Our key is exactly what's enrolled -- the earlier failure was
+          // cosmetic (lost response, duplicate submit). Proceed.
+        } else if (reconciliation.status === "mismatch") {
+          // A different key is enrolled -- most likely this device lost a
+          // concurrent first-enrollment race. This local key is orphaned:
+          // keeping it would let every future retry resubmit it and hit
+          // the same mismatch. Rotating to make it current would require
+          // a signature from whichever key IS enrolled, which this device
+          // never had -- so this is a real failure, not something to
+          // paper over.
+          await clearLocalWipeKey();
+          throw new Error(i18n.t("setup.wipeKeyMismatch"));
+        } else {
+          // server-has-no-key: the reconcile confirms this was a real
+          // failure, not a lost-response false negative. The local key is
+          // preserved so a retry reuses it instead of generating yet
+          // another one.
+          throw uploadErr;
+        }
+      }
       await setSecuritySetupCompleted(ns);
       // Signal App that setup is complete so it can update routing state
       // without waiting for the next IndexedDB poll.
@@ -279,10 +320,4 @@ function bytesToBase64url(bytes: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function bytesToBase64std(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
-  return btoa(binary);
 }

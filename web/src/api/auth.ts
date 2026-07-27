@@ -100,6 +100,15 @@ export async function uploadWipePublicKey(publicKey: string, password?: string):
   });
 }
 
+// getWipePublicKey -- the account's currently-enrolled wipe public key, or
+// null if none is enrolled yet. Used by lib/panicWipeKey.ts's
+// reconcileWipeKey to verify local wipe-key state against the server after
+// an ambiguous enrollment/rotation outcome, rather than guessing from an
+// HTTP status code.
+export async function getWipePublicKey(): Promise<{ public_key: string | null }> {
+  return fetchJSON("/api/auth/panic-wipe-public-key");
+}
+
 export async function requestWipeChallenge(): Promise<{ challenge_id: string; challenge: string }> {
   return fetchJSON("/api/auth/panic-wipe-challenge", { method: "POST" });
 }

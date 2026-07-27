@@ -302,6 +302,9 @@ func main() {
 			LookupWipePublicKey: handlers.NewLookupWipePublicKey(pgPool),
 			LookupPasswordHash:  handlers.NewLookupPasswordHash(pgPool),
 		}))
+		r.With(authMW, rate("auth:panic-wipe-public-key-get", 20, time.Hour)).Get("/panic-wipe-public-key", handlers.NewGetWipePublicKeyHandler(handlers.GetWipePublicKeyDeps{
+			LookupWipePublicKey: handlers.NewLookupWipePublicKey(pgPool),
+		}))
 		r.With(authMW, rate("auth:panic-wipe-challenge", 10, time.Hour)).Post("/panic-wipe-challenge", handlers.NewWipeChallengeHandler(handlers.WipeChallengeDeps{
 			Redis: rdb,
 		}))

@@ -943,6 +943,125 @@ func TestSetWipePublicKeyConcurrentEnrollmentRaceProtection(t *testing.T) {
 	}
 }
 
+// TestSetWipePublicKeyIdempotentResubmitReturnsConflictWithoutSignature
+// verifies that resubmitting the exact same key that's already enrolled —
+// the shape of a retry after the server accepted a prior enrollment but the
+// client never saw the response — returns 409 WIPE_KEY_EXISTS without ever
+// requiring challenge_id/signature. Without the compare-before-rotate check,
+// this hits the rotation branch and returns 401 SIGNATURE_REQUIRED instead:
+// a permanent deadlock, since the client has no reason to send rotation
+// proof for what it believes is a first-time enrollment.
+func TestSetWipePublicKeyIdempotentResubmitReturnsConflictWithoutSignature(t *testing.T) {
+	existingPubKey := make([]byte, 32)
+	existingPubKey[0] = 7
+	existingPubKeyB64 := base64.StdEncoding.EncodeToString(existingPubKey)
+
+	handler := NewSetWipePublicKeyHandler(SetWipePublicKeyDeps{
+		LookupWipePublicKey: func(ctx context.Context, uin int64) (ed25519.PublicKey, error) {
+			return ed25519.PublicKey(existingPubKey), nil
+		},
+		// Deliberately nil Redis/Pool: the idempotent-resubmit path must
+		// return before touching either. If it ever regresses to falling
+		// through to the rotation branch, this test panics on the nil
+		// Redis client instead of asserting 409 — a loud failure either way.
+	})
+	req := httptest.NewRequest(http.MethodPut, "/api/auth/panic-wipe-public-key",
+		strings.NewReader(fmt.Sprintf(`{"public_key":%q}`, existingPubKeyB64)))
+	req = req.WithContext(middleware.WithUIN(req.Context(), 10000001))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp["code"] != "WIPE_KEY_EXISTS" {
+		t.Fatalf("code = %q, want WIPE_KEY_EXISTS", resp["code"])
+	}
+}
+
+// TestSetWipePublicKeyGetReportsNoKeyEnrolled covers the new GET endpoint's
+// "nothing enrolled yet" response, which reconcileWipeKey() on the client
+// reads as status "server-has-no-key".
+func TestSetWipePublicKeyGetReportsNoKeyEnrolled(t *testing.T) {
+	handler := NewGetWipePublicKeyHandler(GetWipePublicKeyDeps{
+		LookupWipePublicKey: func(ctx context.Context, uin int64) (ed25519.PublicKey, error) {
+			return nil, nil
+		},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/panic-wipe-public-key", nil)
+	req = req.WithContext(middleware.WithUIN(req.Context(), 10000001))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp getWipePublicKeyResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.PublicKey != nil {
+		t.Fatalf("public_key = %v, want nil", *resp.PublicKey)
+	}
+}
+
+// TestSetWipePublicKeyGetReportsEnrolledKey covers the GET endpoint
+// returning the exact enrolled key, byte-for-byte comparable against a
+// locally-held key — this is the whole point of reconcileWipeKey().
+func TestSetWipePublicKeyGetReportsEnrolledKey(t *testing.T) {
+	pubKey := make([]byte, 32)
+	pubKey[0] = 9
+	pubKeyB64 := base64.StdEncoding.EncodeToString(pubKey)
+
+	handler := NewGetWipePublicKeyHandler(GetWipePublicKeyDeps{
+		LookupWipePublicKey: func(ctx context.Context, uin int64) (ed25519.PublicKey, error) {
+			return ed25519.PublicKey(pubKey), nil
+		},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/panic-wipe-public-key", nil)
+	req = req.WithContext(middleware.WithUIN(req.Context(), 10000001))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp getWipePublicKeyResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.PublicKey == nil || *resp.PublicKey != pubKeyB64 {
+		t.Fatalf("public_key = %v, want %q", resp.PublicKey, pubKeyB64)
+	}
+}
+
+// TestSetWipePublicKeyGetRequiresAuth mirrors every other endpoint in this
+// file: an unauthenticated request (no UIN in context) must be rejected
+// before the lookup function is ever called.
+func TestSetWipePublicKeyGetRequiresAuth(t *testing.T) {
+	called := false
+	handler := NewGetWipePublicKeyHandler(GetWipePublicKeyDeps{
+		LookupWipePublicKey: func(ctx context.Context, uin int64) (ed25519.PublicKey, error) {
+			called = true
+			return nil, nil
+		},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/panic-wipe-public-key", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rr.Code, rr.Body.String())
+	}
+	if called {
+		t.Fatal("LookupWipePublicKey was called for an unauthenticated request")
+	}
+}
+
 func TestCaptureFileKeysBeforePGDeletesOwnershipRows(t *testing.T) {
 	// This is a source-order test: it verifies that PanicWipe() calls
 	// captureFileKeys BEFORE the PG transaction deletes file_objects.

@@ -203,6 +203,7 @@ export const en = {
   "setup.completing": "Completing…",
   "setup.recoveryFailed": "Failed to generate recovery package. Try again.",
   "setup.completeFailed": "Failed to complete setup. Try again.",
+  "setup.wipeKeyMismatch": "A different security key is already registered for this account. Please try setup again.",
   "recovery.title": "Recovery Import",
   "recovery.help": "Restore your encryption identity from a previously saved Recovery Package and Recovery Key. You must be logged in to the correct account first.",
   "recovery.wrongAccountWarning": "Importing the wrong account's recovery package will be rejected. The package is cryptographically bound to the account that created it.",
