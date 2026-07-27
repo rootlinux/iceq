@@ -333,7 +333,8 @@ func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 				return
 			}
 			if err := VerifyWipeSignature(ctx, *deps.ChallengeSignatureDeps, uin, req.ChallengeID, req.Signature); err != nil {
-				writeError(w, http.StatusUnauthorized, "INVALID_SIGNATURE", err.Error())
+				log.Printf("[auth-service] panic wipe signature verification failed for UIN %d: %v", uin, err)
+				writeError(w, http.StatusUnauthorized, "INVALID_SIGNATURE", "invalid or expired signature")
 				return
 			}
 			// Successful challenge-signature → retire any lingering PIN hash.

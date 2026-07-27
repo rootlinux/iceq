@@ -93,7 +93,7 @@ func NewLogoutHandler(deps LogoutDeps) http.HandlerFunc {
 		if err != nil {
 			// Unreachable if the middleware ran, but
 			// defense in depth.
-			writeError(w, http.StatusUnauthorized, "AUTH_MISSING_BEARER", err.Error())
+			writeError(w, http.StatusUnauthorized, "AUTH_MISSING_BEARER", "Authorization header must use the Bearer scheme")
 			return
 		}
 		if err := deps.Manager.Revoke(ctx, rawToken); err != nil {

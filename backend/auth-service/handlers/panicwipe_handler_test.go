@@ -40,6 +40,83 @@ func (f *fakeMinioError) DeleteUserObjects(ctx context.Context, uin int64, fileK
 }
 func (f *fakeMinioError) DeleteUserGrants(ctx context.Context, uin int64) error { return errors.New("grant store offline") }
 
+// TestPanicWipeSignatureErrorSanitized verifies that signature verification errors
+// do not leak internal infrastructure details (Redis hosts, PG errors, base64 details).
+func TestPanicWipeSignatureErrorSanitized(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	// Store a challenge that the signature will fail to verify against
+	uin := int64(10000001)
+	challengeID := "test-challenge-123"
+	challengeKey := wipeChallengePrefix + itoa(uin) + ":" + challengeID
+	challengeBytes := []byte("test challenge data")
+	challengeB64 := base64.StdEncoding.EncodeToString(challengeBytes)
+	if err := rdb.Set(context.Background(), challengeKey, challengeB64, 0).Err(); err != nil {
+		t.Fatalf("store challenge: %v", err)
+	}
+
+	// Create a fake wipe public key lookup that returns a valid Ed25519 public key
+	fakePub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	lookupWipeKey := func(ctx context.Context, uin int64) (ed25519.PublicKey, error) {
+		return fakePub, nil
+	}
+
+	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
+		PanicWipeDeps: PanicWipeDeps{
+			Redis: rdb,
+		},
+		ChallengeSignatureDeps: &ChallengeSignatureDeps{
+			Redis:               rdb,
+			LookupWipePublicKey: lookupWipeKey,
+		},
+	})
+
+	// Send a wipe request with an invalid signature (wrong length to trigger specific error)
+	invalidSig := base64.StdEncoding.EncodeToString([]byte("too-short"))
+	reqBody := fmt.Sprintf(`{"challenge_id":%q,"signature":%q}`, challengeID, invalidSig)
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/panic-wipe", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	ctx := middleware.WithUIN(req.Context(), uin)
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", rec.Code)
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	// The error message should NOT contain internal details
+	errorMsg := resp["error"]
+	if strings.Contains(errorMsg, "signature has wrong length") {
+		t.Errorf("error message leaks internal details (byte length): %q", errorMsg)
+	}
+	if strings.Contains(errorMsg, "malformed") {
+		t.Errorf("error message leaks internal details (malformed): %q", errorMsg)
+	}
+	if strings.Contains(errorMsg, "redis") || strings.Contains(errorMsg, "Redis") {
+		t.Errorf("error message leaks Redis details: %q", errorMsg)
+	}
+	if strings.Contains(errorMsg, "postgres") || strings.Contains(errorMsg, "pg") || strings.Contains(errorMsg, "sql") {
+		t.Errorf("error message leaks database details: %q", errorMsg)
+	}
+
+	// The error message should be a generic, sanitized message
+	if errorMsg == "" {
+		t.Error("error message should not be empty")
+	}
+}
+
 // helper: returns a Legacy PIN hash + lookup function for tests that need successful PIN auth
 func testPinHashLookup(t *testing.T) (func(ctx context.Context, uin int64) (string, error), string) {
 	t.Helper()
