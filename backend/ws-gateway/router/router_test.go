@@ -241,3 +241,33 @@ func TestBuildPongEnvelopeUsesPongTypeAndEchoesID(t *testing.T) {
 		t.Fatal("pong timestamp was not populated")
 	}
 }
+
+// TestOverridePresenceUINRejectsClientClaimedUIN verifies that the
+// overridePresenceUIN helper replaces the client-provided UIN with
+// the authenticated UIN. This is the core security mechanism that
+// prevents UIN spoofing in presence updates.
+func TestOverridePresenceUINRejectsClientClaimedUIN(t *testing.T) {
+	// Create a presence payload with a spoofed UIN (999)
+	payload := models.PresencePayload{
+		UIN:    999, // Spoofed - should be overridden
+		Status: "online",
+		TS:     1234567890,
+	}
+
+	// Override with authenticated UIN (7)
+	authenticatedUIN := int64(7)
+	override := overridePresenceUIN(payload, authenticatedUIN)
+
+	// Verify the UIN was overridden
+	if override.UIN != authenticatedUIN {
+		t.Fatalf("overridePresenceUIN did not override UIN: got %d want %d", override.UIN, authenticatedUIN)
+	}
+
+	// Verify other fields were preserved
+	if override.Status != payload.Status {
+		t.Fatalf("overridePresenceUIN changed Status: got %q want %q", override.Status, payload.Status)
+	}
+	if override.TS != payload.TS {
+		t.Fatalf("overridePresenceUIN changed TS: got %d want %d", override.TS, payload.TS)
+	}
+}

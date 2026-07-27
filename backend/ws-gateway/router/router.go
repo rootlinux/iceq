@@ -70,7 +70,7 @@ func Dispatch(c *client.Client, env models.Envelope) {
 	case models.EnvelopeTypeRead:
 		handleRead(c, deps, env)
 	case models.EnvelopeTypePresence:
-		handlePresence(deps, env)
+		handlePresence(c, deps, env)
 	case models.EnvelopeTypeTransportAck:
 		handleTransportAck(c, deps, env)
 	case "ping":
@@ -579,7 +579,10 @@ func handleRead(c *client.Client, deps client.Deps, env models.Envelope) {
 // presence.update. The presence service's subscribers (in
 // the gateway's main.go NATS handler block) then fan out to
 // every accepted contact of the user.
-func handlePresence(deps client.Deps, env models.Envelope) {
+//
+// Security: The UIN is always taken from the authenticated client,
+// never from the client-supplied payload. This prevents UIN spoofing.
+func handlePresence(c *client.Client, deps client.Deps, env models.Envelope) {
 	var p models.PresencePayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return
@@ -596,6 +599,10 @@ func handlePresence(deps client.Deps, env models.Envelope) {
 		// observe its own state in the next frame.)
 		return
 	}
+	// Override the UIN with the authenticated client's UIN.
+	// This prevents a malicious client from publishing presence
+	// updates on behalf of another user.
+	p = overridePresenceUIN(p, c.UIN())
 	p.TS = time.Now().UTC().Truncate(time.Minute).UnixMilli()
 	data, err := json.Marshal(models.Envelope{
 		Type:    models.EnvelopeTypePresence,
@@ -609,6 +616,13 @@ func handlePresence(deps client.Deps, env models.Envelope) {
 	if err := deps.NATS.Publish("presence.update", data); err != nil {
 		log.Printf("[ws-gateway] presence publish: %v", err)
 	}
+}
+
+// overridePresenceUIN replaces the UIN in a presence payload with the
+// authenticated user's UIN. This is extracted for testability.
+func overridePresenceUIN(p models.PresencePayload, authenticatedUIN int64) models.PresencePayload {
+	p.UIN = authenticatedUIN
+	return p
 }
 
 // ----------------------------------------------------------------------------
