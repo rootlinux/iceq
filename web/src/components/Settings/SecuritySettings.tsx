@@ -2,11 +2,13 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { getActiveCryptoNamespace, loadIdentity } from "../../lib/indexeddb";
 import { SafetyQr } from "./SafetyQr";
-import { fetchBundle } from "../../api/keys";
-import { computeSafetyNumber } from "../../lib/safetyFingerprint";
-import { acceptPeerIdentity, assessPeerIdentity, verifyPeerIdentity } from "../../lib/identityTrust";
+import {
+  inspectPeerSafety,
+  PEER_SAFETY_LOCAL_IDENTITY_UNAVAILABLE,
+  type PeerSafetyInspection,
+} from "../../lib/peerSafetyInspection";
+import { acceptPeerIdentity, verifyPeerIdentity } from "../../lib/identityTrust";
 import { useAuthStore } from "../../store/authStore";
-import { verifySignedPreKeyBundle } from "../../lib/signal";
 import { PrivacySettings } from "./PrivacySettings";
 import { PanicPinSettings } from "./PanicPinSettings";
 import { useI18n } from "../../i18n";
@@ -38,7 +40,7 @@ export function SecuritySettings(): JSX.Element {
     kind: "loading",
   });
   const [peerUin, setPeerUin] = useState("");
-  const [peerSafety, setPeerSafety] = useState<{ uin: number; identityKey: string; number: string; changed: boolean; verified: boolean } | null>(null);
+  const [peerSafety, setPeerSafety] = useState<PeerSafetyInspection | null>(null);
   const [peerError, setPeerError] = useState<string | null>(null);
 
   const inspectPeer = async (): Promise<void> => {
@@ -47,17 +49,13 @@ export function SecuritySettings(): JSX.Element {
       setPeerError(i18n.t("security.invalidUin")); return;
     }
     try {
-      const [local, remote] = await Promise.all([loadIdentity(getActiveCryptoNamespace()), fetchBundle(parsed)]);
-      if (!local) throw new Error(i18n.t("security.localUnavailable"));
-      await verifySignedPreKeyBundle(remote);
-      const assessment = await assessPeerIdentity(parsed, remote.identity_key,getActiveCryptoNamespace());
-      const number = await computeSafetyNumber(
-        { uin: selfUin, identityKey: local.publicKey },
-        { uin: parsed, identityKey: remote.identity_key },
-      );
-      setPeerSafety({ uin: parsed, identityKey: remote.identity_key, number, changed: !assessment.sendAllowed, verified: assessment.record.verified && assessment.record.fingerprint === remote.identity_key });
+      setPeerSafety(await inspectPeerSafety(selfUin, parsed, getActiveCryptoNamespace()));
       setPeerError(null);
-    } catch (error) { setPeerSafety(null); setPeerError((error as Error).message); }
+    } catch (error) {
+      setPeerSafety(null);
+      const message = (error as Error).message;
+      setPeerError(message === PEER_SAFETY_LOCAL_IDENTITY_UNAVAILABLE ? i18n.t("security.localUnavailable") : message);
+    }
   };
 
   useEffect(() => {

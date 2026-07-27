@@ -27,6 +27,7 @@ export const tr: Record<MessageKey, string> = {
   "settings.turkish": "Türkçe",
   "security.title": "Güvenlik",
   "security.verifyContact": "Bir kişiyi doğrula",
+  "security.verifySafetyNumber": "Güvenlik numarasını doğrula",
   "security.contactUin": "Kişi UIN'i",
   "security.loadSafety": "Güvenlik numarasını yükle",
   "security.identityChanged": "Kimlik değişti. Gönderim engellendi.",

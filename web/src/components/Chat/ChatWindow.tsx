@@ -16,6 +16,7 @@ import { useEffect, useState } from "react";
 import { MessageList } from "./MessageList";
 import { MessageInput } from "./MessageInput";
 import { TypingIndicator } from "./TypingIndicator";
+import { SafetyNumberVerifyModal } from "./SafetyNumberVerifyModal";
 import { historyDM } from "../../api/messages";
 import { decryptMessage } from "../../lib/signal";
 import { getActiveCryptoNamespace } from "../../lib/indexeddb";
@@ -48,6 +49,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
   const messages = useChatStore((s) => s.messagesByConversation[convId] ?? []);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showSafetyModal, setShowSafetyModal] = useState(false);
   const presence = usePresence(peerUin);
 
   // Fetch + decrypt history on mount / peer change.
@@ -150,6 +152,13 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
           <div className="text-sm font-medium text-text">{peerUsername}</div>
           <div className="text-xs text-text-2">#{peerUin}</div>
         </div>
+        <button
+          type="button"
+          className="iceq-btn-secondary ml-auto text-xs"
+          onClick={() => setShowSafetyModal(true)}
+        >
+          {i18n.t("security.verifySafetyNumber")}
+        </button>
       </header>
 
       <div className="min-h-0 flex flex-1 flex-col">
@@ -166,6 +175,15 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
 
       <TypingIndicator conversationId={convId} />
       <MessageInput peerUin={peerUin} />
+
+      {showSafetyModal && selfUin !== null && (
+        <SafetyNumberVerifyModal
+          selfUin={selfUin}
+          peerUin={peerUin}
+          peerLabel={peerUsername}
+          onClose={() => setShowSafetyModal(false)}
+        />
+      )}
     </div>
   );
 }

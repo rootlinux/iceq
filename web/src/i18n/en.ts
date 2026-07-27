@@ -25,6 +25,7 @@ export const en = {
   "settings.turkish": "Türkçe",
   "security.title": "Security",
   "security.verifyContact": "Verify a contact",
+  "security.verifySafetyNumber": "Verify safety number",
   "security.contactUin": "Contact UIN",
   "security.loadSafety": "Load safety number",
   "security.identityChanged": "Identity changed. Sending is blocked.",
