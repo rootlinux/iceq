@@ -492,4 +492,3 @@ test("policy: npm audit execution failure returns error", () => {
     },
   );
 });
-

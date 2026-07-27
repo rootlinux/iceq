@@ -14,7 +14,7 @@ test("contact request and acceptance notifications update the sidebar without a 
   await expect(page.getByText("No contacts yet", { exact: false })).toBeVisible();
 
   await page.evaluate(() => {
-    localStorage.setItem("__iceq_e2e_contacts", JSON.stringify([{ 
+    localStorage.setItem("__iceq_e2e_contacts", JSON.stringify([{
       uin: 700000099,
       username: "incoming_friend",
       avatar_url: "",
@@ -34,7 +34,7 @@ test("contact request and acceptance notifications update the sidebar without a 
   await expect(page.getByRole("button", { name: "Accept" })).toBeVisible();
 
   await page.evaluate(() => {
-    localStorage.setItem("__iceq_e2e_contacts", JSON.stringify([{ 
+    localStorage.setItem("__iceq_e2e_contacts", JSON.stringify([{
       uin: 700000099,
       username: "incoming_friend",
       avatar_url: "",
