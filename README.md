@@ -321,3 +321,7 @@ GitHub Actions workflow [`security-ci.yml`](.github/workflows/security-ci.yml) r
 - **Metadata-reduced message storage** - optional message TTL is available, but conversation IDs and sender/receiver routing metadata still need a deeper minimization redesign
 - **Independent review and production acceptance** — repository tests do not replace a cryptographic audit, penetration test, backup/restore rehearsal, or clearnet real-user acceptance
 - **Tor runtime** — opt-in Compose assets exist, but boot, consensus publication, onion reachability, and DNS-leak testing are intentionally deferred until after clearnet acceptance
+
+## License
+
+MIT — see [LICENSE](LICENSE).
