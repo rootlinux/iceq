@@ -1,9 +1,11 @@
 # Clearnet Pre-deployment Security Audit
 
-Audit date: 2026-07-16
-Scope: Phase 1-2 repository claims through `2d072d1`; local source, unit tests,
-build, dependency audit, migrations, and Compose rendering only. No VPS access,
-deployment, public smoke mutation, or Tor implementation was performed.
+Audit date: 2026-07-27 (updated)
+Previous audit date: 2026-07-16 (Phase 1-2 through `2d072d1`).
+Scope: Release-candidate preparation through Phase 9; local source, unit tests,
+build, dependency audit, migrations, Compose rendering, Caddy validation,
+and .dockerignore verification. No VPS access, deployment, public smoke
+mutation, or Tor implementation was performed.
 
 ## Result
 
@@ -69,12 +71,18 @@ correct the executable-evidence contract.
 | `5ee3065` | Atomically consumed refresh rows before replacement-token issuance, making concurrent reuse single-winner. |
 | `2d072d1` | Added bounded grant-revocation retry, exhaustion recovery, idempotence, and ACK-race compensation. |
 
-## Fresh local verification
+## Fresh local verification (historical — 2026-07-16)
+
+> **Note:** The results below are from the Phase 1–2 audit scope (2026-07-16).
+> Current results are in the "2026-07-27 release-candidate additions" section
+> below and in `docs/security-status.md`. The test count has since grown from
+> 47 to 322, and the dependency gate now reports 2 moderate react-router
+> findings (accepted by policy) instead of the earlier protobufjs advisory.
 
 - Focused Go packages: PASS (auth handlers/routes, shared CSRF/JWT/limiters,
   keys, message handlers/store, presence, files, WS client/router).
 - Full backend: `cd backend && go test ./...` PASS.
-- Web tests: `cd web && npm test` PASS, 47 tests.
+- Web tests: `cd web && npm test` PASS, 47 tests (historical; 322 as of 2026-07-27).
 - TypeScript: `cd web && npm run typecheck` PASS.
 - Production bundle: `cd web && npm run build` PASS. Vite reports existing
   vendor `curveasm.js` compatibility warnings; the build exits zero and the
@@ -89,16 +97,29 @@ correct the executable-evidence contract.
   with the local example-derived environment. This validates rendering, not
   container startup or runtime health.
 
+## 2026-07-27 release-candidate additions
+
+- **React Router security gate**: `react-router-dom` downgraded from `^7.18.1` to exact `6.30.4`. Direct `react-router` dependency removed. This eliminates the HIGH-severity findings. The policy accepts only three reviewed advisory identifiers represented by two MODERATE package entries: the affected SSR/RSC path is unused, and the redirect path is constrained by the fixed-route AST regression gate. All 322 web tests, 48 E2E tests, typecheck, and build pass.
+- **Caddy validation**: `check-clearnet-compose.sh` now invokes `caddy validate` (not bare `validate`). Both clearnet and Tor configs validated at runtime. Regression test added.
+- **Root `.dockerignore`**: Excludes version control, hidden local state directories, environment files, `node_modules`, build artifacts, coverage, logs, and editor/OS metadata. `.env.example` explicitly re-included. Regression test verifies exclusions.
+- **Redis authentication**: Production Redis requires `requirepass` + `ICEQ_REDIS_PASSWORD`. `ICEQ_REDIS_REQUIRE_AUTH=1` enforces non-empty password at startup. Acceptance uses synthetic `iceq-acceptance-redis`.
+- **NATS authentication**: Production NATS enforces `--auth` token (`ICEQ_NATS_TOKEN`). All internal clients read token from environment. Acceptance uses synthetic `iceq-acceptance-nats`.
+- **ScyllaDB mode**: Production defaults to `--developer-mode=0` via `ICEQ_SCYLLA_DEVELOPER_MODE`. Acceptance retains `--developer-mode=1`.
+- **Migrations 014–017**: Panic Wipe PIN, challenge-signature key, wipe jobs table, and Scylla erasure indexes. All additive with guards.
+- **Five-storage acceptance**: The disposable stack applied the real migration files, seeded PostgreSQL, Redis, ScyllaDB, NATS JetStream, and MinIO, then verified zero footprint for the wiped account and no change to a control account.
+
 ## Remaining pre-deployment concerns
 
-1. Apply and verify Scylla migration 004 and PostgreSQL migrations 005-007 on
+1. Apply and verify all pending migrations (004-007, 010-017) on
    existing volumes before affected services start.
 2. Obtain live clearnet HTTPS/WSS, authorization, rate-limit, panic-wipe, and
    file-grant smoke evidence only after the separate deployment approval gate.
-3. Resolved at `f3968a9`: exact direct `protobufjs@7.6.5` passed the parser and
-   identity boundary tests, all 142 web tests, typecheck, production build, and
-   both moderate audit modes with `0 vulnerabilities`.
+3. `protobufjs@7.6.5` resolved; all web tests, typecheck, and build pass.
 4. Add server-side expiry/reconciliation for attachment grants to cover browser
    crashes before the in-memory lifecycle can revoke them.
-5. Retain the documented limitations: legacy pre-004 message cleanup, incomplete
+5. Complete backup and restore rehearsal against disposable data. Clean-schema migration application and the five-storage Panic Wipe acceptance path pass locally.
+6. Complete independent cryptographic/security audit.
+7. Retain the documented limitations: legacy pre-004 message cleanup, incomplete
    group E2EE, and lack of an external cryptographic/security review.
+8. npm audit reports 2 moderate findings for react-router v6 (SSR/RSC features
+   not used by IceQ's client-side SPA); no high or critical vulnerabilities.

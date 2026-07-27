@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { StaticRouter } from "react-router-dom/server.js";
+import { StaticRouter } from "react-router-dom/server";
 
 class MemoryStorage {
   private readonly values = new Map<string, string>();

@@ -39,6 +39,7 @@ declare global {
   interface Window {
     __iceqE2ENetwork: BrowserNetworkEvidence;
     __iceqE2ENativeFetch: typeof fetch;
+    __iceqE2EQueuePollEnvelope?: (envelope: unknown) => void;
   }
 }
 
@@ -65,6 +66,11 @@ export async function installSyntheticAPI(
 
   await page.addInitScript((syntheticUsers) => {
     const evidence: BrowserNetworkEvidence = { apiAttempts: [], websocketAttempts: [], unhandled: [] };
+    const pollQueue: unknown[] = [];
+    const pollWaiters: Array<(response: Response) => void> = [];
+    let pollCursor = 0;
+    let wipePublicKeyB64: string | null = null;
+    let wipeChallenge: { id: string; bytes: Uint8Array; used: boolean } | null = null;
     window.__iceqE2ENetwork = evidence;
     const nativeFetch = window.fetch.bind(window);
     window.__iceqE2ENativeFetch = nativeFetch;
@@ -73,6 +79,14 @@ export async function installSyntheticAPI(
       status,
       headers: { "Content-Type": "application/json" },
     });
+    window.__iceqE2EQueuePollEnvelope = (envelope: unknown): void => {
+      pollQueue.push(envelope);
+      const waiter = pollWaiters.shift();
+      if (waiter) {
+        pollCursor += 1;
+        waiter(respondJSON({ cursor: `synthetic-cursor-${pollCursor}`, envelopes: pollQueue.splice(0) }));
+      }
+    };
 
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const request = new Request(input, init);
@@ -106,7 +120,45 @@ export async function installSyntheticAPI(
         return respondJSON({ uin: user.uin, username: user.username });
       }
       if (url.pathname === "/api/auth/logout") return respondJSON({});
-      if (url.pathname === "/api/contacts/" && request.method === "GET") return respondJSON({ contacts: [] });
+      if (url.pathname === "/api/auth/panic-wipe-public-key" && request.method === "PUT") {
+        const input = JSON.parse(body || "{}") as { public_key?: string };
+        wipePublicKeyB64 = input.public_key ?? null;
+        return respondJSON({});
+      }
+      if (url.pathname === "/api/auth/panic-wipe-challenge" && request.method === "POST") {
+        const bytes = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+        wipeChallenge = { id: "synthetic-wipe-challenge-1", bytes, used: false };
+        return respondJSON({
+          challenge_id: wipeChallenge.id,
+          challenge: btoa(String.fromCharCode(...bytes)),
+        });
+      }
+      if (url.pathname === "/api/auth/panic-wipe" && request.method === "POST") {
+        const input = JSON.parse(body || "{}") as { challenge_id?: string; signature?: string };
+        if (!wipePublicKeyB64 || !wipeChallenge || wipeChallenge.used || input.challenge_id !== wipeChallenge.id || !input.signature) {
+          return respondJSON({ code: "INVALID_SIGNATURE" }, 403);
+        }
+        try {
+          const publicKey = Uint8Array.from(atob(wipePublicKeyB64), (char) => char.charCodeAt(0));
+          const signature = Uint8Array.from(atob(input.signature), (char) => char.charCodeAt(0));
+          const imported = await globalThis.crypto.subtle.importKey("raw", publicKey, { name: "Ed25519" }, false, ["verify"]);
+          const valid = await globalThis.crypto.subtle.verify(
+            { name: "Ed25519" },
+            imported,
+            signature,
+            wipeChallenge.bytes,
+          );
+          if (!valid) return respondJSON({ code: "INVALID_SIGNATURE" }, 403);
+          wipeChallenge.used = true;
+          return respondJSON({}, 202);
+        } catch {
+          return respondJSON({ code: "INVALID_SIGNATURE" }, 403);
+        }
+      }
+      if (url.pathname === "/api/contacts/" && request.method === "GET") {
+        const contacts = JSON.parse(localStorage.getItem("__iceq_e2e_contacts") ?? "[]") as unknown[];
+        return respondJSON({ contacts });
+      }
       if (url.pathname === "/api/groups/" && request.method === "GET") return respondJSON({ groups: [] });
       if (/^\/api\/keys\/bundle\/\d+$/.test(url.pathname) && request.method === "GET") {
         const uin = url.pathname.split("/").at(-1) ?? "";
@@ -118,8 +170,18 @@ export async function installSyntheticAPI(
       if (url.pathname === "/api/keys/bundle" && request.method === "POST") return respondJSON({});
       if (url.pathname === "/api/keys/prekeys/count" && request.method === "GET") return respondJSON({ count: 20 });
       if (url.pathname === "/api/transport/poll" && request.method === "GET") {
+        if (pollQueue.length > 0) {
+          pollCursor += 1;
+          return respondJSON({ cursor: `synthetic-cursor-${pollCursor}`, envelopes: pollQueue.splice(0) });
+        }
         return new Promise<Response>((_resolve, reject) => {
-          request.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+          const resolve = (response: Response): void => _resolve(response);
+          pollWaiters.push(resolve);
+          request.signal.addEventListener("abort", () => {
+            const index = pollWaiters.indexOf(resolve);
+            if (index >= 0) pollWaiters.splice(index, 1);
+            reject(new DOMException("Aborted", "AbortError"));
+          }, { once: true });
         });
       }
 
@@ -188,8 +250,12 @@ export async function publishSyntheticDirectory(
   }, { key: PUBLIC_DIRECTORY_KEY, accountUin: uin, directoryEntry: entry });
 }
 
-export async function seedSyntheticIdentity(page: Page, user: SyntheticUser): Promise<void> {
-  const seeded = await page.evaluate(async (account) => {
+export async function seedSyntheticIdentity(
+  page: Page,
+  user: SyntheticUser,
+  options: { completeSecuritySetup?: boolean } = {},
+): Promise<void> {
+  const seeded = await page.evaluate(async ({ account, completeSecuritySetup }) => {
     const idb = await import("/src/lib/indexeddb.ts");
     const signal = await import("/src/lib/signal.ts");
     const namespace = { uin: account.uin, deviceId: await idb.loadOrCreateDeviceId() };
@@ -197,13 +263,14 @@ export async function seedSyntheticIdentity(page: Page, user: SyntheticUser): Pr
     const registrationId = signal.generateRegistrationId();
     await signal.saveOwnIdentity(identity, registrationId, namespace);
     const bundle = await signal.generatePreKeyBundle(identity, 1, 1, registrationId, namespace);
+    if (completeSecuritySetup) await idb.setSecuritySetupCompleted(namespace);
     return {
       identity_key: bundle.identity_key,
       signed_pre_key: bundle.signed_pre_key,
       pre_key: bundle.one_time_pre_keys[0],
       registration_id: bundle.registration_id,
     };
-  }, user);
+  }, { account: user, completeSecuritySetup: options.completeSecuritySetup ?? true });
   await publishSyntheticDirectory(page, user.uin, seeded);
 }
 

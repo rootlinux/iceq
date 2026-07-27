@@ -85,10 +85,48 @@ export async function logout(signal?: AbortSignal, accessToken?: string | null):
 	});
 }
 
-export async function panicWipe(): Promise<void> {
-  await fetchWithAuth("/api/auth/panic-wipe", { method: "POST", body: {} });
+export async function panicWipe(pin?: string): Promise<void> {
+  await fetchWithAuth("/api/auth/panic-wipe", { method: "POST", body: { pin: pin ?? "" } });
+}
+
+export async function panicWipeWithSignature(challengeID: string, signature: string): Promise<void> {
+  await fetchWithAuth("/api/auth/panic-wipe", { method: "POST", body: { challenge_id: challengeID, signature } });
+}
+
+export async function uploadWipePublicKey(publicKey: string, password?: string): Promise<void> {
+  await fetchWithAuth("/api/auth/panic-wipe-public-key", {
+    method: "PUT",
+    body: { public_key: publicKey, password: password ?? "" },
+  });
+}
+
+export async function requestWipeChallenge(): Promise<{ challenge_id: string; challenge: string }> {
+  return fetchJSON("/api/auth/panic-wipe-challenge", { method: "POST" });
+}
+
+// setPanicPin sets (pin non-empty) or clears (pin === "") the panic-wipe
+// PIN. The server re-verifies currentPassword before writing -- changing
+// this security setting requires the same re-authentication bar as any
+// other one.
+export async function setPanicPin(currentPassword: string, pin: string): Promise<void> {
+  await fetchWithAuth("/api/auth/panic-pin", {
+    method: "PUT",
+    body: { current_password: currentPassword, pin },
+  });
 }
 
 export async function me(): Promise<UserPublic> {
   return fetchJSON<UserPublic>("/api/auth/me", { method: "GET" });
+}
+
+export interface CryptoBinding {
+  uin: number;
+  identity_key: string;
+}
+
+/** Returns the authenticated user's public identity key for
+ *  ambiguous registration recovery. Self-only — never accepts
+ *  a target UIN and never exposes private material. */
+export async function cryptoBinding(): Promise<CryptoBinding> {
+  return fetchJSON<CryptoBinding>("/api/auth/crypto-binding", { method: "GET" });
 }

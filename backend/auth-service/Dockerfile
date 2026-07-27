@@ -27,6 +27,7 @@ RUN go mod download
 # it imports. This keeps the build cache hot when unrelated services
 # change and avoids leaking other directories into the image.
 COPY backend/auth-service/  ./auth-service/
+COPY backend/file-service/minio/ ./file-service/minio/
 COPY backend/shared/        ./shared/
 
 ARG VERSION=dev

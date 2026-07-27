@@ -150,6 +150,69 @@ export async function savePendingRegistration<T>(value:T):Promise<void>{const db
 export async function clearPendingRegistration():Promise<void>{const db=await openDB();try{await idbDelete(db,STORE_METADATA,PENDING_REGISTRATION_KEY);}finally{db.close();}}
 
 // ----------------------------------------------------------------------------
+// Recovery provisioning — durable pending record
+// ----------------------------------------------------------------------------
+//
+// After importing a recovery package, the identity key is in IndexedDB but
+// the server still has the OLD device's prekey bundle. Provisioning fresh
+// prekeys requires generating a bundle and uploading it. If the upload fails
+// (network), we must retry the EXACT same bundle — not regenerate keys.
+//
+// This record stores the staging bundle + namespace + identity fingerprint
+// so recovery can resume after a page reload without re-importing the
+// recovery package.
+
+const PENDING_RECOVERY_PROVISIONING_PREFIX = "pending_recovery_provisioning_v1";
+
+function pendingRecoveryProvisioningKey(ns: CryptoNamespace): string {
+  return `${PENDING_RECOVERY_PROVISIONING_PREFIX}:${ns.uin}:${ns.deviceId}`;
+}
+
+export interface PendingRecoveryProvisioning {
+  // The exact PreKeyBundleUpload to retry on failure.
+  bundle: {
+    identityKey: string;
+    registrationId: number;
+    deviceId: number;
+    signedPreKey: { keyId: number; publicKey: string; signature: string };
+    oneTimePreKeys: Array<{ keyId: number; publicKey: string }>;
+  };
+  // The namespace the identity was imported into.
+  namespace: CryptoNamespace;
+  // Derived public key of the recovered identity (fingerprint for mismatch detection).
+  identityFingerprint: string;
+  // When the record was created (for debugging).
+  createdAt: number;
+}
+
+export async function loadPendingRecoveryProvisioning(ns: CryptoNamespace): Promise<PendingRecoveryProvisioning | null> {
+  const db = await openDB();
+  try {
+    return (await idbGet<PendingRecoveryProvisioning>(db, STORE_METADATA, pendingRecoveryProvisioningKey(ns))) ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+export async function savePendingRecoveryProvisioning(record: PendingRecoveryProvisioning): Promise<void> {
+  const db = await openDB();
+  try {
+    await idbPut(db, STORE_METADATA, record, pendingRecoveryProvisioningKey(record.namespace));
+  } finally {
+    db.close();
+  }
+}
+
+export async function clearPendingRecoveryProvisioning(ns: CryptoNamespace): Promise<void> {
+  const db = await openDB();
+  try {
+    await idbDelete(db, STORE_METADATA, pendingRecoveryProvisioningKey(ns));
+  } finally {
+    db.close();
+  }
+}
+
+// ----------------------------------------------------------------------------
 // Identity. Own long-term identity. Persisted in IndexedDB only.
 // Zustand NEVER holds the private key — only the Signal bindings
 // do, and they hand it back to the bindings API on demand.
@@ -1049,6 +1112,61 @@ export class IndexedDBSignalProtocolStore implements StorageType {
 // has a single chokepoint to attach to.
 export function getSignalStore(namespace: CryptoNamespace): IndexedDBSignalProtocolStore {
   return new IndexedDBSignalProtocolStore(namespace);
+}
+
+// ----------------------------------------------------------------------------
+// Security vault — passphrase verification blob (never contains the passphrase
+// or derived key; only a PBKDF2-derived AES-GCM-encrypted known prefix).
+// ----------------------------------------------------------------------------
+
+const SECURITY_VAULT_SALT_KEY = "security_vault_salt";
+const SECURITY_VAULT_BLOB_KEY = "security_vault";
+const SECURITY_SETUP_COMPLETE_KEY = "security_setup_complete";
+
+export async function saveSecurityVaultSalt(ns: CryptoNamespace, salt: string): Promise<void> {
+  const db = await openDB();
+  await idbPut(db, STORE_METADATA, { v: 1, salt }, cryptoRecordKey(ns, "metadata", SECURITY_VAULT_SALT_KEY));
+  db.close();
+}
+
+export async function loadSecurityVaultSalt(ns: CryptoNamespace): Promise<{ v: number; salt: string } | null> {
+  const db = await openDB();
+  const v = await idbGet<{ v: number; salt: string }>(db, STORE_METADATA, cryptoRecordKey(ns, "metadata", SECURITY_VAULT_SALT_KEY));
+  db.close();
+  return v ?? null;
+}
+
+export async function saveSecurityVaultBlob(ns: CryptoNamespace, blob: string): Promise<void> {
+  const db = await openDB();
+  await idbPut(db, STORE_METADATA, { v: 1, blob }, cryptoRecordKey(ns, "metadata", SECURITY_VAULT_BLOB_KEY));
+  db.close();
+}
+
+export async function loadSecurityVaultBlob(ns: CryptoNamespace): Promise<{ v: number; blob: string } | null> {
+  const db = await openDB();
+  const v = await idbGet<{ v: number; blob: string }>(db, STORE_METADATA, cryptoRecordKey(ns, "metadata", SECURITY_VAULT_BLOB_KEY));
+  db.close();
+  return v ?? null;
+}
+
+export async function deleteSecurityVaultRecords(ns: CryptoNamespace): Promise<void> {
+  const db = await openDB();
+  await idbDelete(db, STORE_METADATA, cryptoRecordKey(ns, "metadata", SECURITY_VAULT_SALT_KEY));
+  await idbDelete(db, STORE_METADATA, cryptoRecordKey(ns, "metadata", SECURITY_VAULT_BLOB_KEY));
+  db.close();
+}
+
+export async function hasSecuritySetupCompleted(ns: CryptoNamespace): Promise<boolean> {
+  const db = await openDB();
+  const v = await idbGet<{ v: number }>(db, STORE_METADATA, cryptoRecordKey(ns, "metadata", SECURITY_SETUP_COMPLETE_KEY));
+  db.close();
+  return v?.v === 1;
+}
+
+export async function setSecuritySetupCompleted(ns: CryptoNamespace): Promise<void> {
+  const db = await openDB();
+  await idbPut(db, STORE_METADATA, { v: 1 }, cryptoRecordKey(ns, "metadata", SECURITY_SETUP_COMPLETE_KEY));
+  db.close();
 }
 
 // ----------------------------------------------------------------------------

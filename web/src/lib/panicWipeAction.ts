@@ -1,8 +1,9 @@
 export async function runConfirmedPanicWipe(
   confirm: () => boolean,
-  panicWipe: () => Promise<void>,
+  panicWipe: (pin?: string) => Promise<void>,
+  pin?: string,
 ): Promise<boolean> {
   if (!confirm()) return false;
-  await panicWipe();
+  await panicWipe(pin);
   return true;
 }

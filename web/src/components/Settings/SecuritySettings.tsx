@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { getActiveCryptoNamespace, loadIdentity } from "../../lib/indexeddb";
 import { SafetyQr } from "./SafetyQr";
 import { fetchBundle } from "../../api/keys";
@@ -7,20 +8,32 @@ import { acceptPeerIdentity, assessPeerIdentity, verifyPeerIdentity } from "../.
 import { useAuthStore } from "../../store/authStore";
 import { verifySignedPreKeyBundle } from "../../lib/signal";
 import { PrivacySettings } from "./PrivacySettings";
+import { PanicPinSettings } from "./PanicPinSettings";
 import { useI18n } from "../../i18n";
 import { runConfirmedPanicWipe } from "../../lib/panicWipeAction";
+import { ApiError } from "../../api/client";
+import { unlockSecurityVault, lockSecurityVault } from "../../lib/securityVault";
+import { loadAndDecryptWipePrivateKey, signWipeChallenge } from "../../lib/panicWipeKey";
+import { panicWipeWithSignature, requestWipeChallenge } from "../../api/auth";
 
 type FingerprintStatus =
   | { kind: "loading" }
   | { kind: "ready"; fingerprint: string | null }
   | { kind: "error" };
 
+type PanicWipeMode = "idle" | "pin" | "passphrase";
+
 export function SecuritySettings(): JSX.Element {
   const i18n = useI18n();
+  const navigate = useNavigate();
   const selfUin = useAuthStore((state) => state.uin);
-  const panicWipe = useAuthStore((state) => state.panicWipe);
+  const storePanicWipe = useAuthStore((state) => state.panicWipe);
   const [panicBusy, setPanicBusy] = useState(false);
-  const [panicError, setPanicError] = useState(false);
+  const [panicError, setPanicError] = useState<string | null>(null);
+  const [panicConfirmOpen, setPanicConfirmOpen] = useState(false);
+  const [panicPinInput, setPanicPinInput] = useState("");
+  const [panicPassphraseInput, setPanicPassphraseInput] = useState("");
+  const [panicMode, setPanicMode] = useState<PanicWipeMode>("idle");
   const [fingerprintStatus, setFingerprintStatus] = useState<FingerprintStatus>({
     kind: "loading",
   });
@@ -67,6 +80,84 @@ export function SecuritySettings(): JSX.Element {
     };
   }, []);
 
+  async function handlePassphraseWipe(): Promise<void> {
+    setPanicError(null);
+    setPanicBusy(true);
+    try {
+      const unlocked = await unlockSecurityVault(panicPassphraseInput);
+      if (!unlocked) {
+        setPanicError(i18n.t("security.panicWipeWrongPin"));
+        return;
+      }
+
+      const privateKey = await loadAndDecryptWipePrivateKey();
+      if (!privateKey) {
+        setPanicError(i18n.t("security.panicWipeFailed"));
+        return;
+      }
+
+      const challengeResp = await requestWipeChallenge();
+      const challengeBytes = new Uint8Array(
+        Uint8Array.from(atob(challengeResp.challenge), c => c.charCodeAt(0))
+      );
+
+      const sigBytes = await signWipeChallenge(challengeBytes, privateKey);
+      const sigB64 = btoa(String.fromCharCode(...sigBytes));
+
+      await panicWipeWithSignature(challengeResp.challenge_id, sigB64);
+
+      // Server accepted the wipe (202). Trigger destructive local cleanup:
+      // lock vault, clear tokens, destroy IndexedDB, clear caches, reset
+      // memory, redirect to login. Await the teardown so we know whether
+      // local cleanup succeeded.
+      lockSecurityVault();
+      try {
+        await useAuthStore.getState().handleServerWipe();
+        // Local cleanup succeeded — clear the dialog.
+        setPanicConfirmOpen(false);
+      } catch {
+        // Local cleanup failed. The fail-closed cleanup-required marker is
+        // already set by startSessionTeardown. Keep the dialog open so the
+        // user sees the error banner; do not report the wipe as completed.
+        setPanicError(i18n.t("cleanup.failed"));
+        // Keep panicConfirmOpen = true so the user can retry.
+      }
+    } catch (e) {
+      lockSecurityVault();
+      if (e instanceof ApiError) {
+        if (e.code === "INVALID_SIGNATURE") setPanicError(i18n.t("security.panicWipeWrongPin"));
+        else if (e.code === "SIGNATURE_REQUIRED") setPanicError(i18n.t("security.panicWipeWrongPin"));
+        else setPanicError(i18n.t("security.panicWipeFailed"));
+      } else {
+        setPanicError(i18n.t("security.panicWipeFailed"));
+      }
+    } finally {
+      setPanicBusy(false);
+      setPanicPassphraseInput("");
+    }
+  }
+
+  async function handlePinWipe(): Promise<void> {
+    try {
+      await runConfirmedPanicWipe(() => true, storePanicWipe, panicPinInput);
+      setPanicConfirmOpen(false);
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.code === "INVALID_PIN") {
+        setPanicError(i18n.t("security.panicWipeWrongPin"));
+      } else {
+        setPanicError(i18n.t("security.panicWipeFailed"));
+      }
+    }
+  }
+
+  function openPanicWipe(): void {
+    setPanicError(null);
+    setPanicPinInput("");
+    setPanicPassphraseInput("");
+    setPanicMode("pin");
+    setPanicConfirmOpen(true);
+  }
+
   return (
     <div className="iceq-settings-panel">
       <h3>{i18n.t("security.title")}</h3>
@@ -94,16 +185,126 @@ export function SecuritySettings(): JSX.Element {
         </div>
       </div>
 
+      <PanicPinSettings />
+
       <div className="iceq-settings-row">
         <div className="iceq-settings-status">
           <strong>{i18n.t("security.panicWipeTitle")}</strong>
           <p>{i18n.t("security.panicWipeWarning")}</p>
-          <button type="button" disabled={panicBusy} onClick={() => {
-            setPanicBusy(true); setPanicError(false);
-            void runConfirmedPanicWipe(() => window.confirm(i18n.t("security.panicWipeConfirm")), panicWipe)
-              .catch(() => setPanicError(true)).finally(() => setPanicBusy(false));
-          }}>{i18n.t("security.panicWipeAction")}</button>
-          {panicError && <div role="alert">{i18n.t("security.panicWipeFailed")}</div>}
+          <button type="button" disabled={panicBusy} onClick={openPanicWipe}>
+            {i18n.t("security.panicWipeAction")}
+          </button>
+          {panicError === i18n.t("security.panicWipeFailed") && <div role="alert">{panicError}</div>}
+        </div>
+      </div>
+
+      {panicConfirmOpen && (
+        <div
+          className="iceq-modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="panic-wipe-confirm-title"
+          onClick={() => !panicBusy && setPanicConfirmOpen(false)}
+        >
+          <div className="iceq-modal" onClick={(e) => e.stopPropagation()}>
+            <h2 id="panic-wipe-confirm-title" className="text-lg font-semibold text-text">
+              {i18n.t("security.panicWipeAction")}
+            </h2>
+            <p className="mt-1 text-sm text-text-2">{i18n.t("security.panicWipeConfirm")}</p>
+
+            <div className="mt-3 flex gap-2">
+              <button
+                type="button"
+                className={panicMode === "pin" ? "iceq-btn-primary text-xs" : "iceq-btn-secondary text-xs"}
+                onClick={() => setPanicMode("pin")}
+              >
+                {i18n.t("security.panicWipeEnterPin")}
+              </button>
+              <button
+                type="button"
+                className={panicMode === "passphrase" ? "iceq-btn-primary text-xs" : "iceq-btn-secondary text-xs"}
+                onClick={() => setPanicMode("passphrase")}
+              >
+                {i18n.t("setup.passphraseLabel")}
+              </button>
+            </div>
+
+            {panicMode === "pin" && (
+              <div className="mt-3">
+                <label htmlFor="panic-wipe-pin" className="mb-1 block text-xs text-text-2">
+                  {i18n.t("security.panicWipeEnterPin")}
+                </label>
+                <input
+                  id="panic-wipe-pin"
+                  type="password"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  maxLength={4}
+                  pattern="[0-9]{4}"
+                  className="iceq-input"
+                  value={panicPinInput}
+                  onChange={(event) => setPanicPinInput(event.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+                  disabled={panicBusy}
+                />
+                <p className="mt-1 text-xs text-text-2">{i18n.t("security.panicWipeEnterPinHelp")}</p>
+              </div>
+            )}
+
+            {panicMode === "passphrase" && (
+              <div className="mt-3">
+                <label htmlFor="panic-wipe-passphrase" className="mb-1 block text-xs text-text-2">
+                  {i18n.t("setup.passphraseInput")}
+                </label>
+                <input
+                  id="panic-wipe-passphrase"
+                  type="password"
+                  autoComplete="off"
+                  className="iceq-input"
+                  value={panicPassphraseInput}
+                  onChange={(event) => setPanicPassphraseInput(event.target.value)}
+                  disabled={panicBusy}
+                />
+                <p className="mt-1 text-xs text-text-2">{i18n.t("setup.createPassphraseHelp")}</p>
+              </div>
+            )}
+
+            {panicError && <div role="alert" className="mt-2 text-sm">{panicError}</div>}
+
+            <div className="iceq-modal-buttons">
+              <button type="button" className="iceq-btn-secondary" disabled={panicBusy} onClick={() => setPanicConfirmOpen(false)}>
+                {i18n.t("security.panicWipeCancel")}
+              </button>
+              <button
+                type="button"
+                className="iceq-btn-primary"
+                disabled={panicBusy}
+                onClick={() => {
+                  setPanicBusy(true);
+                  setPanicError(null);
+                  if (panicMode === "passphrase") {
+                    void handlePassphraseWipe();
+                  } else {
+                    void (async () => {
+                      await handlePinWipe();
+                      setPanicBusy(false);
+                    })();
+                  }
+                }}
+              >
+                {i18n.t("security.panicWipeAction")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="iceq-settings-row">
+        <div className="iceq-settings-status">
+          <strong>{i18n.t("recovery.title")}</strong>
+          <p>{i18n.t("recovery.help")}</p>
+          <button type="button" onClick={() => navigate("/recovery")}>
+            {i18n.t("recovery.importAction")}
+          </button>
         </div>
       </div>
 

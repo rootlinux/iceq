@@ -39,6 +39,7 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/iceq/iceq/auth-service/handlers"
 	"github.com/iceq/iceq/auth-service/models"
+	"github.com/iceq/iceq/file-service/minio"
 	"github.com/iceq/iceq/shared/db"
 	"github.com/iceq/iceq/shared/jwt"
 	"github.com/iceq/iceq/shared/middleware"
@@ -71,6 +72,9 @@ type config struct {
 	NATSURL         string
 	ScyllaHosts     string
 	ScyllaKeyspace  string
+	MinioEndpoint   string
+	MinioAccessKey  string
+	MinioSecretKey  string
 	JWTSecret       string
 	AllowedOrigins  string
 	ShutdownTimeout time.Duration
@@ -85,6 +89,9 @@ func loadConfig() config {
 		NATSURL:         envOr("ICEQ_NATS_URL", "nats://nats:4222"),
 		ScyllaHosts:     envOr("ICEQ_SCYLLA_HOSTS", "scylla:9042"),
 		ScyllaKeyspace:  envOr("ICEQ_SCYLLA_KEYSPACE", "iceq"),
+		MinioEndpoint:   envOr("ICEQ_MINIO_ENDPOINT", "minio:9000"),
+		MinioAccessKey:  envOr("ICEQ_MINIO_ACCESS_KEY", "minioadmin"),
+		MinioSecretKey:  envOr("ICEQ_MINIO_SECRET_KEY", "minioadmin"),
 		JWTSecret:       envOr("ICEQ_JWT_SECRET", ""),
 		AllowedOrigins:  envOr("ICEQ_ALLOWED_ORIGINS", "https://localhost"),
 		ShutdownTimeout: 10 * time.Second,
@@ -158,8 +165,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("scylla message store: %v", err)
 	}
-	panicWipeDeps := newPanicWipeDeps(pgPool, rdb, messageStore)
-
 	// --- JWT manager ---------------------------------------------------
 	// F-2 / F-5 (JWT assessment): NewManager now requires the pg
 	// pool because the per-user session_epoch check in Verify
@@ -187,6 +192,35 @@ func main() {
 		log.Fatalf("nats: %v", err)
 	}
 	log.Printf("[auth-service] nats: connected to %s", cfg.NATSURL)
+
+	// --- MinIO client ---------------------------------------------------
+	// The panic wipe must be able to delete user objects. Fail startup if
+	// MinIO is unreachable — a partial wipe that silently retains objects
+	// is a privacy violation.
+	minioClient, err := minio.New(bootCtx, minio.Config{
+		Endpoint:  cfg.MinioEndpoint,
+		AccessKey: cfg.MinioAccessKey,
+		SecretKey: cfg.MinioSecretKey,
+		UseSSL:    false,
+	})
+	if err != nil {
+		log.Fatalf("minio: %v", err)
+	}
+	log.Printf("[auth-service] minio: connected to %s", cfg.MinioEndpoint)
+
+	// Verify the wipe_jobs table exists with the correct schema before
+	// starting any background worker. Fail closed if migration 016 has
+	// not been applied — a missing table means durable wipe cleanup
+	// cannot work and the auth-service must not start.
+	if err := handlers.CheckWipeJobsSchema(bootCtx, pgPool); err != nil {
+		log.Fatalf("wipe_jobs schema: %v", err)
+	}
+	log.Printf("[auth-service] wipe_jobs schema: verified")
+
+	// Wire panic-wipe dependencies after all storage clients are ready.
+	// newPanicWipeDeps fails startup if any dependency is nil — a
+	// partial wipe that silently skips a layer is a privacy violation.
+	panicWipeDeps := newPanicWipeDeps(pgPool, rdb, messageStore, bus, minioClient)
 
 	// --- Router --------------------------------------------------------
 	r := chi.NewRouter()
@@ -245,8 +279,31 @@ func main() {
 		r.With(authMW, rate("auth:me", 60, time.Minute)).Get("/me", handlers.NewMeHandler(handlers.MeDeps{
 			Pool: pgPool,
 		}))
+		// GET /api/auth/crypto-binding — authenticated self-only public
+		// identity binding proof for ambiguous registration recovery.
+		r.With(authMW, rate("auth:crypto-binding", 30, time.Minute)).Get("/crypto-binding", handlers.NewCryptoBindingHandler(handlers.CryptoBindingDeps{
+			Pool: pgPool,
+		}))
+		challengeSigDeps := &handlers.ChallengeSignatureDeps{
+			Pool:                pgPool,
+			LookupWipePublicKey: handlers.NewLookupWipePublicKey(pgPool),
+			Redis:               rdb,
+		}
 		r.With(authMW, rate("auth:panic-wipe", 3, time.Hour), csrfMW).Post("/panic-wipe", handlers.NewManualPanicWipeHandler(handlers.ManualPanicWipeDeps{
-			PanicWipeDeps: panicWipeDeps,
+			PanicWipeDeps:          panicWipeDeps,
+			ChallengeSignatureDeps: challengeSigDeps,
+		}))
+		r.With(authMW, rate("auth:panic-pin", 5, time.Hour), csrfMW).Put("/panic-pin", handlers.NewSetPanicPinHandler(handlers.SetPanicPinDeps{
+			Pool: pgPool,
+		}))
+		r.With(authMW, rate("auth:panic-wipe-public-key", 5, time.Hour), csrfMW).Put("/panic-wipe-public-key", handlers.NewSetWipePublicKeyHandler(handlers.SetWipePublicKeyDeps{
+			Pool:                pgPool,
+			Redis:               rdb,
+			LookupWipePublicKey: handlers.NewLookupWipePublicKey(pgPool),
+			LookupPasswordHash:  handlers.NewLookupPasswordHash(pgPool),
+		}))
+		r.With(authMW, rate("auth:panic-wipe-challenge", 10, time.Hour)).Post("/panic-wipe-challenge", handlers.NewWipeChallengeHandler(handlers.WipeChallengeDeps{
+			Redis: rdb,
 		}))
 		r.Get("/health", newHealthHandler(pgPool, rdb, VERSION))
 	})
@@ -271,6 +328,23 @@ func main() {
 		r.With(authMW, contactRate("contacts:block", 30), middleware.RequireCSRF).Put("/{target_uin}/block", handlers.NewBlockContactHandler(contactsDeps))
 		r.With(authMW, contactRate("contacts:remove", 30), middleware.RequireCSRF).Delete("/{target_uin}", handlers.NewRemoveContactHandler(contactsDeps))
 	})
+
+	// --- Background wipe worker -------------------------------------------
+	// Starts a goroutine that polls wipe_jobs and retries Scylla, NATS,
+	// and MinIO cleanup independently of HTTP request budgets. The worker
+	// runs until the process receives SIGINT/SIGTERM.
+	wipeWorker := &handlers.WipeJobRunner{
+		Pool:   pgPool,
+		Scylla: messageStore,
+		NATS:   bus,
+		Minio:  minioClient,
+		Redis:  handlers.NewRedisWipeCleaner(rdb),
+	}
+	// Create a cancellable context so the worker can be stopped
+	// independently of the HTTP server.
+	wipeWorkerCtx, wipeWorkerCancel := context.WithCancel(context.Background())
+	defer wipeWorkerCancel()
+	stopWipeWorker := wipeWorker.StartWipeWorker(wipeWorkerCtx)
 
 	// --- HTTP server + graceful shutdown -------------------------------
 	srv := &http.Server{
@@ -318,6 +392,14 @@ func main() {
 	} else {
 		log.Printf("[auth-service] http server stopped cleanly")
 	}
+
+	// Stop the wipe worker before draining dependencies.
+	// Cancel triggers the poll loop to exit; stop waits for any
+	// in-flight job to finish within its lease timeout.
+	wipeWorkerCancel()
+	stopWipeWorker()
+	log.Printf("[auth-service] wipe worker stopped")
+
 	// Drain the NATS bus after the HTTP server is fully stopped
 	// so no in-flight publish is interrupted mid-flight. Drain()
 	// is best-effort; an error here is logged but does not
@@ -328,8 +410,22 @@ func main() {
 	log.Printf("[auth-service] bye")
 }
 
-func newPanicWipeDeps(pool *pgxpool.Pool, redisClient *redis.Client, store handlers.MessageStore) handlers.PanicWipeDeps {
-	return handlers.PanicWipeDeps{Pool: pool, Redis: redisClient, Scylla: store}
+func newPanicWipeDeps(pool *pgxpool.Pool, redisClient *redis.Client, store handlers.MessageStore, natsCleaner handlers.NatsCleaner, minioCleaner handlers.MinioCleaner) handlers.PanicWipeDeps {
+	deps := handlers.PanicWipeDeps{
+		Pool:   pool,
+		Redis:  redisClient,
+		Scylla: store,
+		NATS:   natsCleaner,
+		Minio:  minioCleaner,
+	}
+	// Production-mode assertion: every required dependency must be non-nil.
+	// A nil field here means the panic wipe would silently skip a storage
+	// layer, leaving ciphertext or objects behind — a privacy violation.
+	if deps.Pool == nil || deps.Redis == nil || deps.Scylla == nil || deps.NATS == nil || deps.Minio == nil {
+		log.Fatalf("[auth-service] panic-wipe dependencies incomplete: pg=%v redis=%v scylla=%v nats=%v minio=%v",
+			deps.Pool != nil, deps.Redis != nil, deps.Scylla != nil, deps.NATS != nil, deps.Minio != nil)
+	}
+	return deps
 }
 
 // ----------------------------------------------------------------------------

@@ -16,6 +16,7 @@ import * as authApi from "../api/auth";
 import type { UserPublic } from "../api/auth";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
 import { clearAllIceQLocalData, ICEQ_CLEANUP_REQUIRED_MARKER_KEY, ICEQ_LOGGED_OUT_MARKER_KEY, registerMemoryReset, resetIceQMemory, type CleanupReason } from "../lib/localDataCleanup";
+import { lockSecurityVault } from "../lib/securityVault";
 
 const ACCOUNT_UIN_KEY = "iceq_account_uin";
 
@@ -35,7 +36,7 @@ interface AuthState {
   login: (username: string, password: string) => Promise<void>;
   register: (input: { username: string; password: string; identityKey: string }) => Promise<void>;
   logout: () => Promise<void>;
-  panicWipe: () => Promise<void>;
+  panicWipe: (pin?: string) => Promise<void>;
   handleServerWipe: () => Promise<void>;
   retryLocalCleanup: () => Promise<void>;
   expireSession: () => Promise<void>;
@@ -150,6 +151,7 @@ function startSessionTeardown(reason: CleanupReason, logoutServer: boolean, set:
 	beginSessionTeardown();
 	tokenStore.clear();
 	resetIceQMemory();
+	lockSecurityVault();
 	set(EMPTY_AUTH);
 	const ownerGeneration = authLifecycleGeneration;
 	teardownFlight = (async () => {
@@ -303,8 +305,8 @@ export const useAuthStore = create<AuthState>((set) => ({
 		return startSessionTeardown("logout", true, set);
 	},
 
-	panicWipe: async () => {
-		await authApi.panicWipe();
+	panicWipe: async (pin) => {
+		await authApi.panicWipe(pin);
 		return startSessionTeardown("panic-wipe", false, set);
 	},
 

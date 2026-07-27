@@ -119,6 +119,9 @@ services:
       - ./init/migrations/007_file_object_grants.sql:/docker-entrypoint-initdb.d/07-file_object_grants.sql:ro
       - ./init/migrations/008_group_crypto_epoch.sql:/docker-entrypoint-initdb.d/08-group_crypto_epoch.sql:ro
       - ./init/migrations/009_sender_key_distribution_inbox.sql:/docker-entrypoint-initdb.d/09-sender_key_distribution_inbox.sql:ro
+      - ./init/migrations/014_panic_wipe_pin.sql:/docker-entrypoint-initdb.d/10-panic_wipe_pin.sql:ro
+      - ./init/migrations/015_wipe_public_key.sql:/docker-entrypoint-initdb.d/11-wipe_public_key.sql:ro
+      - ./init/migrations/016_wipe_jobs.sql:/docker-entrypoint-initdb.d/12-wipe_jobs.sql:ro
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /run:size=16m,mode=0755
@@ -150,11 +153,13 @@ services:
     networks: [iceq-net]
     security_opt:
       - no-new-privileges:true
+    env_file:
+      - ${ICEQ_ENV_FILE:-.env.local}
     command:
       - "--smp=1"
       - "--memory=400M"
       - "--overprovisioned=1"
-      - "--developer-mode=1"
+      - "--developer-mode=${ICEQ_SCYLLA_DEVELOPER_MODE:-0}"
       - "--api-address=0.0.0.0"
     volumes:
       - scylla_data:/var/lib/scylla
@@ -193,6 +198,7 @@ services:
       - ./init/migrations/011_disappearing_messages.cql:/init/011-disappearing-messages.cql:ro
       - ./init/migrations/012_durable_message_ingest.cql:/init/012-durable-message-ingest.cql:ro
       - ./init/migrations/013_group_recipient_snapshot.cql:/init/013-group-recipient-snapshot.cql:ro
+      - ./init/migrations/017_user_erasure_indexes.cql:/init/017-user-erasure-indexes.cql:ro
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -219,10 +225,34 @@ services:
           echo "[scylla-init] schema already exists (idempotent OK)"
         fi
         cqlsh scylla 9042 -f /init/004-panic-wipe-message-indexes.cql
-        cqlsh scylla 9042 -f /init/010-group-message-crypto-epoch.cql
-        cqlsh scylla 9042 -f /init/011-disappearing-messages.cql
+        # Scylla 5.4's CQL parser does not support "ALTER TABLE ... ADD IF NOT
+        # EXISTS col type" (unlike CREATE TABLE IF NOT EXISTS, which works).
+        # These files use plain ADD, so re-running on a volume that already
+        # has the column fails with "Invalid column name X because it
+        # conflicts with an existing column" -- tolerate only that error to
+        # keep the migration idempotent across restarts/redeploys. Order
+        # matters: 013 ALTERs tables that 012 creates, so 012 must run first.
+        apply_tolerant_alter() {
+          cqlsh scylla 9042 -f "/init/$$1.cql" > "/tmp/cql-$$1.log" 2>&1 || true
+          if grep -qE 'conflicts with an existing column' "/tmp/cql-$$1.log"; then
+            if grep -vE 'conflicts with an existing column' "/tmp/cql-$$1.log" | grep -qE 'Error|error|ERROR'; then
+              echo "[scylla-init] fatal: non-duplicate-column error applying $$1.cql" >&2
+              cat "/tmp/cql-$$1.log" >&2
+              exit 1
+            fi
+            echo "[scylla-init] $$1.cql already applied (idempotent OK)"
+          elif grep -qE 'Error|error|ERROR' "/tmp/cql-$$1.log"; then
+            echo "[scylla-init] fatal error applying $$1.cql" >&2
+            cat "/tmp/cql-$$1.log" >&2
+            exit 1
+          fi
+        }
+        apply_tolerant_alter 010-group-message-crypto-epoch
+        apply_tolerant_alter 011-disappearing-messages
         cqlsh scylla 9042 -f /init/012-durable-message-ingest.cql
-        cqlsh scylla 9042 -f /init/013-group-recipient-snapshot.cql
+        apply_tolerant_alter 013-group-recipient-snapshot
+        echo "[scylla-init] applying erasure indexes (017)"
+        cqlsh scylla 9042 -f /init/017-user-erasure-indexes.cql
         echo "[scylla-init] schema applied successfully"
     logging: *default-logging
 
@@ -235,6 +265,10 @@ services:
     hostname: redis
     restart: unless-stopped
     networks: [iceq-net]
+    env_file:
+      - ${ICEQ_ENV_FILE:-.env.local}
+    environment:
+      REDISCLI_AUTH: ${ICEQ_REDIS_PASSWORD:?set ICEQ_REDIS_PASSWORD}
     command:
       - "redis-server"
       - "--appendonly"
@@ -246,10 +280,12 @@ services:
       - "1000"
       - "--maxmemory-policy"
       - "allkeys-lru"
+      - "--requirepass"
+      - "${ICEQ_REDIS_PASSWORD:?set ICEQ_REDIS_PASSWORD}"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDISCLI_AUTH\" ping"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -273,11 +309,15 @@ services:
     hostname: nats
     restart: unless-stopped
     networks: [iceq-net]
+    env_file:
+      - ${ICEQ_ENV_FILE:-.env.local}
     command:
       - "--name=iceq-nats"
       - "--jetstream"
       - "--store_dir=/data"
       - "--http_port=8222"
+      - "--auth"
+      - "${ICEQ_NATS_TOKEN:?set ICEQ_NATS_TOKEN}"
     volumes:
       - nats_data:/data
     healthcheck:
@@ -599,6 +639,13 @@ services:
       redis:
         condition: service_healthy
       nats:
+        condition: service_healthy
+      # message-service owns the ICEQ_DELIVERY JetStream stream
+      # (ensureDeliveryStream in backend/message-service/durable_ingest.go).
+      # Without this, ws-gateway's durable delivery consumer fails with
+      # "nats: stream not found" and crash-loops until message-service
+      # happens to win the startup race and create it.
+      message-service:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:8082/health"]

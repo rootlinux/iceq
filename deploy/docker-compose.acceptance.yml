@@ -1,0 +1,97 @@
+# Disposable acceptance-test stack — completely isolated from the
+# production iceq-* Compose project. Uses separate volumes, network,
+# and port mappings.
+#
+# Usage:
+#   docker compose -f docker-compose.acceptance.yml up -d
+#   ICEQ_ACCEPTANCE_PG_URL=... ICEQ_ACCEPTANCE_REDIS_ADDR=... \
+#     go test -count=1 -race -run TestAcceptance -v ./auth-service/handlers/
+#   docker compose -f docker-compose.acceptance.yml down -v
+
+name: iceq-acceptance
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: iceq
+    ports:
+      - "5434:5432"
+    volumes:
+      - pg_acceptance:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDISCLI_AUTH: iceq-acceptance-redis
+    command:
+      - "redis-server"
+      - "--requirepass"
+      - "iceq-acceptance-redis"
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_acceptance:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a $$REDISCLI_AUTH ping"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9002:9000"
+      - "9003:9001"
+    volumes:
+      - minio_acceptance:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 2s
+      retries: 15
+
+  nats:
+    image: nats:2.10-alpine
+    command: -js -sd /data -m 8222 --auth iceq-acceptance-nats
+    ports:
+      - "4223:4222"
+    volumes:
+      - nats_acceptance:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  scylla:
+    image: scylladb/scylla:5.4
+    command: --smp 1 --memory 1G --overprovisioned 1 --developer-mode 1
+    ports:
+      - "9043:9042"
+    volumes:
+      - scylla_acceptance:/var/lib/scylla
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status 2>/dev/null | grep -q '^UN' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  pg_acceptance:
+  redis_acceptance:
+  minio_acceptance:
+  nats_acceptance:
+  scylla_acceptance:

@@ -21,8 +21,13 @@ test("cleanup failures render a persistent accessible retry surface with localiz
 test("security settings exposes authenticated panic wipe behind strong confirmation", async () => {
   const source = await readFile(new URL("../src/components/Settings/SecuritySettings.tsx", import.meta.url), "utf8");
   assert.match(source, /panicWipe/);
-  assert.match(source, /window\.confirm/);
+  // A native window.confirm() cannot collect a PIN, so the confirmation step
+  // is a real modal (see runConfirmedPanicWipe / panic-wipe-pin.test.ts)
+  // that also gates the action behind the account's optional panic PIN.
+  assert.doesNotMatch(source, /window\.confirm/);
+  assert.match(source, /panic-wipe-confirm-title/);
   assert.match(source, /security\.panicWipeConfirm/);
+  assert.match(source, /panicPinInput/);
 });
 
 test("WebSocket 4403 delegates to the auth lifecycle without replaying the panic API", async () => {

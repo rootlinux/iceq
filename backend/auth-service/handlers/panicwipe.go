@@ -1,38 +1,33 @@
 // Package handlers — panicwipe.go
 //
-// PanicWipe is the explicit authenticated account-erasure operation. It
-// removes every key, every
-// contact, every group membership, every prekey bundle, every refresh
-// token, and every identifying row is gone. The user's record is
-// anonymized (username -> "deleted_<UIN>", email -> NULL, identity_key
-// -> "") so a future attacker cannot register with the same email or
-// impersonate the wiped user via their public key.
+// PanicWipe is the explicit authenticated account-erasure operation.
 //
-// Design constraints from the spec:
+// Execution order is critical:
+//  1. IMMEDIATE: Set Redis blocklist key to revoke all sessions.
+//  2. Capture exact file-object keys from Postgres BEFORE they are deleted.
+//  3. Atomic PG transaction: delete prekeys, tokens, memberships, contacts,
+//     file ownership, security settings, disable the account (set
+//     session_epoch), AND insert a durable wipe_job row. The job is
+//     committed atomically with the account mutation — if job insertion
+//     fails, the entire transaction rolls back so the account is never
+//     disabled without a corresponding cleanup job.
+//  4. Best-effort Redis auxiliary cleanup.
 //
-//  1. PG atomicity, Scylla best-effort. Everything inside Postgres
-//     happens in a single transaction so the partial state is never
-//     visible to a concurrent reader. Scylla deletes run AFTER the
-//     PG commit. We log if a Scylla delete fails, but we do NOT
-//     fail the wipe — ciphertext without the matching private keys
-//     is a successful cryptographic erase.
+// After the PG transaction commits, a background worker picks up the job
+// and executes Scylla, NATS, and MinIO cleanup. Only after every external
+// storage layer confirms deletion does the worker execute a final PG
+// transaction that permanently deletes the user row, wiped_accounts
+// entries, and the completed wipe-job row — leaving zero rows associated
+// with the wiped UIN in any PostgreSQL table. There is no "deleted_<UIN>"
+// tombstone.
 //
-//  2. Audit-trail discipline. The log line is timestamp + UIN + the
-//     constant string "panic_wipe_executed". We do NOT log
-//     passwords, the count that triggered the wipe, the source IP,
-//     or any of the field values being scrubbed. A wipe that fires
-//     is itself a security event; the audit log should be useful to
-//     incident response, not a side channel for an attacker who
-//     has read access to logs.
+// Recovery: if the blocklist SET succeeds but any subsequent step before
+// the PG commit fails, the blocklist key is removed so the account is not
+// permanently inaccessible. The caller can retry the wipe.
 //
-//  3. Blocklist with TTL. The wipe also sets
-//     `jwt:blocklist:wipe:{uin}` in Redis with a 7-day TTL. The
-//     ws-gateway checks this key on every inbound message; if it
-//     exists, the connection is closed with code 4403 (custom
-//     close code meaning "account wiped, clear local storage").
-//     The 7-day window is a comfortable bound: access tokens
-//     expire in 15 minutes by default, so by then any token that
-//     could have been used is long gone.
+// Always returns 202 Accepted — storage cleanup continues asynchronously
+// via the persisted wipe job. The client must clear local state immediately
+// without waiting for the background worker to finish.
 package handlers
 
 import (
@@ -45,6 +40,7 @@ import (
 	"time"
 
 	"github.com/iceq/iceq/shared/middleware"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -138,6 +134,104 @@ type MessageStore interface {
 	DeleteUserGroupMessages(ctx context.Context, uin int64) error
 }
 
+type NatsCleaner interface {
+	PurgeUserStreams(ctx context.Context, uin int64) error
+}
+
+type MinioCleaner interface {
+	DeleteUserObjects(ctx context.Context, uin int64, fileKeys []string) error
+	DeleteUserGrants(ctx context.Context, uin int64) error
+}
+
+// RedisCleaner removes user-scoped keys from Redis during durable wipe
+// cleanup.
+//
+// Two-phase deletion:
+//   1. CleanupUserKeys — deletes user data keys (presence, poll, undelivered,
+//      login attempts). Called during the "redis" wipe phase. Does NOT
+//      delete the blocklist key.
+//   2. DeleteBlocklistKey — deletes the panic-wipe blocklist key
+//      (jwt:blocklist:wipe:{uin}). Called ONLY after the final PG erasure
+//      transaction commits (user row no longer exists, all connections
+//      terminated). Until then the blocklist key must remain to reject
+//      in-flight sessions.
+//
+// Blocklist key lifetime:
+//   - Set by PanicWipe with a 7-day TTL (panicWipeBlocklistTTL).
+//   - Removed by the worker after final PG erasure confirms the user row
+//     is permanently deleted.
+//   - If the worker never runs (e.g., crash before final erasure), the
+//     key self-expires after 7 days, which exceeds the maximum access-token
+//     TTL (15 min) and maximum refresh-token TTL (30 days by spec).
+//   - Zero server footprint is achieved only after the blocklist key is
+//     confirmed deleted by the wipe worker. If the worker cannot reach
+//     Redis, the wipe_job row remains as a durable retry marker and the
+//     key self-expires after 7 days.
+type RedisCleaner interface {
+	CleanupUserKeys(ctx context.Context, uin int64) error
+	DeleteBlocklistKey(ctx context.Context, uin int64) error
+}
+
+// redisWipeAdapter wraps *redis.Client to satisfy RedisCleaner.
+type redisWipeAdapter struct {
+	rdb *redis.Client
+}
+
+// NewRedisWipeCleaner returns a RedisCleaner backed by the given Redis
+// client. The returned cleaner deletes every user-scoped key except the
+// wipe blocklist key.
+func NewRedisWipeCleaner(rdb *redis.Client) RedisCleaner {
+	return &redisWipeAdapter{rdb: rdb}
+}
+
+func (a *redisWipeAdapter) CleanupUserKeys(ctx context.Context, uin int64) error {
+	s := itoa(uin)
+
+	// Deterministic per-user keys — DEL directly.
+	// The blocklist key (jwt:blocklist:wipe:{uin}) is NOT deleted here;
+	// it is removed by DeleteBlocklistKey after final PG erasure.
+	for _, key := range []string{
+		"presence:" + s,
+		"undelivered:" + s,
+		"poll:stream:" + s,
+		"poll:cursors:" + s,
+		"poll:cursor-order:" + s,
+		"login_attempts:" + s,
+	} {
+		if err := a.rdb.Del(ctx, key).Err(); err != nil {
+			return fmt.Errorf("redis del %s: %w", key, err)
+		}
+	}
+
+	// Hash-tag poll keys — SCAN + DEL.
+	patterns := []string{
+		"poll:{" + s + "}:*",
+		"poll:{" + s + "}",
+	}
+	for _, pattern := range patterns {
+		if err := deletePattern(ctx, a.rdb, pattern); err != nil {
+			return fmt.Errorf("redis scan+del %s: %w", pattern, err)
+		}
+	}
+
+	return nil
+}
+
+// DeleteBlocklistKey removes the panic-wipe session-revocation key.
+// Must only be called after the final PG erasure transaction commits —
+// at that point the user row no longer exists and all connections have
+// been terminated via the ws-gateway's blocklist check.
+func (a *redisWipeAdapter) DeleteBlocklistKey(ctx context.Context, uin int64) error {
+	key := panicWipeBlocklistKey(uin)
+	if err := a.rdb.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("redis del blocklist %s: %w", key, err)
+	}
+	return nil
+}
+
+// Existing helper — reused by both HTTP-handler best-effort cleanup
+// and the durable worker phase.
+
 // PanicWipeDeps bundles the explicit wipe's dependencies.
 type PanicWipeDeps struct {
 	// Pool is the PG pool. Required.
@@ -151,27 +245,59 @@ type PanicWipeDeps struct {
 	// interface is satisfied by the message-service's gocql
 	// session in a later step.
 	Scylla MessageStore
+	NATS  NatsCleaner  // optional: nil means skip NATS cleanup
+	Minio MinioCleaner // optional: nil means skip MinIO cleanup
 }
 
 // ManualPanicWipeDeps wires the authenticated manual panic-wipe
 // endpoint. Wipe defaults to PanicWipe; tests can replace it so
 // the handler contract stays unit-testable without a live PG/Redis
-// stack.
+// stack. LookupPanicPinHash defaults to a Postgres-backed lookup via
+// PanicWipeDeps.Pool when Pool is set; tests inject a stub instead of
+// standing up a real database, matching Wipe's pattern. A nil Pool and
+// nil override both mean "the panic-PIN feature is off" -- the wipe
+// proceeds unconditionally, which is also the pre-PIN behavior every
+// existing caller relies on.
 type ManualPanicWipeDeps struct {
 	PanicWipeDeps
-	Wipe    func(context.Context, PanicWipeDeps, int64) error
-	Timeout time.Duration
+	Wipe                    func(context.Context, PanicWipeDeps, int64) (int64, error)
+	Timeout                 time.Duration
+	LookupPanicPinHash      func(ctx context.Context, uin int64) (string, error)
+	ChallengeSignatureDeps  *ChallengeSignatureDeps
+}
+
+type manualPanicWipeRequest struct {
+	Pin         string `json:"pin,omitempty"`
+	ChallengeID string `json:"challenge_id,omitempty"`
+	Signature   string `json:"signature,omitempty"`
 }
 
 // NewManualPanicWipeHandler returns the handler mounted at
 // POST /api/auth/panic-wipe. The route MUST be wrapped with
-// BearerAuth; the authenticated UIN is the only input to the wipe.
+// BearerAuth; the authenticated UIN and (if the account configured one)
+// the panic PIN are the only inputs to the wipe.
 func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 	if deps.Wipe == nil {
 		deps.Wipe = PanicWipe
 	}
 	if deps.Timeout <= 0 {
 		deps.Timeout = 10 * time.Second
+	}
+	if deps.LookupPanicPinHash == nil && deps.Pool != nil {
+		pool := deps.Pool
+		deps.LookupPanicPinHash = func(ctx context.Context, uin int64) (string, error) {
+			var hash *string
+			if err := pool.QueryRow(ctx, qSelectPanicPinHash, uin).Scan(&hash); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return "", nil
+				}
+				return "", err
+			}
+			if hash == nil {
+				return "", nil
+			}
+			return *hash, nil
+		}
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -180,11 +306,70 @@ func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 			writeError(w, http.StatusUnauthorized, "AUTH_MISSING_BEARER", "Authorization header is required")
 			return
 		}
+		var req manualPanicWipeRequest
+		if !decodeJSON(w, r, &req, 256) {
+			return
+		}
 
 		ctx, cancel := context.WithTimeout(r.Context(), deps.Timeout)
 		defer cancel()
 
-		if err := deps.Wipe(ctx, deps.PanicWipeDeps, uin); err != nil {
+		// Determine which verifier the account uses by inspecting server-side state.
+		// The server decides, never the client.
+		hasWipePublicKey := false
+		if deps.ChallengeSignatureDeps != nil && deps.ChallengeSignatureDeps.LookupWipePublicKey != nil {
+			pubKey, err := deps.ChallengeSignatureDeps.LookupWipePublicKey(ctx, uin)
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, "PANIC_WIPE_FAILED", "could not verify account state; please retry")
+				return
+			}
+			hasWipePublicKey = pubKey != nil
+		}
+
+		if hasWipePublicKey {
+			// Challenge-signature path is mandatory for migrated accounts.
+			if req.ChallengeID == "" || req.Signature == "" {
+				writeError(w, http.StatusUnauthorized, "SIGNATURE_REQUIRED", "challenge_id and signature are required")
+				return
+			}
+			if err := VerifyWipeSignature(ctx, *deps.ChallengeSignatureDeps, uin, req.ChallengeID, req.Signature); err != nil {
+				writeError(w, http.StatusUnauthorized, "INVALID_SIGNATURE", err.Error())
+				return
+			}
+			// Successful challenge-signature → retire any lingering PIN hash.
+			if deps.Pool != nil {
+				if _, err := deps.Pool.Exec(ctx, qNullPanicPinHash, uin); err != nil {
+					log.Printf("[auth-service] panicwipe: null pin hash after signature verification failed: %v", err)
+				}
+			}
+		} else {
+			// Legacy PIN path: check if a PIN hash exists.
+			var pinHash string
+			if deps.LookupPanicPinHash != nil {
+				var err error
+				pinHash, err = deps.LookupPanicPinHash(ctx, uin)
+				if err != nil {
+					writeError(w, http.StatusServiceUnavailable, "PANIC_WIPE_FAILED", "could not wipe account; please retry")
+					return
+				}
+			}
+			if pinHash != "" {
+				if !verifyPassword(pinHash, req.Pin).OK {
+					writeError(w, http.StatusUnauthorized, "INVALID_PIN", "incorrect panic PIN")
+					return
+				}
+			} else {
+				// No wipe_public_key AND no panic_pin_hash → security setup required.
+				writeError(w, http.StatusForbidden, "SECURITY_SETUP_REQUIRED", "panic wipe requires security setup (wipe key or PIN)")
+				return
+			}
+		}
+
+		if _, err := deps.Wipe(ctx, deps.PanicWipeDeps, uin); err != nil {
+
+			// Hard failure — PG transaction rolled back (or blocklist failed),
+			// nothing was wiped. The recovery deferred-remove cleared the
+			// blocklist if it was set. The caller can retry.
 			log.Printf("[auth-service] manual panic wipe failed")
 			clearSessionCookies(w)
 			writeError(w, http.StatusServiceUnavailable, "PANIC_WIPE_FAILED",
@@ -192,138 +377,254 @@ func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 			return
 		}
 
+		// PG data is wiped and the cleanup job is committed atomically.
+		// Storage cleanup (Scylla, NATS, MinIO) continues asynchronously
+		// via the persisted wipe job. Always return 202 Accepted so the
+		// client clears local state immediately while durable cleanup
+		// proceeds independently of this HTTP request.
 		clearSessionCookies(w)
-		w.WriteHeader(http.StatusNoContent)
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"status": "pending",
+		})
 	}
 }
 
 // PanicWipe executes the full wipe sequence. If ctx expires mid-wipe the
 // transaction is rolled back and the function returns ctx.Err().
 //
-// The function logs the timestamp + UIN + sentinel string on
-// success. Any other log line omits identifying details.
-func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) error {
+// Execution order is critical:
+//  1. IMMEDIATE: Set Redis blocklist key to revoke all sessions.
+//  2. Capture exact file-object keys from Postgres BEFORE they are deleted.
+//  3. Atomic PG transaction: delete prekeys, tokens, memberships, contacts,
+//     file ownership, security settings, disable the account (set
+//     session_epoch), AND insert a durable wipe_job row. The job is
+//     committed atomically with the account mutation — if job insertion
+//     fails, the entire transaction rolls back so the account is never
+//     disabled without a corresponding cleanup job.
+//  4. Best-effort Redis auxiliary cleanup.
+//
+// Recovery: if the blocklist SET succeeds but any subsequent step before
+// the PG commit fails, the blocklist key is removed so the account is not
+// permanently inaccessible. The caller can retry the wipe.
+//
+// Always returns (jobID, nil) on success. A wipe job is always created —
+// even with no storage layers, the worker must execute final PG erasure
+// (delete user row, wiped_accounts, and the job itself).
+func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) (int64, error) {
 	if deps.Pool == nil {
-		return errors.New("panicwipe: pg pool is nil")
+		return 0, errors.New("panicwipe: pg pool is nil")
 	}
 	if deps.Redis == nil {
-		return errors.New("panicwipe: redis client is nil")
+		return 0, errors.New("panicwipe: redis client is nil")
 	}
 
-	// ----- 1. PG transaction -------------------------------------------------
-	// Every PG delete/anonymize inside one tx so a concurrent
-	// reader never sees a half-wiped row. The tx is committed
-	// BEFORE we touch Scylla (see below) because XA between
-	// Postgres and Scylla is not available.
+	blocklistKey := panicWipeBlocklistKey(uin)
+
+	// ----- 1. IMMEDIATE session revocation ----------------------------------
+	// The blocklist key MUST be set before any data is touched. This
+	// ensures no valid token can observe half-wiped state. The ws-gateway
+	// checks this key on every message; if it exists, the connection is
+	// closed with code 4403. 7-day TTL: long enough to cover every active
+	// token, short enough to keep Redis tidy.
+	if err := deps.Redis.Set(ctx, blocklistKey, "1", panicWipeBlocklistTTL).Err(); err != nil {
+		return 0, fmt.Errorf("panicwipe: revoke active sessions: %w", err)
+	}
+
+	// If any step after blocklisting fails before the PG commit succeeds,
+	// remove the blocklist so the account can retry. blocklisted=true means
+	// "we must clean up on failure"; it is cleared once the PG commit
+	// confirms the wipe is durable.
+	blocklisted := true
+	defer func() {
+		if blocklisted {
+			if err := deps.Redis.Del(context.WithoutCancel(ctx), blocklistKey).Err(); err != nil {
+				log.Printf("[auth-service] panicwipe: failed to remove blocklist during recovery: %v", err)
+			}
+		}
+	}()
+
+	// ----- 2. Capture exact cleanup targets ---------------------------------
+	fileKeys, err := captureFileKeys(ctx, deps.Pool, uin)
+	if err != nil {
+		return 0, fmt.Errorf("panicwipe: capture file keys: %w", err)
+	}
+
+	// ----- 3. PG transaction -------------------------------------------------
 	tx, err := deps.Pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("panicwipe: begin tx: %w", err)
+		return 0, fmt.Errorf("panicwipe: begin tx: %w", err)
 	}
-	// Defer a rollback that fires only if the tx is still open.
-	// After Commit() the tx is closed and the Rollback call
-	// returns ErrTxClosed which we explicitly ignore.
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
 
-	// 3. DELETE FROM one_time_prekeys WHERE uin = $1
-	// (ScyllaDB deletes — steps 1, 2 — run AFTER the PG commit
-	//  in the best-effort block below; they cannot be folded
-	//  into the PG transaction because they touch a different
-	//  data store.)
+	// DELETE FROM one_time_prekeys WHERE uin = $1
 	if _, err := tx.Exec(ctx, qWipeOneTimePrekeys, uin); err != nil {
-		return fmt.Errorf("panicwipe: delete one_time_prekeys: %w", err)
+		return 0, fmt.Errorf("panicwipe: delete one_time_prekeys: %w", err)
 	}
 
-	// 4. DELETE FROM prekey_bundles WHERE uin = $1
+	// DELETE FROM prekey_bundles WHERE uin = $1
 	if _, err := tx.Exec(ctx, qWipePrekeyBundles, uin); err != nil {
-		return fmt.Errorf("panicwipe: delete prekey_bundles: %w", err)
+		return 0, fmt.Errorf("panicwipe: delete prekey_bundles: %w", err)
 	}
 
-	// 5. DELETE FROM refresh_tokens WHERE uin = $1
+	// DELETE FROM refresh_tokens WHERE uin = $1
 	if _, err := tx.Exec(ctx, qWipeRefreshTokens, uin); err != nil {
-		return fmt.Errorf("panicwipe: delete refresh_tokens: %w", err)
+		return 0, fmt.Errorf("panicwipe: delete refresh_tokens: %w", err)
 	}
 
-	// 6. DELETE FROM group_members WHERE uin = $1
+	// DELETE FROM group_members WHERE uin = $1
 	if _, err := tx.Exec(ctx, qWipeGroupMemberships, uin); err != nil {
-		return fmt.Errorf("panicwipe: delete group_members: %w", err)
+		return 0, fmt.Errorf("panicwipe: delete group_members: %w", err)
 	}
 
-	// 7. DELETE FROM contacts WHERE owner_uin = ? OR target_uin = ?
+	// DELETE FROM contacts WHERE owner_uin = $1 OR target_uin = $1
 	if _, err := tx.Exec(ctx, qWipeContacts, uin); err != nil {
-		return fmt.Errorf("panicwipe: delete contacts: %w", err)
+		return 0, fmt.Errorf("panicwipe: delete contacts: %w", err)
 	}
 
-	// Delete the security-settings row too. Done in the same
-	// tx so the post-wipe state is internally consistent: no
-	// settings, no prekey bundle, no prekeys, no membership.
+	// Delete file-object grant rows. Must run AFTER captureFileKeys above.
+	if _, err := tx.Exec(ctx, qWipeFileGrants, uin); err != nil {
+		return 0, fmt.Errorf("panicwipe: delete file_object_grants: %w", err)
+	}
+	if _, err := tx.Exec(ctx, qWipeFileObjects, uin); err != nil {
+		return 0, fmt.Errorf("panicwipe: delete file_objects: %w", err)
+	}
+
+	// Delete security settings.
 	if _, err := tx.Exec(ctx, qWipeSecuritySettings, uin); err != nil {
-		return fmt.Errorf("panicwipe: delete user_security_settings: %w", err)
-	}
-	if _, err := tx.Exec(ctx, qMarkAccountWiped, uin); err != nil {
-		return fmt.Errorf("panicwipe: mark account wiped: %w", err)
+		return 0, fmt.Errorf("panicwipe: delete user_security_settings: %w", err)
 	}
 
-	// 8. UPDATE users SET ... (anonymize in place; the row stays
-	//    for FK integrity)
-	if _, err := tx.Exec(ctx, qWipeUser, uin); err != nil {
-		return fmt.Errorf("panicwipe: anonymize users row: %w", err)
+	// Disable the account by advancing session_epoch. This invalidates all
+	// existing access/refresh tokens immediately. The user row stays in
+	// place (preserving FK integrity for the wipe_job row) until the
+	// background worker confirms all external storage deletion and executes
+	// the final PG erasure transaction.
+	if _, err := tx.Exec(ctx, `UPDATE users SET session_epoch = NOW(), updated_at = NOW() WHERE uin = $1`, uin); err != nil {
+		return 0, fmt.Errorf("panicwipe: disable account: %w", err)
 	}
 
-	// Commit the PG portion. After this point the wipe is
-	// observable to every other connection.
+	// ----- 3a. Insert cleanup job INSIDE the transaction --------------------
+	// The wipe_job row is committed atomically with the account mutation.
+	// If this INSERT fails, the entire transaction rolls back — the wipe
+	// is never committed without a corresponding cleanup job. This
+	// prevents permanent loss of the captured MinIO object keys.
+	// A job is ALWAYS created — even with no storage layers configured,
+	// the worker must execute final PG erasure (delete user row,
+	// wiped_accounts, and the job itself).
+	jobID, err := InsertWipeJobTx(ctx, tx, uin, fileKeys)
+	if err != nil {
+		return 0, fmt.Errorf("panicwipe: insert wipe job: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("panicwipe: commit: %w", err)
+		return 0, fmt.Errorf("panicwipe: commit: %w", err)
 	}
+	// PG commit succeeded — the wipe is durable. Clear the recovery flag so
+	// the deferred blocklist removal does NOT fire.
+	blocklisted = false
 
-	// ----- 9. Wipe blocklist ------------------------------------------------
-	// Sets the per-user blocklist key. The ws-gateway does
-	// EXISTS on this key for every message; if it returns 1,
-	// the gateway closes the connection with code 4403.
-	// 7-day TTL: long enough to cover every active token, short
-	// enough to keep Redis tidy.
-	if err := deps.Redis.Set(ctx,
-		panicWipeBlocklistKey(uin),
-		"1",
-		panicWipeBlocklistTTL,
-	).Err(); err != nil {
-		return fmt.Errorf("panicwipe: revoke active sessions: %w", err)
-	}
-
-	// Remove any failed-login counter left by a legacy deployment.
+	// ----- 4. Redis auxiliary cleanup (best-effort, non-fatal) --------------
 	if err := deps.Redis.Del(ctx, legacyLoginAttemptsKeyPrefix+itoa(uin)).Err(); err != nil {
 		log.Printf("[auth-service] panicwipe: del legacy counter failed: %v", err)
 	}
-
-	// ----- 11. DEL presence:{uin} -------------------------------------------
-	// Best-effort. The presence-service may or may not have a
-	// row; if it does, removing it speeds up the "user is
-	// offline" transition for any client that has the
-	// (now-defunct) UIN in a recent-chat list.
 	if err := deps.Redis.Del(ctx, presenceKeyPrefix+itoa(uin)).Err(); err != nil {
 		log.Printf("[auth-service] panicwipe: del presence failed: %v", err)
 	}
-
-	// Ciphertext cleanup is deliberately last. It receives an independent,
-	// bounded context so a slow Scylla node cannot consume the request budget
-	// needed for token/session revocation above.
-	if deps.Scylla != nil {
-		cleanupScylla(ctx, deps.Scylla, uin, 5*time.Second)
+	if err := deps.Redis.Del(ctx, "undelivered:"+itoa(uin)).Err(); err != nil {
+		log.Printf("[auth-service] panicwipe: del undelivered queue failed: %v", err)
 	}
+	cleanupPollKeys(ctx, deps.Redis, uin)
 
-	// Audit log contains no request or account metadata.
-	log.Printf("[auth-service] panic_wipe_executed")
+	log.Printf("[auth-service] panic_wipe_executed wipe_job=%d", jobID)
+	return jobID, nil
+}
+
+// captureFileKeys queries file_objects for every object_key owned by the
+// given UIN. It MUST be called BEFORE the PG transaction deletes the
+// ownership rows — the returned keys are the exact set MinIO should delete.
+// An empty list is valid (the user may never have uploaded a file).
+func captureFileKeys(ctx context.Context, pool *pgxpool.Pool, uin int64) ([]string, error) {
+	rows, err := pool.Query(ctx, qSelectFileObjectKeys, uin)
+	if err != nil {
+		return nil, fmt.Errorf("query file object keys: %w", err)
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("scan file object key: %w", err)
+		}
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate file object keys: %w", err)
+	}
+	return keys, nil
+}
+
+func deletePattern(ctx context.Context, rdb *redis.Client, pattern string) error {
+	var cursor uint64
+	for {
+		keys, nextCursor, err := rdb.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			if err := rdb.Del(ctx, key).Err(); err != nil {
+				log.Printf("[auth-service] panicwipe: del key %s failed: %v", key, err)
+			}
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
 	return nil
 }
 
-func cleanupScylla(parent context.Context, store MessageStore, uin int64, timeout time.Duration) {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+func cleanupPollKeys(ctx context.Context, rdb *redis.Client, uin int64) {
+	uinStr := itoa(uin)
+
+	// Deterministic per-user keys — DEL directly.
+	for _, key := range []string{
+		"poll:stream:" + uinStr,
+		"poll:cursors:" + uinStr,
+		"poll:cursor-order:" + uinStr,
+	} {
+		if err := rdb.Del(ctx, key).Err(); err != nil {
+			log.Printf("[auth-service] panicwipe: del poll key %s failed: %v", key, err)
+		}
+	}
+
+	// Hash-tag keys: poll:{UIN}:sequence, poll:{UIN}:seen:*, poll:{UIN}:record:*
+	// SCAN is required here because seen and record keys contain per-message digests
+	// whose names we cannot enumerate up front.
+	patterns := []string{
+		"poll:{" + uinStr + "}:*",
+		"poll:{" + uinStr + "}",
+	}
+	for _, pattern := range patterns {
+		if err := deletePattern(ctx, rdb, pattern); err != nil {
+			log.Printf("[API_WIPE] panicwipe: scan+del %s failed: %v", pattern, err)
+		}
+	}
+
+}
+
+func cleanupScylla(parent context.Context, store MessageStore, uin int64, timeout time.Duration) error {
+	cleanupCtx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	if err := store.DeleteUserMessages(cleanupCtx, uin); err != nil {
-		log.Printf("[auth-service] panicwipe: scylla delete messages failed: %v (ciphertext retained; keys gone)", err)
+		return fmt.Errorf("scylla delete messages: %w", err)
 	}
 	if err := store.DeleteUserGroupMessages(cleanupCtx, uin); err != nil {
-		log.Printf("[auth-service] panicwipe: scylla delete group_messages failed: %v (ciphertext retained; keys gone)", err)
+		return fmt.Errorf("scylla delete group_messages: %w", err)
 	}
+	return nil
 }

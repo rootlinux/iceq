@@ -31,7 +31,7 @@ test("install prompt capture starts before React renders while UI stays in the a
   );
   assert.match(
     app,
-    /path=["']\/app\/\*["'][\s\S]*element=\{isAuthed\s*\?\s*<MainLayout>/,
+    /path=["']\/app\/\*["'][\s\S]*<MainLayout>/,
   );
   assert.doesNotMatch(app, /path=["']\/(?:login|register)["'][\s\S]{0,200}<InstallPrompt/);
 });

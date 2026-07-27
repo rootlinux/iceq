@@ -62,9 +62,12 @@ test("clears every IceQ-owned browser and registered in-memory state without tou
   const unregister = registerMemoryReset(() => { resets += 1; });
   setActiveCryptoNamespace({ uin: 101, deviceId: "cleanup_device_0001" });
   trackObjectURL("blob:iceq-secret");
-  await clearAllIceQLocalData("logout");
+  // panic-wipe is one of the two reasons that must destroy the local
+  // Signal identity (the other is account-change); logout/auth-expired
+  // deliberately do not -- see the dedicated test below.
+  await clearAllIceQLocalData("panic-wipe");
   assert.throws(() => getActiveCryptoNamespace(), /not initialized/);
-  await clearAllIceQLocalData("logout");
+  await clearAllIceQLocalData("panic-wipe");
   unregister();
 
   assert.deepEqual(deletedDatabases, [ICEQ_INDEXEDDB_NAME, "iceq-signal", ICEQ_INDEXEDDB_NAME, "iceq-signal"]);
@@ -83,8 +86,8 @@ test("concurrent cleanup callers share one IndexedDB deletion flight", async () 
     async databases() { return [{ name: ICEQ_INDEXEDDB_NAME }]; },
     deleteDatabase() { deletes += 1; const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null }; finish = () => request.onsuccess?.(); return request; },
   } });
-  const first = clearAllIceQLocalData("logout");
-  const second = clearAllIceQLocalData("auth-expired");
+  const first = clearAllIceQLocalData("panic-wipe");
+  const second = clearAllIceQLocalData("account-change");
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(deletes, 1);
   finish?.();
@@ -97,8 +100,37 @@ test("a blocked delete that later succeeds remains one request", async () => {
     async databases() { return [{ name: ICEQ_INDEXEDDB_NAME }]; },
     deleteDatabase() { deletes += 1; const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null }; queueMicrotask(() => { request.onblocked?.(); queueMicrotask(() => request.onsuccess?.()); }); return request; },
   } });
-  await Promise.all([clearAllIceQLocalData("panic-wipe"), clearAllIceQLocalData("logout")]);
+  await Promise.all([clearAllIceQLocalData("panic-wipe"), clearAllIceQLocalData("account-change")]);
   assert.equal(deletes, 1);
+});
+
+test("auth-expired and logout clear session state but preserve the local Signal identity", async () => {
+  const local = storage({ iceq_access_token: "secret", iceq_privacy_settings: "{}" });
+  const deletedDatabases: string[] = [];
+  Object.defineProperties(globalThis, {
+    localStorage: { configurable: true, value: local.api },
+    sessionStorage: { configurable: true, value: storage({}).api },
+    indexedDB: { configurable: true, value: {
+      async databases() { return [{ name: ICEQ_INDEXEDDB_NAME }]; },
+      deleteDatabase(name: string) {
+        deletedDatabases.push(name);
+        const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null };
+        queueMicrotask(() => request.onsuccess?.());
+        return request;
+      },
+    } },
+  });
+
+  setActiveCryptoNamespace({ uin: 101, deviceId: "cleanup_device_0002" });
+  await clearAllIceQLocalData("auth-expired");
+  // The in-memory active-namespace pointer still resets (it must be
+  // re-established on the next login regardless), but the persisted
+  // IndexedDB database itself is untouched.
+  assert.throws(() => getActiveCryptoNamespace(), /not initialized/);
+  await clearAllIceQLocalData("logout");
+
+  assert.deepEqual(deletedDatabases, []);
+  assert.equal(local.entries.has("iceq_access_token"), false);
 });
 
 test("untracked object URLs are not revoked by later cleanup", async () => {

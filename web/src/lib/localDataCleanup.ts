@@ -87,7 +87,23 @@ export function clearAllIceQLocalData(reason: CleanupReason): Promise<void> {
   return cleanupFlight;
 }
 
-async function performCleanup(_reason: CleanupReason): Promise<void> {
+// Reasons that must destructively erase the local Signal identity and
+// message cache (the "iceq" IndexedDB database). "auth-expired" and
+// "logout" intentionally do NOT appear here: an expired or failed session
+// token is not evidence of device compromise, and destroying the only copy
+// of a locally-held E2EE identity on every benign session end -- a network
+// hiccup during token refresh, a long-idle refresh token finally expiring
+// -- would turn an ordinary reliability blip into unrecoverable account
+// loss (there is no server-side backup of the private key by design).
+// Logging back in on the same device should resume exactly where the user
+// left off, the same way Signal/WhatsApp behave. The deliberate "destroy
+// this device's access right now" action is panic-wipe (PIN-gated, see
+// SecuritySettings); "account-change" wipes so switching to a second
+// account on the same device never leaves the previous account's keys
+// reachable from the new session.
+const REASONS_THAT_ERASE_CRYPTO_IDENTITY: ReadonlySet<CleanupReason> = new Set(["panic-wipe", "account-change"]);
+
+async function performCleanup(reason: CleanupReason): Promise<void> {
   const failures: CleanupFailure[] = [];
   const capture = async (area: string, operation: () => void | Promise<void>): Promise<void> => {
     try { await operation(); } catch (cause) { failures.push({ area, cause }); }
@@ -120,7 +136,7 @@ async function performCleanup(_reason: CleanupReason): Promise<void> {
       if (!await caches.delete(name)) throw new Error(`Cache deletion failed: ${name}`);
     }));
   });
-  if (typeof indexedDB !== "undefined") {
+  if (typeof indexedDB !== "undefined" && REASONS_THAT_ERASE_CRYPTO_IDENTITY.has(reason)) {
     const databaseNames = await iceQDatabaseNames();
     for (const name of databaseNames) await capture("indexeddb", () => deleteIceQDatabase(name));
   }

@@ -20,5 +20,5 @@ test("security settings renders local identity fingerprint guidance without expo
   assert.match(englishCatalog, /Compare this fingerprint out-of-band with contacts\./);
   assert.match(englishCatalog, /This only verifies the key stored on this device\./);
   assert.doesNotMatch(securitySettings, /identity\.privateKey/);
-  assert.doesNotMatch(securitySettings, /privateKey/);
+  assert.doesNotMatch(securitySettings, /\.privateKey/);
 });

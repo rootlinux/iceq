@@ -18,8 +18,12 @@ import {
   saveNextPreKeyId,
   reserveNextPreKeyIds,
   setActiveCryptoNamespace,
+  loadPendingRecoveryProvisioning,
+  savePendingRecoveryProvisioning,
+  clearPendingRecoveryProvisioning,
   type CryptoNamespace,
   type StoredIdentity,
+  type PendingRecoveryProvisioning,
 } from "./indexeddb";
 import {
   generateOneTimePreKeys,
@@ -128,6 +132,231 @@ export async function ensureOwnBundle(
   );
   await deps.uploadBundle(bundle);
   return "repaired";
+}
+
+// ---------------------------------------------------------------------------
+// Recovery prekey provisioning
+// ---------------------------------------------------------------------------
+//
+// After importing a recovery package, the recovered identity key is in
+// IndexedDB but the server still has the OLD device's prekey bundle.
+// ensureOwnBundle() returns "ok" immediately when it sees a server bundle
+// exists — it has no way to know the bundle belongs to a different device.
+//
+// provisionRecoveryPrekeys is the explicit state machine for recovery:
+//
+//  1. Load the recovered identity (must exist — caller verified import).
+//  2. Derive the public key and confirm it matches the server directory.
+//     Identity mismatch → fail closed WITHOUT uploading anything.
+//  3. Generate a fresh signed prekey + one-time prekeys. Private halves
+//     are persisted to IndexedDB by generatePreKeyBundle BEFORE this
+//     function calls uploadBundle.
+//  4. Upload the new bundle, replacing the old device's bundle on the
+//     server. The identity_key is unchanged (same recovered identity);
+//     only the signed prekey and one-time prekeys are new.
+//  5. If upload fails, the staged keys are already in IndexedDB. The
+//     caller retries the same keys — they are NOT regenerated.
+//
+// The caller MUST NOT report recovery as complete until this function
+// returns successfully.
+
+export interface RecoveryProvisioningDeps {
+  loadIdentity: (ns?: CryptoNamespace) => Promise<StoredIdentity | null>;
+  fetchBundle: (uin: number) => Promise<RemotePreKeyBundle>;
+  restoreIdentity: (stored: StoredIdentity) => RestoredIdentity;
+  deriveStoredPublic?: (privateKey: string) => Promise<string>;
+  generatePreKeyBundle: (
+    identity: IdentityKeyPair,
+    startId: number,
+    oneTimeCount: number,
+    registrationId: number,
+    namespace?: CryptoNamespace,
+  ) => Promise<GeneratedBundle>;
+  uploadBundle: (bundle: PreKeyBundleUpload) => Promise<void>;
+  loadPendingRecord: (ns: CryptoNamespace) => Promise<PendingRecoveryProvisioning | null>;
+  savePendingRecord: (record: PendingRecoveryProvisioning) => Promise<void>;
+  clearPendingRecord: (ns: CryptoNamespace) => Promise<void>;
+}
+
+const defaultRecoveryDeps: RecoveryProvisioningDeps = {
+  loadIdentity: (ns) => loadIdentity(ns!),
+  fetchBundle,
+  restoreIdentity: restoreOwnIdentity,
+  deriveStoredPublic: deriveIdentityPublicKey,
+  generatePreKeyBundle: (identity, start, count, registration, ns) => generatePreKeyBundle(identity, start, count, registration, ns!),
+  uploadBundle,
+  loadPendingRecord: (ns) => loadPendingRecoveryProvisioning(ns),
+  savePendingRecord: savePendingRecoveryProvisioning,
+  clearPendingRecord: (ns) => clearPendingRecoveryProvisioning(ns),
+};
+
+// provisionRecoveryPrekeys generates fresh prekeys for a recovered identity
+// and uploads them to the server. The caller MUST pass the existing active
+// namespace — the namespace is NEVER invented or mutated by this function.
+//
+// Durable recovery-provisioning record (IndexedDB):
+//
+//  1. Check for an existing pending record. If one exists with a matching
+//     identity fingerprint, the private key halves were already persisted
+//     by a prior generatePreKeyBundle call. Reuse the exact same public
+//     bundle for the upload retry — keys are NEVER regenerated.
+//
+//  2. If no pending record exists, load the recovered identity, verify it
+//     against the server directory (fail closed on mismatch), generate
+//     fresh prekeys, persist the pending record to IndexedDB, then upload.
+//
+//  3. After a successful upload, clear the pending record.
+//
+//  4. If upload fails, the pending record remains. The caller can retry
+//     after a page reload — the pending record survives browser restarts.
+//
+// The recovered identity key is NEVER changed. Only the signed prekey and
+// one-time prekeys are replaced. The global active namespace is NEVER
+// mutated — the caller owns namespace management.
+export async function provisionRecoveryPrekeys(
+  ns: CryptoNamespace,
+  deps: RecoveryProvisioningDeps = defaultRecoveryDeps,
+): Promise<void> {
+  // 0. Check for a pending record from a previous attempt.
+  //    If one exists with a matching identity fingerprint, the private key
+  //    halves are already in IndexedDB. Reuse the exact same public bundle.
+  const pending = await deps.loadPendingRecord(ns);
+  if (pending) {
+    // Verify the namespace matches — if the caller passes a different
+    // namespace, something is wrong.
+    if (pending.namespace.uin !== ns.uin || pending.namespace.deviceId !== ns.deviceId) {
+      throw new Error("Pending recovery provisioning record namespace does not match active namespace.");
+    }
+
+    // Load the identity to verify the fingerprint still matches.
+    const stored = await deps.loadIdentity(ns);
+    if (!stored) {
+      // Identity was deleted (e.g., IndexedDB cleared). Clear the stale
+      // pending record so the caller falls through to full provisioning.
+      await deps.clearPendingRecord(ns);
+      throw new Error("No recovered identity found. Import the recovery package first.");
+    }
+
+    const derivedPublic = await (deps.deriveStoredPublic ?? (async () => stored.publicKey))(stored.privateKey);
+    if (!constantTimeEqual(derivedPublic, pending.identityFingerprint)) {
+      // Identity changed — the pending record is for a different identity.
+      // Clear it so the caller can re-provision.
+      await deps.clearPendingRecord(ns);
+      throw new IdentityKeyMismatchError();
+    }
+
+    // ---- Revalidate server identity before retrying the upload ----
+    // Fetch the current server identity bundle and verify ALL THREE match:
+    // server identity, local derived identity, and pending-record fingerprint.
+    // If the server identity changed between the first failed attempt and
+    // this retry (e.g., another device rotated keys), fail closed and
+    // upload NOTHING.
+    let serverDirectory: RemotePreKeyBundle;
+    try {
+      serverDirectory = await deps.fetchBundle(ns.uin);
+    } catch (fetchErr) {
+      throw new Error(`Cannot fetch server key directory for retry: ${(fetchErr as Error).message}`);
+    }
+
+    if (!constantTimeEqual(derivedPublic, serverDirectory.identity_key)) {
+      // Server identity does not match local identity. The server's key
+      // directory has changed since the pending record was created. Fail
+      // closed — do NOT upload anything, do NOT overwrite server identity.
+      await deps.clearPendingRecord(ns);
+      throw new IdentityKeyMismatchError();
+    }
+
+    // All three match: server identity, local derived identity, and
+    // pending-record fingerprint. Safe to retry the exact same bundle.
+    // Map from camelCase (IndexedDB storage format) to snake_case
+    // (PreKeyBundleUpload wire format).
+    await deps.uploadBundle({
+      identity_key: pending.bundle.identityKey,
+      registration_id: pending.bundle.registrationId,
+      signed_pre_key: {
+        id: pending.bundle.signedPreKey.keyId,
+        public_key: pending.bundle.signedPreKey.publicKey,
+        signature: pending.bundle.signedPreKey.signature,
+      },
+      one_time_pre_keys: pending.bundle.oneTimePreKeys.map((k) => ({
+        id: k.keyId,
+        public_key: k.publicKey,
+      })),
+    });
+    // Upload succeeded — clear the pending record.
+    await deps.clearPendingRecord(ns);
+    return;
+  }
+
+  // 1. Load recovered identity from the caller's namespace.
+  const stored = await deps.loadIdentity(ns);
+  if (!stored) {
+    throw new Error("No recovered identity found. Import the recovery package first.");
+  }
+
+  // 2. Fetch server directory and verify identity match.
+  let directory: RemotePreKeyBundle;
+  try {
+    directory = await deps.fetchBundle(ns.uin);
+  } catch (error) {
+    throw new Error(`Cannot fetch server key directory: ${(error as Error).message}`);
+  }
+
+  const derivedPublic = await (deps.deriveStoredPublic ?? (async () => stored.publicKey))(stored.privateKey);
+  if (!constantTimeEqual(derivedPublic, directory.identity_key)) {
+    // Identity mismatch — fail closed WITHOUT uploading anything.
+    throw new IdentityKeyMismatchError();
+  }
+
+  // 3. Restore identity and generate fresh prekeys.
+  //    generatePreKeyBundle persists private halves to IndexedDB before
+  //    returning — the keys are staged locally regardless of upload outcome.
+  const identity = deps.restoreIdentity(stored);
+  const bundle = await deps.generatePreKeyBundle(
+    identity,
+    DEFAULT_PREKEY_START,
+    DEFAULT_ONE_TIME_PREKEY_COUNT,
+    identity.registrationId,
+    ns,
+  );
+
+  // 4. Persist the pending record BEFORE uploading. This makes the bundle
+  //    durable across page reloads. The fingerprint ensures the record
+  //    matches the recovered identity.
+  const pendingRecord: PendingRecoveryProvisioning = {
+    bundle: {
+      identityKey: bundle.identity_key,
+      registrationId: bundle.registration_id,
+      deviceId: 1,
+      signedPreKey: {
+        keyId: bundle.signed_pre_key.id,
+        publicKey: bundle.signed_pre_key.public_key,
+        signature: bundle.signed_pre_key.signature,
+      },
+      oneTimePreKeys: bundle.one_time_pre_keys.map((k) => ({
+        keyId: k.id,
+        publicKey: k.public_key,
+      })),
+    },
+    namespace: { uin: ns.uin, deviceId: ns.deviceId },
+    identityFingerprint: derivedPublic,
+    createdAt: Date.now(),
+  };
+  await deps.savePendingRecord(pendingRecord);
+
+  // 5. Upload the bundle. The identity_key is the same recovered key;
+  //    only the signed prekey and one-time prekeys are replaced.
+  //    If this fails, the pending record survives and the caller retries
+  //    the exact same bundle (step 0 above reuses it).
+  try {
+    await deps.uploadBundle(bundle);
+  } catch (uploadErr) {
+    // Pending record stays — caller retries same bundle on next attempt.
+    throw uploadErr;
+  }
+
+  // 6. Upload confirmed — clear the pending record.
+  await deps.clearPendingRecord(ns);
 }
 
 export interface SignalProvisioningResult {

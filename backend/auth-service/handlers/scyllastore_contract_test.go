@@ -12,7 +12,19 @@ func TestScyllaWipeUsesUINPartitionedIndexesWithoutAllowFiltering(t *testing.T) 
 		t.Fatal(err)
 	}
 	s := string(src)
-	for _, want := range []string{"message_deletion_index WHERE uin = ?", "group_message_deletion_index WHERE uin = ?", "DELETE FROM messages WHERE conversation_id = ? AND created_at = ? AND id = ?", "DELETE FROM group_messages WHERE group_id = ? AND created_at = ? AND id = ?"} {
+	for _, want := range []string{
+		"message_deletion_index WHERE uin = ?",
+		"group_message_deletion_index WHERE uin = ?",
+		"DELETE FROM messages WHERE conversation_id = ? AND created_at = ? AND id = ?",
+		"DELETE FROM group_messages WHERE group_id = ? AND created_at = ? AND id = ?",
+		// Erasure-indexed tables must delete via indexes, not scans.
+		"message_ingest_erasure_index WHERE uin = ?",
+		"message_outbox_erasure_index WHERE uin = ?",
+		"group_message_outbox_erasure_index WHERE uin = ?",
+		"DELETE FROM message_ingest WHERE sender_uin = ? AND client_id = ?",
+		"DELETE FROM message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ?",
+		"DELETE FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ?",
+	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing indexed wipe contract %q", want)
 		}

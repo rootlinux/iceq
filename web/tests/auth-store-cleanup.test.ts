@@ -35,7 +35,10 @@ test("logout attempts server revocation before clearing every local account stat
 
   assert.equal(serverSawLocalState, true);
   assert.equal(logoutAuthorization, "Bearer token");
-  assert.equal(deleteCount, 1);
+  // logout clears session state but -- unlike panic-wipe/account-change --
+  // deliberately preserves the local Signal identity so the same device
+  // can log back into the same account without losing it.
+  assert.equal(deleteCount, 0);
   assert.equal(values.has("iceq_privacy_settings"), false);
   assert.equal(values.get("iceq_logged_out"), "1");
   assert.equal(values.has("iceq_account_uin"), false);
@@ -48,7 +51,10 @@ test("logout attempts server revocation before clearing every local account stat
   await useAuthStore.getState().setSession({ uin: 7, username: "alice" }, "first", "");
   useAuthStore.setState({ uin: null }); // simulate a reload with only the durable owner marker
   await useAuthStore.getState().setSession({ uin: 8, username: "bob" }, "second", "");
-  assert.equal(deleteCount, 2);
+  // Switching to a different account (7 -> 8) on this device is an
+  // account-change, which still erases the previous account's identity --
+  // this is the one deletion in the sequence so far (logout contributed 0).
+  assert.equal(deleteCount, 1);
   assert.equal(useAuthStore.getState().uin, 8);
 
   failPanicWipe = true;
@@ -161,7 +167,12 @@ test("logout attempts server revocation before clearing every local account stat
   assert.equal(values.has("iceq_privacy_settings"), false);
 
   // New sessions wait for the active teardown owner and cannot be erased by
-  // its late completion.
+  // its late completion. Uses panicWipe (not logout) as the in-flight
+  // teardown here specifically because it still exercises the IndexedDB
+  // deletion path -- logout deliberately no longer deletes the local
+  // Signal identity (see localDataCleanup.ts), so it has no controllable
+  // async gap left to race against; the wait/no-clobber property under
+  // test applies to every teardown reason, not just this one.
   async function raceTeardownWithSession(establish: () => Promise<void>, expectedUin: number): Promise<void> {
     let finishDelete!: () => void;
     Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: {
@@ -172,7 +183,7 @@ test("logout attempts server revocation before clearing every local account stat
         return request;
       },
     } });
-    const teardown = useAuthStore.getState().logout();
+    const teardown = useAuthStore.getState().panicWipe();
     await new Promise((resolve) => setTimeout(resolve, 0));
     const session = establish();
     await Promise.resolve();

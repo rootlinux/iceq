@@ -30,7 +30,7 @@ export function PrivacySettings(): JSX.Element {
       <div className="iceq-settings-row">
         <label htmlFor="disappearing-duration">{i18n.t("privacy.disappearing")}</label>
         <select id="disappearing-duration" value={disappearing} onChange={(event) => { const next = Number(event.target.value); setDisappearing(next); saveDisappearingSeconds(next); }}>
-          <option value={0}>{i18n.t("privacy.off")}</option><option value={3600}>{i18n.t("privacy.oneHour")}</option><option value={86400}>{i18n.t("privacy.oneDay")}</option><option value={604800}>{i18n.t("privacy.sevenDays")}</option><option value={2592000}>{i18n.t("privacy.thirtyDays")}</option>
+          <option value={3600}>{i18n.t("privacy.oneHour")}</option><option value={86400}>{i18n.t("privacy.oneDay")}</option><option value={259200}>{i18n.t("privacy.threeDays")}</option><option value={604800}>{i18n.t("privacy.sevenDays")}</option>
         </select>
       </div>
       <p className="text-sm text-text-2">{i18n.t("privacy.disappearingHelp")}</p>

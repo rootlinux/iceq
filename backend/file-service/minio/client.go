@@ -38,7 +38,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -293,6 +295,65 @@ func toProxyPath(u *url.URL) string {
 		rewritten += "?" + u.RawQuery
 	}
 	return rewritten
+}
+
+// DeleteUserObjects removes only the specified fileKeys from the files bucket
+// and the deterministic avatar key from the avatars bucket. It NEVER lists
+// objects — the caller must supply the exact keys to delete, which must be
+// captured from the file_objects table BEFORE ownership rows are removed.
+//
+// This is a safety-critical design: scanning and deleting an entire bucket
+// would wipe every user's objects. The caller is responsible for passing
+// only keys owned by the wiped UIN.
+func (m *MinioClient) DeleteUserObjects(ctx context.Context, uin int64, fileKeys []string) error {
+	// Delete only exact file keys from the files bucket.
+	for _, key := range fileKeys {
+		if key == "" {
+			continue
+		}
+		if err := m.client.RemoveObject(ctx, BucketFiles, key, mio.RemoveObjectOptions{}); err != nil {
+			log.Printf("[minio] delete object %s/%s failed: %v", BucketFiles, key, err)
+			return fmt.Errorf("delete file object %s: %w", key, err)
+		}
+	}
+
+	// Delete only the deterministic avatar key. A missing avatar is not an
+	// error — the user may never have uploaded one.
+	avatarKey := "avatars/" + itoa(uin)
+	if err := m.client.RemoveObject(ctx, BucketAvatars, avatarKey, mio.RemoveObjectOptions{}); err != nil {
+		// NoSuchKey is not fatal — the user might not have an avatar.
+		if !isNoSuchKey(err) {
+			log.Printf("[minio] delete avatar %s/%s failed: %v", BucketAvatars, avatarKey, err)
+			return fmt.Errorf("delete avatar object: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// itoa is a tiny helper for int64-to-string conversion used by avatar key
+// generation. Avoids importing strconv in the minio package for one call.
+func itoa(n int64) string {
+	return fmt.Sprintf("%d", n)
+}
+
+// isNoSuchKey reports whether err is a MinIO "The specified key does not
+// exist" response.
+func isNoSuchKey(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "The specified key does not exist")
+}
+
+// DeleteUserGrants is a no-op stub at the MinIO layer. File-object
+// grants live in the `file_objects` and `file_object_grants`
+// Postgres tables, which are cleaned inside the PanicWipe PG
+// transaction. This method exists so the auth-service can call a
+// single MinioCleaner interface without knowing the grant storage
+// backend.
+func (m *MinioClient) DeleteUserGrants(_ context.Context, _ int64) error {
+	return nil
 }
 
 // avatarKey is the deterministic object key for a user's
