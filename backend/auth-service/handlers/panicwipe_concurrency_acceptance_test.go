@@ -496,21 +496,45 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 	// of its bounded attempts reads a value that is stale by the time its
 	// own CAS lands.
 	// ---------------------------------------------------------------------
-	t.Run("bounded retry exhaustion under sustained contention fails the wipe step instead of reporting false success", func(t *testing.T) {
+	// CAS retry under synchronized contention: forcing real exhaustion
+	// against real Scylla is inherently a timing race -- adversaries and
+	// the call under test both need a network round trip per attempt, so
+	// whether the main call's CAS wins on a given attempt against 6
+	// concurrent adversaries can never be made deterministic without
+	// instrumenting production code (excluded -- see boundedCASRetry's own
+	// deterministic unit test in scyllastore_retry_test.go, which forces
+	// exhaustion with a fake, network-free attempt function instead). This
+	// test only asserts the safety contract that must hold regardless of
+	// which outcome the race happens to produce: never report success
+	// while the wiped uin remains, never resurrect it, never extend TTL,
+	// and never delete the erasure index before absence is confirmed.
+	//
+	// A synchronization barrier guarantees every adversary is actively
+	// looping before the call under test starts (fixing the previous
+	// version's flakiness, which came from occasionally letting the main
+	// call's first attempt land before any real contention existed) --
+	// but the barrier only guarantees contention is present, not which
+	// side wins a given round, so the assertion below accepts either
+	// outcome rather than trying to force one.
+	t.Run("CAS retry under synchronized contention: safety holds regardless of outcome", func(t *testing.T) {
 		uinA, uinB, uinC, senderUIN := freshUINs()
-		clientID := "exhaustion-check"
+		clientID := "exhaustion-safety-check"
 		seedGroupIngestRow(t, senderUIN, []int64{uinA, uinB, uinC}, clientID, 3600)
 
 		const adversaryCount = 6
 		dummyBase := int64(800000000)
+		var adversariesReady sync.WaitGroup
+		adversaryStart := make(chan struct{})
 		stop := make(chan struct{})
 		var adversaries sync.WaitGroup
 		for a := 0; a < adversaryCount; a++ {
 			a := a
+			adversariesReady.Add(1)
 			adversaries.Add(1)
 			go func() {
 				defer adversaries.Done()
-				toggle := false
+				adversariesReady.Done()
+				<-adversaryStart
 				for {
 					select {
 					case <-stop:
@@ -521,12 +545,20 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 					iter := session.Query(`SELECT recipient_uins FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
 					iter.Scan(&current)
 					_ = iter.Close()
+					// Append-only, derived from whatever this read actually
+					// saw -- never reset to a hardcoded list. A version of
+					// this adversary used to reset to []int64{uinA, uinB,
+					// uinC} on alternating iterations, which could replay a
+					// stale pre-removal snapshot and successfully CAS uinA
+					// back in AFTER the call under test had already
+					// legitimately, successfully removed it -- a resurrection
+					// caused entirely by this goroutine's own hardcoded reset,
+					// not by any defect in the CAS retry logic under test. A
+					// real concurrent writer wouldn't undo another worker's
+					// removal either; it would only contend over its own
+					// unrelated changes, which append-only faithfully models.
 					next := append(append([]int64(nil), current...), dummyBase+int64(a))
-					if toggle {
-						next = []int64{uinA, uinB, uinC}
-					}
-					toggle = !toggle
-					// Best-effort: a failed flip just means we try again
+					// Best-effort: a failed CAS just means we try again
 					// next loop iteration with a fresh read. Errors are
 					// deliberately ignored -- this goroutine's only job is
 					// to keep the value churning.
@@ -535,20 +567,51 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 				}
 			}()
 		}
+		// Wait for every adversary to be actively looping before starting
+		// the call under test, instead of relying on scheduling luck to
+		// land contention on its very first attempt.
+		adversariesReady.Wait()
+		close(adversaryStart)
 
 		err := msgStore.DeleteUserMessages(ctx, uinA)
 		close(stop)
 		adversaries.Wait()
 
 		if err == nil {
-			t.Fatal("expected DeleteUserMessages to fail under sustained adversarial contention (bounded CAS retries exhausted), got nil error -- false success must never be reported")
+			// Claimed success: must be truthful, not merely the absence of
+			// an error.
+			found, recipients, _, _, _ := readGroupIngestRow(t, senderUIN, clientID)
+			if !found {
+				t.Fatal("row missing after a claimed-successful wipe under contention")
+			}
+			for _, r := range recipients {
+				if r == uinA {
+					t.Fatalf("DeleteUserMessages reported success but uin %d is still present in recipient_uins %v -- success must never be reported while the wiped uin remains", uinA, recipients)
+				}
+			}
+			if got := countIngestErasureIndex(t, uinA); got != 0 {
+				t.Fatalf("DeleteUserMessages reported success but the erasure index for uin %d still has %d rows -- index must be removed once absence is confirmed", uinA, got)
+			}
+			var ttl int
+			iter := session.Query(`SELECT TTL(recipient_set_sanitized) FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
+			iter.Scan(&ttl)
+			if err := iter.Close(); err != nil {
+				t.Fatalf("read TTL: %v", err)
+			}
+			if ttl <= 0 || ttl > 3600 {
+				t.Fatalf("TTL(recipient_set_sanitized) after a claimed-successful wipe under contention = %d, want in (0, 3600] -- success must not extend or drop TTL", ttl)
+			}
+			return
 		}
+
+		// Claimed failure: must be the documented, retryable exhaustion
+		// error -- never a silent or ambiguous one -- and the erasure
+		// index must survive so a retried wipe job can find this row
+		// again. deleteIngestReceipts must NOT have deleted uinA's own
+		// erasure-index entry in this branch.
 		if !strings.Contains(err.Error(), "exhausted") || !strings.Contains(err.Error(), "CAS") {
 			t.Fatalf("error = %q, want it to explain bounded CAS-retry exhaustion so the wipe job can be identified and retried", err.Error())
 		}
-		// Because the call failed, deleteIngestReceipts must NOT have
-		// deleted uinA's own erasure-index entry -- the wipe job must be
-		// retried later, and it can only find this row again via the index.
 		if got := countIngestErasureIndex(t, uinA); got == 0 {
 			t.Fatal("erasure index for uin A was deleted despite the wipe step failing -- a retried wipe job would never find this row again")
 		}
@@ -743,10 +806,52 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 	// expiry configured at all, and a row already past its own expiry.
 	// ---------------------------------------------------------------------
 	t.Run("message_ingest: concurrent wipe of the last two recipients terminalizes the row", func(t *testing.T) {
+		// Sentinel values with no real user data: sentinelReceiverUIN is
+		// negative (every real uin from freshUINs is positive and >=
+		// 930001), and sentinelConversationID is an obviously-synthetic
+		// string. Seeded into every variant below and confirmed present
+		// BEFORE each wipe, so the post-wipe "cleared" assertions prove the
+		// terminal CAS statement actively clears these columns instead of
+		// trivially passing against a column that was already empty.
+		const (
+			sentinelReceiverUIN    = int64(-1)
+			sentinelConversationID = "sentinel:not-real-user-data"
+		)
+
 		t.Run("row has time remaining", func(t *testing.T) {
 			uinA, uinB, _, senderUIN := freshUINs()
 			clientID := "exhaustion-ingest-ttl"
-			expiresAt, _ := seedGroupIngestRow(t, senderUIN, []int64{uinA, uinB}, clientID, 3600)
+			groupID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			msgID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			createdAt := time.Now().UTC().Truncate(time.Millisecond)
+			expiresAt := createdAt.Add(3600 * time.Second)
+			envelope := []byte("time-remaining-exhaustion-envelope")
+			hash := sha256.Sum256(envelope)
+			if err := session.Query(`INSERT INTO message_ingest
+				(sender_uin, client_id, message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 3600`,
+				senderUIN, clientID, "group", sentinelReceiverUIN, sentinelConversationID, groupID, int64(1), []int64{uinA, uinB},
+				envelope, hash[:], msgID, createdAt, expiresAt, "stored", msgID, createdAt,
+			).WithContext(ctx).Exec(); err != nil {
+				t.Fatalf("seed message_ingest: %v", err)
+			}
+			for _, indexUIN := range []int64{uinA, uinB, senderUIN} {
+				if err := session.Query(`INSERT INTO message_ingest_erasure_index (uin, sender_uin, client_id) VALUES (?, ?, ?) USING TTL 3600`,
+					indexUIN, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
+					t.Fatalf("seed message_ingest_erasure_index (uin %d): %v", indexUIN, err)
+				}
+			}
+
+			preReceiverUIN, preConversationID, preEnvelope, preEnvelopeHash := readIngestTombstoneFields(t, senderUIN, clientID)
+			if preReceiverUIN != sentinelReceiverUIN || preConversationID != sentinelConversationID || len(preEnvelope) == 0 || len(preEnvelopeHash) == 0 {
+				t.Fatalf("pre-wipe sentinel check failed: receiver_uin=%d conversation_id=%q envelope=%q envelope_hash=%x -- seeding did not persist the expected sentinels, post-wipe checks would be meaningless", preReceiverUIN, preConversationID, preEnvelope, preEnvelopeHash)
+			}
 
 			wipe := func(uin int64) func() error {
 				return func() error { return msgStore.DeleteUserMessages(ctx, uin) }
@@ -773,18 +878,18 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 			if !gotExpiresAt.Equal(expiresAt) {
 				t.Fatalf("expires_at = %v, want unchanged original %v -- a retry must never extend TTL", gotExpiresAt, expiresAt)
 			}
-			receiverUIN, conversationID, envelope, envelopeHash := readIngestTombstoneFields(t, senderUIN, clientID)
+			receiverUIN, conversationID, gotEnvelope, gotEnvelopeHash := readIngestTombstoneFields(t, senderUIN, clientID)
 			if receiverUIN != 0 {
-				t.Fatalf("receiver_uin = %d, want cleared", receiverUIN)
+				t.Fatalf("receiver_uin = %d, want actively cleared from sentinel %d", receiverUIN, sentinelReceiverUIN)
 			}
 			if conversationID != "" {
-				t.Fatalf("conversation_id = %q, want cleared", conversationID)
+				t.Fatalf("conversation_id = %q, want actively cleared from sentinel %q", conversationID, sentinelConversationID)
 			}
-			if len(envelope) != 0 {
-				t.Fatalf("envelope = %q, want cleared -- ciphertext must not survive terminalization", envelope)
+			if len(gotEnvelope) != 0 {
+				t.Fatalf("envelope = %q, want cleared -- ciphertext must not survive terminalization", gotEnvelope)
 			}
-			if len(envelopeHash) != 0 {
-				t.Fatalf("envelope_hash = %x, want cleared", envelopeHash)
+			if len(gotEnvelopeHash) != 0 {
+				t.Fatalf("envelope_hash = %x, want cleared", gotEnvelopeHash)
 			}
 			if got := countIngestErasureIndex(t, uinA); got != 0 {
 				t.Fatalf("message_ingest_erasure_index for wiped uin A still has %d rows", got)
@@ -846,9 +951,9 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 			// nullable TIMESTAMP
 			// (deploy/init/migrations/012_durable_message_ingest.cql).
 			if err := session.Query(`INSERT INTO message_ingest
-				(sender_uin, client_id, message_kind, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, state, owner_token, lease_until)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				senderUIN, clientID, "group", groupID, int64(1), []int64{uinA, uinB},
+				(sender_uin, client_id, message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, state, owner_token, lease_until)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				senderUIN, clientID, "group", sentinelReceiverUIN, sentinelConversationID, groupID, int64(1), []int64{uinA, uinB},
 				envelope, hash[:], msgID, createdAt, "stored", msgID, createdAt,
 			).WithContext(ctx).Exec(); err != nil {
 				t.Fatalf("seed no-TTL message_ingest: %v", err)
@@ -858,6 +963,11 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 					indexUIN, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
 					t.Fatalf("seed message_ingest_erasure_index (uin %d): %v", indexUIN, err)
 				}
+			}
+
+			preReceiverUIN, preConversationID, preEnvelope, preEnvelopeHash := readIngestTombstoneFields(t, senderUIN, clientID)
+			if preReceiverUIN != sentinelReceiverUIN || preConversationID != sentinelConversationID || len(preEnvelope) == 0 || len(preEnvelopeHash) == 0 {
+				t.Fatalf("pre-wipe sentinel check failed: receiver_uin=%d conversation_id=%q envelope=%q envelope_hash=%x -- seeding did not persist the expected sentinels, post-wipe checks would be meaningless", preReceiverUIN, preConversationID, preEnvelope, preEnvelopeHash)
 			}
 
 			wipe := func(uin int64) func() error {
@@ -881,7 +991,7 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 			}
 			gotReceiverUIN, gotConversationID, gotEnvelope, gotEnvelopeHash := readIngestTombstoneFields(t, senderUIN, clientID)
 			if gotReceiverUIN != 0 || gotConversationID != "" || len(gotEnvelope) != 0 || len(gotEnvelopeHash) != 0 {
-				t.Fatalf("no-expiry row tombstone fields not cleared: receiver_uin=%d conversation_id=%q envelope=%q envelope_hash=%x", gotReceiverUIN, gotConversationID, gotEnvelope, gotEnvelopeHash)
+				t.Fatalf("no-expiry row tombstone fields not actively cleared from their sentinels: receiver_uin=%d conversation_id=%q envelope=%q envelope_hash=%x", gotReceiverUIN, gotConversationID, gotEnvelope, gotEnvelopeHash)
 			}
 
 			// The write must have used the plain (non-"USING TTL") CAS
@@ -937,9 +1047,9 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 			envelope := []byte("expired-exhaustion-envelope")
 			hash := sha256.Sum256(envelope)
 			if err := session.Query(`INSERT INTO message_ingest
-				(sender_uin, client_id, message_kind, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 3600`,
-				senderUIN, clientID, "group", groupID, int64(1), []int64{uinA, uinB},
+				(sender_uin, client_id, message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 3600`,
+				senderUIN, clientID, "group", sentinelReceiverUIN, sentinelConversationID, groupID, int64(1), []int64{uinA, uinB},
 				envelope, hash[:], msgID, createdAt, staleExpiresAt, "stored", msgID, createdAt,
 			).WithContext(ctx).Exec(); err != nil {
 				t.Fatalf("seed stale message_ingest: %v", err)
@@ -949,6 +1059,11 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 					indexUIN, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
 					t.Fatalf("seed message_ingest_erasure_index (uin %d): %v", indexUIN, err)
 				}
+			}
+
+			preReceiverUIN, preConversationID, preEnvelope, preEnvelopeHash := readIngestTombstoneFields(t, senderUIN, clientID)
+			if preReceiverUIN != sentinelReceiverUIN || preConversationID != sentinelConversationID || len(preEnvelope) == 0 || len(preEnvelopeHash) == 0 {
+				t.Fatalf("pre-wipe sentinel check failed: receiver_uin=%d conversation_id=%q envelope=%q envelope_hash=%x -- seeding did not persist the expected sentinels, post-wipe checks would be meaningless", preReceiverUIN, preConversationID, preEnvelope, preEnvelopeHash)
 			}
 
 			wipe := func(uin int64) func() error {
@@ -961,7 +1076,8 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 			}
 
 			// Left exactly as seeded: skip, don't mutate. Both wiped uins
-			// are still allowed to be present here -- the row is about to
+			// and the sentinel receiver_uin/conversation_id/ciphertext are
+			// still allowed to be present here -- the row is about to
 			// vanish via its own already-past expiry, so mutating it (and
 			// risking a fresh/permanent TTL landing on it) is unnecessary
 			// and risky. This must never reach the exhaustion/terminalize
@@ -981,6 +1097,10 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 			}
 			if !gotExpiresAt.Equal(staleExpiresAt) {
 				t.Fatalf("expires_at = %v, want unchanged stale value %v", gotExpiresAt, staleExpiresAt)
+			}
+			postReceiverUIN, postConversationID, postEnvelope, postEnvelopeHash := readIngestTombstoneFields(t, senderUIN, clientID)
+			if postReceiverUIN != sentinelReceiverUIN || postConversationID != sentinelConversationID || string(postEnvelope) != string(envelope) || string(postEnvelopeHash) != string(hash[:]) {
+				t.Fatalf("already-expired row was mutated: receiver_uin=%d conversation_id=%q envelope=%q envelope_hash=%x, want the original sentinels/ciphertext untouched", postReceiverUIN, postConversationID, postEnvelope, postEnvelopeHash)
 			}
 
 			// A retried wipe on the same still-expired row is equally safe.

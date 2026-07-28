@@ -176,20 +176,49 @@ func (s *ScyllaMessageStore) deleteIngestReceipts(ctx context.Context, uin int64
 	return nil
 }
 
+// boundedCASRetry runs attempt up to maxAttempts times, stopping as soon as
+// attempt reports applied=true or returns a non-nil error. ctx is checked
+// for cancellation before every attempt, including the first -- a
+// cancelled context is reported without ever calling attempt. Exhausting
+// maxAttempts without attempt ever reporting applied=true returns
+// exhaustedErr(maxAttempts) instead of silently giving up, so a caller can
+// tell "safe to treat as done" apart from "must be retried later." The
+// exhaustion/cancellation errors are returned unwrapped so each call site
+// can attach its own context-specific message, matching what
+// sanitizeIngestReceipt did inline before this was extracted.
+func boundedCASRetry(ctx context.Context, maxAttempts int, exhaustedErr func(attempts int) error, attempt func(ctx context.Context) (applied bool, err error)) error {
+	for i := 0; ; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if i >= maxAttempts {
+			return exhaustedErr(maxAttempts)
+		}
+		applied, err := attempt(ctx)
+		if err != nil {
+			return err
+		}
+		if applied {
+			return nil
+		}
+	}
+}
+
 // sanitizeIngestReceipt applies role-aware cleanup to a single message_ingest
 // row for a wiped uin. Safe to call more than once for the same row (repeated
 // wipe-worker retries, or two different recipients of the same group message
 // wiped in separate operations): every branch either no-ops on a row that's
 // already gone, already terminal, or no longer references the uin.
 //
-// The group branch is a bounded read-compute-CAS retry loop, not a single
-// read-modify-write: two wipe workers processing different recipients of the
-// SAME group row can run concurrently (see wipejob.go's FOR UPDATE SKIP
-// LOCKED), and a plain "UPDATE ... IF EXISTS" only guards row existence, not
-// the recipient_uins value each worker read. Without the CAS condition, the
-// second writer's UPDATE can silently overwrite the first's removal with a
-// stale list, resurrecting an already-wiped recipient with no future retry
-// to catch it -- see sanitizeGroupIngestRecipients.
+// The group branch is a bounded read-compute-CAS retry loop (boundedCASRetry),
+// not a single read-modify-write: two wipe workers processing different
+// recipients of the SAME group row can run concurrently (see wipejob.go's
+// FOR UPDATE SKIP LOCKED), and a plain "UPDATE ... IF EXISTS" only guards
+// row existence, not the recipient_uins value each worker read. Without the
+// CAS condition, the second writer's UPDATE can silently overwrite the
+// first's removal with a stale list, resurrecting an already-wiped
+// recipient with no future retry to catch it -- see
+// sanitizeGroupIngestRecipients.
 func (s *ScyllaMessageStore) sanitizeIngestReceipt(ctx context.Context, senderUIN int64, clientID string, wipedUIN int64) error {
 	if senderUIN == wipedUIN {
 		if err := s.session.Query(`DELETE FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
@@ -198,14 +227,9 @@ func (s *ScyllaMessageStore) sanitizeIngestReceipt(ctx context.Context, senderUI
 		return nil
 	}
 
-	for attempt := 0; ; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("sanitize ingest receipt: %w", err)
-		}
-		if attempt >= maxRecipientSanitizeCASAttempts {
-			return fmt.Errorf("sanitize ingest receipt: exhausted %d CAS attempts under contention for sender_uin=%d client_id=%s -- caller must retry this wipe job later", maxRecipientSanitizeCASAttempts, senderUIN, clientID)
-		}
-
+	err := boundedCASRetry(ctx, maxRecipientSanitizeCASAttempts, func(attempts int) error {
+		return fmt.Errorf("sanitize ingest receipt: exhausted %d CAS attempts under contention for sender_uin=%d client_id=%s -- caller must retry this wipe job later", attempts, senderUIN, clientID)
+	}, func(ctx context.Context) (bool, error) {
 		var kind, state string
 		var receiverUIN int64
 		var recipientUINs []int64
@@ -213,16 +237,16 @@ func (s *ScyllaMessageStore) sanitizeIngestReceipt(ctx context.Context, senderUI
 		readIter := s.session.Query(`SELECT message_kind, receiver_uin, recipient_uins, state, expires_at FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
 		found := readIter.Scan(&kind, &receiverUIN, &recipientUINs, &state, &expiresAt)
 		if err := readIter.Close(); err != nil {
-			return fmt.Errorf("read ingest receipt: %w", err)
+			return false, fmt.Errorf("read ingest receipt: %w", err)
 		}
 		if !found {
 			// Already gone -- delivered and cleaned up, or a previous wipe pass
 			// already handled it. Safe to repeat.
-			return nil
+			return true, nil
 		}
 		if state == ingestRecipientErasedState {
 			// Already terminalized by an earlier wipe pass. Idempotent no-op.
-			return nil
+			return true, nil
 		}
 
 		now := time.Now().UTC()
@@ -230,7 +254,7 @@ func (s *ScyllaMessageStore) sanitizeIngestReceipt(ctx context.Context, senderUI
 		if !expiresAt.IsZero() && remaining <= 0 {
 			// Already past its own expiry -- let it expire naturally rather
 			// than writing a fresh TTL that would resurrect it.
-			return nil
+			return true, nil
 		}
 
 		switch kind {
@@ -238,26 +262,25 @@ func (s *ScyllaMessageStore) sanitizeIngestReceipt(ctx context.Context, senderUI
 			if receiverUIN != wipedUIN {
 				// This uin isn't referenced by this receipt in a role we
 				// recognize; leave it untouched.
-				return nil
+				return true, nil
 			}
 			// A direct receipt has exactly one receiver_uin, so no two
 			// concurrent wipes can ever target the same row here -- a plain
 			// IF EXISTS is sufficient, no CAS/retry needed.
-			return s.terminalizeIngestReceipt(ctx, senderUIN, clientID, remaining)
+			return true, s.terminalizeIngestReceipt(ctx, senderUIN, clientID, remaining)
 		case "group":
-			applied, err := s.sanitizeGroupIngestRecipients(ctx, senderUIN, clientID, wipedUIN, recipientUINs, remaining)
-			if err != nil {
-				return err
-			}
-			if applied {
-				return nil
-			}
-			// Lost the race to a concurrent wipe of a different recipient on
-			// this same row. Re-read the current state and retry.
+			// Lost the race to a concurrent wipe of a different recipient
+			// on this same row when applied=false: boundedCASRetry re-reads
+			// the current state (this closure runs again) and retries.
+			return s.sanitizeGroupIngestRecipients(ctx, senderUIN, clientID, wipedUIN, recipientUINs, remaining)
 		default:
-			return fmt.Errorf("sanitize ingest receipt: unrecognized message_kind %q for sender_uin=%d client_id=%s", kind, senderUIN, clientID)
+			return false, fmt.Errorf("sanitize ingest receipt: unrecognized message_kind %q for sender_uin=%d client_id=%s", kind, senderUIN, clientID)
 		}
+	})
+	if err != nil && err == ctx.Err() {
+		return fmt.Errorf("sanitize ingest receipt: %w", err)
 	}
+	return err
 }
 
 // sanitizeGroupIngestRecipients performs ONE compare-and-set attempt that
