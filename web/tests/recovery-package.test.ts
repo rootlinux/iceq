@@ -4,6 +4,14 @@ import "fake-indexeddb/auto";
 import { generateRecoveryKey, createRecoveryPackage, importRecoveryPackage, RECOVERY_KEY_BYTES } from "../src/lib/recoveryPackage";
 import { setActiveCryptoNamespace, getActiveCryptoNamespace, loadIdentity, saveIdentity, type CryptoNamespace } from "../src/lib/indexeddb";
 import { deriveIdentityPublicKey } from "../src/lib/signal";
+import { createSecurityPassphrase, lockSecurityVault } from "../src/lib/securityVault";
+import {
+  generateWipeKeyPair,
+  storeEncryptedWipePrivateKey,
+  loadAndDecryptWipePrivateKey,
+  importRecoveredWipeKey,
+  bytesToBase64std,
+} from "../src/lib/panicWipeKey";
 
 const NAMESPACE: CryptoNamespace = { uin: 3001, deviceId: "recovery_test_dev_0001" };
 
@@ -76,7 +84,7 @@ test("create and import recovery package round-trip with identity", async () => 
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return bytes;
   })();
-  assert.equal(combined[0], 3, "package version byte must be 3");
+  assert.equal(combined[0], 4, "package version byte must be 4");
 
   // Clear identity to simulate fresh namespace
   const ns2: CryptoNamespace = { uin: 3001, deviceId: "recovery_test_dev_0002" };
@@ -89,7 +97,7 @@ test("create and import recovery package round-trip with identity", async () => 
   // Import. This exercises AAD-authenticated decryption + identity verification.
   const payload = await importRecoveryPackage(pkg, 3001, serverId, key);
   assert.ok(payload, "import must return payload");
-  assert.equal(payload.v, 3, "v3 packages use AAD-authenticated headers");
+  assert.equal(payload.v, 4, "current packages are v4");
   assert.ok(payload.identity, "payload must contain identity");
   assert.equal(payload.identity.publicKey, identity.publicKey);
 
@@ -319,3 +327,163 @@ test("edited header identity is rejected before decryption", async () => {
     /server identity mismatch/,
   );
 });
+
+// --- Task #11: wipe key travels in the recovery package (v4) -----------
+
+test("recovery package omits wipeKey when the vault is locked at export time", async () => {
+  const ns: CryptoNamespace = { uin: 3002, deviceId: "recovery_test_dev_0010" };
+  setActiveCryptoNamespace(ns);
+  lockSecurityVault();
+  const identity = await realIdentity();
+  await saveIdentity(ns, identity);
+
+  const key = generateRecoveryKey();
+  const pkg = await createRecoveryPackage(3002, identity.publicKey, key);
+
+  setActiveCryptoNamespace({ uin: 3002, deviceId: "recovery_test_dev_0011" });
+  const payload = await importRecoveryPackage(pkg, 3002, identity.publicKey, key);
+  assert.equal(payload.wipeKey, undefined, "no wipe key existed at export time -- nothing to include");
+});
+
+test("recovery package carries the wipe key when one is enrolled, and it survives the round trip", async () => {
+  const ns: CryptoNamespace = { uin: 3003, deviceId: "recovery_test_dev_0012" };
+  setActiveCryptoNamespace(ns);
+  lockSecurityVault();
+  await createSecurityPassphrase("wipe key recovery test passphrase");
+
+  const identity = await realIdentity();
+  await saveIdentity(ns, identity);
+
+  const wipeKeyPair = await generateWipeKeyPair();
+  await storeEncryptedWipePrivateKey(wipeKeyPair.encryptedPrivateBlob, wipeKeyPair.publicKeyBytes);
+
+  const key = generateRecoveryKey();
+  const pkg = await createRecoveryPackage(3003, identity.publicKey, key);
+
+  const ns2: CryptoNamespace = { uin: 3003, deviceId: "recovery_test_dev_0013" };
+  setActiveCryptoNamespace(ns2);
+  const payload = await importRecoveryPackage(pkg, 3003, identity.publicKey, key);
+
+  assert.ok(payload.wipeKey, "wipe key must be present in the payload");
+  // payload.wipeKey.publicKey is base64url (recoveryPackage.ts's own
+  // encoding), not base64std -- compare raw bytes to sidestep the
+  // encoding difference entirely.
+  assert.deepEqual(base64urlToBytesLocal(payload.wipeKey!.publicKey), wipeKeyPair.publicKeyBytes);
+});
+
+test("importRecoveredWipeKey re-encrypts recovered material into a working signing key on the new device", async () => {
+  const sourceNs: CryptoNamespace = { uin: 3004, deviceId: "recovery_test_dev_0014" };
+  setActiveCryptoNamespace(sourceNs);
+  lockSecurityVault();
+  await createSecurityPassphrase("source device passphrase");
+
+  const identity = await realIdentity();
+  await saveIdentity(sourceNs, identity);
+
+  const wipeKeyPair = await generateWipeKeyPair();
+  await storeEncryptedWipePrivateKey(wipeKeyPair.encryptedPrivateBlob, wipeKeyPair.publicKeyBytes);
+
+  const key = generateRecoveryKey();
+  const pkg = await createRecoveryPackage(3004, identity.publicKey, key);
+
+  // New device: different namespace, no vault yet.
+  const targetNs: CryptoNamespace = { uin: 3004, deviceId: "recovery_test_dev_0015" };
+  setActiveCryptoNamespace(targetNs);
+  const payload = await importRecoveryPackage(pkg, 3004, identity.publicKey, key);
+  assert.ok(payload.wipeKey);
+
+  // The new device creates its OWN, independent vault -- a different
+  // passphrase than the source device used. This is the whole point:
+  // the recovered wipe key must not depend on reusing the old passphrase.
+  lockSecurityVault();
+  await createSecurityPassphrase("a completely different new-device passphrase");
+
+  const recoveredPublicKeyBytes = base64urlToBytesLocal(payload.wipeKey!.publicKey);
+  const recoveredPrivateKeyBytes = base64urlToBytesLocal(payload.wipeKey!.privateKeyPkcs8);
+  await importRecoveredWipeKey(recoveredPublicKeyBytes, recoveredPrivateKeyBytes);
+
+  // The public key is unchanged -- this is what makes the server's
+  // idempotent-resubmit path (WIPE_KEY_EXISTS, no rotation needed) apply.
+  assert.equal(bytesToBase64std(recoveredPublicKeyBytes), bytesToBase64std(wipeKeyPair.publicKeyBytes));
+
+  // The re-encrypted private key must actually work: sign something and
+  // verify it with the original public key.
+  const restoredPrivateKey = await loadAndDecryptWipePrivateKey();
+  assert.ok(restoredPrivateKey, "restored wipe private key must be loadable on the new device");
+
+  const message = new TextEncoder().encode("panic wipe challenge");
+  const signature = await globalThis.crypto.subtle.sign({ name: "Ed25519" }, restoredPrivateKey!, message);
+
+  const verifyKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    wipeKeyPair.publicKeyBytes.buffer as unknown as BufferSource,
+    { name: "Ed25519" },
+    false,
+    ["verify"],
+  );
+  const valid = await globalThis.crypto.subtle.verify({ name: "Ed25519" }, verifyKey, signature, message);
+  assert.equal(valid, true, "signature from the recovered key must verify against the original public key");
+});
+
+test("v3-shaped packages (no wipeKey field at all) still import successfully", async () => {
+  // Simulates a package created before Task #11 shipped, by constructing
+  // a genuine v3 package from scratch (not by mutating a v4 one -- the
+  // version byte is part of the AES-GCM AAD, so any post-hoc edit to it
+  // correctly invalidates the whole ciphertext; see the AAD-tamper tests
+  // above. A real v3 package never had that byte set to 4 in the first
+  // place, so its AAD is self-consistent.)
+  const identity = await realIdentity();
+  const key = generateRecoveryKey();
+  const uin = 3005;
+
+  const HEADER_AAD_SIZE_LOCAL = 1 + 8 + 32;
+  const HEADER_SIZE_LOCAL = HEADER_AAD_SIZE_LOCAL + 12;
+  const serverIdBytes = base64urlToBytesLocal(identity.publicKey);
+
+  const iv = new Uint8Array(12);
+  globalThis.crypto.getRandomValues(iv);
+  const header = new Uint8Array(HEADER_SIZE_LOCAL);
+  header[0] = 3; // v3: no wipeKey field, ever
+  new DataView(header.buffer).setBigUint64(1, BigInt(uin), false);
+  header.set(serverIdBytes, 9);
+  header.set(iv, 41);
+  const aad = header.subarray(0, HEADER_AAD_SIZE_LOCAL);
+
+  const v3Payload = { v: 3, identity, peerTrust: [] as unknown[] };
+  const payloadJson = new TextEncoder().encode(JSON.stringify(v3Payload));
+
+  const aesKey = await globalThis.crypto.subtle.importKey(
+    "raw", key.buffer as unknown as BufferSource, "AES-GCM", false, ["encrypt"],
+  );
+  const ciphertext = await globalThis.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: iv as unknown as BufferSource, additionalData: aad as unknown as BufferSource },
+    aesKey,
+    payloadJson as unknown as BufferSource,
+  );
+  const ct = new Uint8Array(ciphertext);
+  const combined = new Uint8Array(header.length + ct.length);
+  combined.set(header);
+  combined.set(ct, header.length);
+  const v3Package = base64urlFromBytesLocal(combined);
+
+  setActiveCryptoNamespace({ uin, deviceId: "recovery_test_dev_0017" });
+  const payload = await importRecoveryPackage(v3Package, uin, identity.publicKey, key);
+  assert.equal(payload.v, 3);
+  assert.equal(payload.wipeKey, undefined);
+  assert.equal(payload.identity.publicKey, identity.publicKey);
+});
+
+function base64urlToBytesLocal(s: string): Uint8Array {
+  let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4 !== 0) b64 += "=";
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function base64urlFromBytesLocal(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}

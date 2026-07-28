@@ -8,11 +8,16 @@ import {
   type StoredPeerTrust,
 } from "./indexeddb";
 import { deriveIdentityPublicKey } from "./signal";
+import { exportWipePrivateKeyRawForRecovery } from "./panicWipeKey";
 
-// PACKAGE_VERSION 3 authenticates the header (version, UIN, server identity)
-// as AES-GCM AAD so that tampering with any header byte causes decryption
-// failure. Version 2 did not authenticate the header and is rejected.
-const PACKAGE_VERSION = 3;
+// PACKAGE_VERSION 4 adds an optional wipe-key field (see RecoveryPayload)
+// so a recovered device can restore the SAME panic-wipe key pair the
+// server already has enrolled, instead of being stuck needing a rotation
+// signature from a key it never had. v3 packages (no wipe key field) and
+// v4 both authenticate the header as AES-GCM AAD and remain importable.
+// Version 2 did not authenticate the header and is rejected.
+const PACKAGE_VERSION = 4;
+const MIN_SUPPORTED_PACKAGE_VERSION = 3;
 const HEADER_AAD_SIZE = 1 + 8 + 32; // version + UIN + server identity (41 bytes)
 const HEADER_SIZE = HEADER_AAD_SIZE + 12; // + IV (12 bytes) = 53 bytes
 const MIN_RECOVERY_KEY_BYTES = 16;
@@ -23,6 +28,12 @@ interface RecoveryPayload {
   v: number;
   identity: StoredIdentity;
   peerTrust: Array<{ peerUin: number; record: StoredPeerTrust }>;
+  // Present only when the source device had already enrolled a panic-wipe
+  // key at export time (v4+) and the security vault was unlocked. Absent
+  // on v3 packages, and on v4 packages created before wipe-key setup --
+  // see RecoveryImportScreen.tsx, which treats a missing field as "fall
+  // back to generating a fresh wipe key" rather than an error.
+  wipeKey?: { publicKey: string; privateKeyPkcs8: string };
 }
 
 export interface RecoveryPackage {
@@ -94,10 +105,22 @@ async function gatherRecoveryPayload(ns: CryptoNamespace): Promise<RecoveryPaylo
 
   db.close();
 
+  // Best-effort: a wipe key may not exist yet (vault locked, or this
+  // device hasn't enabled panic wipe). Recovery packages degrade
+  // gracefully without one rather than failing to generate at all.
+  const wipeKeyMaterial = await exportWipePrivateKeyRawForRecovery();
+  const wipeKey = wipeKeyMaterial
+    ? {
+        publicKey: base64urlFromBytes(wipeKeyMaterial.publicKeyBytes),
+        privateKeyPkcs8: base64urlFromBytes(wipeKeyMaterial.privateKeyPkcs8),
+      }
+    : undefined;
+
   return {
     v: PACKAGE_VERSION,
     identity,
     peerTrust,
+    ...(wipeKey ? { wipeKey } : {}),
   };
 }
 
@@ -175,7 +198,12 @@ export async function importRecoveryPackage(
       "Please re-create your recovery package from the Security Setup screen on your original device."
     );
   }
-  if (version !== PACKAGE_VERSION) throw new Error(`unsupported recovery package version: ${version}`);
+  // v3 (no wipe-key field) and v4 (optional wipe-key field) are both
+  // importable -- both authenticate the header as AAD. A missing wipe
+  // key field is handled below by simply not restoring one.
+  if (version === undefined || version < MIN_SUPPORTED_PACKAGE_VERSION || version > PACKAGE_VERSION) {
+    throw new Error(`unsupported recovery package version: ${version}`);
+  }
 
   const view = new DataView(combined.buffer, combined.byteOffset, combined.byteLength);
   const pkgUin = Number(view.getBigUint64(1, false));
@@ -220,7 +248,7 @@ export async function importRecoveryPackage(
   } catch {
     throw new Error("recovery package contains corrupted payload");
   }
-  if (!payload || payload.v !== PACKAGE_VERSION || !payload.identity) throw new Error("invalid recovery payload");
+  if (!payload || payload.v !== version || !payload.identity) throw new Error("invalid recovery payload");
 
   // --- Cryptographic identity verification ---
   // Derive the public key from the imported private key and verify it matches

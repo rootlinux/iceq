@@ -6,22 +6,36 @@ import {
   loadIdentity,
   loadPendingRecoveryProvisioning,
   clearPendingRecoveryProvisioning,
+  setSecuritySetupCompleted,
   type CryptoNamespace,
 } from "../../lib/indexeddb";
+import { createSecurityPassphrase, hasSecurityPassphrase } from "../../lib/securityVault";
+import { importRecoveredWipeKey } from "../../lib/panicWipeKey";
 import { useI18n } from "../../i18n";
 import { useAuthStore } from "../../store/authStore";
 import { fetchBundle } from "../../api/keys";
 import { provisionRecoveryPrekeys, IdentityKeyMismatchError } from "../../lib/signalBootstrap";
 import { deriveIdentityPublicKey } from "../../lib/signal";
 
-type ImportState = "input" | "importing" | "provisioning" | "done" | "error";
+const MIN_PASSPHRASE_LENGTH = 12;
+
+// "passphrase" runs BEFORE "input"/"importing" so a security vault exists
+// on THIS device by the time a recovered wipe key (if the package has one
+// -- see recoveryPackage.ts's Task #11 wipeKey field) needs to be
+// re-encrypted and persisted. The recovered key is only ever held as raw
+// bytes in memory for the moment between decrypting the package and
+// wrapping it with this device's own vault key -- never written to
+// IndexedDB unencrypted.
+type ImportState = "passphrase" | "input" | "importing" | "provisioning" | "done" | "error";
 
 export function RecoveryImportScreen(): JSX.Element {
   const navigate = useNavigate();
   const i18n = useI18n();
   const selfUin = useAuthStore((s) => s.uin);
-  const [state, setState] = useState<ImportState>("input");
+  const [state, setState] = useState<ImportState>("passphrase");
   const [error, setError] = useState("");
+  const [passphrase, setPassphrase] = useState("");
+  const [passphraseConfirm, setPassphraseConfirm] = useState("");
   const [recoveryKeyB64, setRecoveryKeyB64] = useState("");
   const [packageContent, setPackageContent] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -35,9 +49,17 @@ export function RecoveryImportScreen(): JSX.Element {
   const provisioningNs = useRef<CryptoNamespace | null>(null);
   // Tracks whether the mount-time pending-record check has completed.
   const mountCheckDone = useRef(false);
+  // The recovered wipe key (if the package had one), held only long
+  // enough to re-encrypt it with this device's own vault key -- see
+  // restorePendingWipeKey. Cleared once restored so a retry never
+  // re-does it, and simply absent (not an error) if a page reload wiped
+  // in-memory state before restoration completed -- see the comment on
+  // handleRetryProvisioning.
+  const pendingWipeKey = useRef<{ publicKey: string; privateKeyPkcs8: string } | null>(null);
+  const wipeKeyRestored = useRef(false);
 
-  // On mount, check for a pending recovery provisioning record from a
-  // previous session that was interrupted (e.g. page reload). If one
+  // On mount: first check for a pending recovery provisioning record from
+  // a previous session that was interrupted (e.g. page reload). If one
   // exists with a matching identity fingerprint, restore the UI into
   // resumable provisioning state so the user can retry without
   // re-importing the recovery package.
@@ -45,12 +67,24 @@ export function RecoveryImportScreen(): JSX.Element {
   // Pending records are scoped by account/device namespace — a
   // mismatched authenticated account cannot observe or delete another
   // account's recoverable pending state.
+  //
+  // If there's no pending record, this is either a fresh visit or a
+  // retry from before a vault existed. Either way, skip straight past
+  // the passphrase step when a vault already exists (e.g. the user
+  // already completed it earlier in this same session) rather than
+  // asking them to set a new one and silently orphaning the first.
   useEffect(() => {
     if (mountCheckDone.current) return;
     mountCheckDone.current = true;
 
     void (async () => {
-      if (selfUin === null) return;
+      const restoredPending = await tryRestorePendingProvisioning();
+      if (restoredPending) return;
+      if (await hasSecurityPassphrase()) setState("input");
+    })();
+
+    async function tryRestorePendingProvisioning(): Promise<boolean> {
+      if (selfUin === null) return false;
 
       // Obtain the active crypto namespace. If no namespace is set,
       // there cannot be a pending record for this device — skip.
@@ -58,16 +92,16 @@ export function RecoveryImportScreen(): JSX.Element {
       try {
         ns = getActiveCryptoNamespace();
       } catch {
-        return;
+        return false;
       }
 
       // Validate UIN matches the authenticated session before reading.
       // The key includes UIN, so a mismatched account would already
       // get null — but we defensively verify here.
-      if (ns.uin !== selfUin) return;
+      if (ns.uin !== selfUin) return false;
 
       const pending = await loadPendingRecoveryProvisioning(ns);
-      if (!pending) return;
+      if (!pending) return false;
 
       // Validate that the recovered identity still exists in IndexedDB.
       const stored = await loadIdentity(pending.namespace);
@@ -75,7 +109,7 @@ export function RecoveryImportScreen(): JSX.Element {
         // Identity was deleted (e.g. IndexedDB cleared). Clear the
         // stale pending record — the caller must re-import.
         await clearPendingRecoveryProvisioning(ns);
-        return;
+        return false;
       }
 
       // Validate identity fingerprint matches the pending record.
@@ -84,13 +118,13 @@ export function RecoveryImportScreen(): JSX.Element {
         derivedPublic = await deriveIdentityPublicKey(stored.privateKey);
       } catch {
         await clearPendingRecoveryProvisioning(ns);
-        return;
+        return false;
       }
 
       if (derivedPublic !== pending.identityFingerprint) {
         // Identity changed — stale pending record for a different key.
         await clearPendingRecoveryProvisioning(ns);
-        return;
+        return false;
       }
 
       // All validations passed. Restore the UI into resumable
@@ -100,8 +134,50 @@ export function RecoveryImportScreen(): JSX.Element {
       identityImported.current = true;
       setState("error"); // Show the retry UI
       setError(i18n.t("recovery.provisioningPending"));
-    })();
+      return true;
+    }
   }, [selfUin, i18n]);
+
+  async function handleCreatePassphrase(): Promise<void> {
+    setError("");
+    if (passphrase.length < MIN_PASSPHRASE_LENGTH) { setError(i18n.t("setup.passphraseTooShort")); return; }
+    if (passphrase !== passphraseConfirm) { setError(i18n.t("setup.passphraseMismatch")); return; }
+    try {
+      await createSecurityPassphrase(passphrase);
+      setState("input");
+    } catch (e) {
+      setError((e as Error).message || i18n.t("setup.passphraseFailed"));
+    } finally {
+      setPassphrase("");
+      setPassphraseConfirm("");
+    }
+  }
+
+  // Re-encrypts the wipe key recovered from the package (if any) with
+  // this device's own vault key. No-ops if there's nothing pending
+  // (no wipe key in the package) or it was already restored (retry after
+  // a later step failed). See the pendingWipeKey/wipeKeyRestored comment
+  // above for what happens if a reload wipes this in-memory state before
+  // it runs -- graceful fallback, not a hard failure.
+  async function restorePendingWipeKey(): Promise<void> {
+    if (wipeKeyRestored.current || !pendingWipeKey.current) return;
+    const { publicKey, privateKeyPkcs8 } = pendingWipeKey.current;
+    await importRecoveredWipeKey(base64urlToBytes(publicKey), base64urlToBytes(privateKeyPkcs8));
+    wipeKeyRestored.current = true;
+  }
+
+  // Identity, peer trust, vault, and (if the package had one) the wipe
+  // key are all restored at this point. Only mark setup fully complete
+  // when the wipe key was ALSO restored -- otherwise this device still
+  // needs to go through SecuritySetupGate's "wipekey" step to enable
+  // panic wipe (it skips straight past "passphrase" since a vault
+  // already exists -- see SecuritySetupGate's mount check).
+  async function finishRecovery(ns: CryptoNamespace): Promise<void> {
+    if (wipeKeyRestored.current) {
+      await setSecuritySetupCompleted(ns);
+    }
+    setState("done");
+  }
 
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>): Promise<void> {
     const file = e.target.files?.[0];
@@ -156,7 +232,8 @@ export function RecoveryImportScreen(): JSX.Element {
       provisioningNs.current = ns;
 
       // Import the recovery package. This validates:
-      //   - v3 format with AAD-authenticated header
+      //   - v3 or v4 format with AAD-authenticated header (v4 adds an
+      //     optional wipe key -- see payload.wipeKey below)
       //   - UIN and server identity match (header AAD)
       //   - Decryption integrity
       //   - Derived public key matches payload identity AND server directory
@@ -164,8 +241,17 @@ export function RecoveryImportScreen(): JSX.Element {
       //   - Atomic IndexedDB write (all-or-nothing)
       //
       // Private identity material is NEVER uploaded to the server.
-      await importRecoveryPackage(packageContent, selfUin, bundle.identity_key, keyBytes);
+      const payload = await importRecoveryPackage(packageContent, selfUin, bundle.identity_key, keyBytes);
       identityImported.current = true;
+      pendingWipeKey.current = payload.wipeKey ?? null;
+
+      // If the package carried a wipe key (Task #11: the source device
+      // had one enrolled at export time), restore it now that the vault
+      // exists -- see restorePendingWipeKey. Absent for older v3
+      // packages or if the source device hadn't enabled panic wipe yet;
+      // either way this device falls back to enrolling a fresh one later
+      // via SecuritySetupGate, same as before this restoration existed.
+      await restorePendingWipeKey();
 
       // Identity is now restored in IndexedDB. The server still has the
       // OLD device's prekey bundle. We must explicitly provision fresh
@@ -190,7 +276,7 @@ export function RecoveryImportScreen(): JSX.Element {
         throw new Error(i18n.t("recovery.provisioningFailed"));
       }
 
-      setState("done");
+      await finishRecovery(ns);
     } catch (e) {
       setState("error");
       setError((e as Error).message || i18n.t("recovery.importFailed"));
@@ -211,8 +297,13 @@ export function RecoveryImportScreen(): JSX.Element {
     }
     setState("provisioning");
     try {
+      // Retry wipe-key restoration first, in case that's what failed
+      // last time (or a reload interrupted it before provisioning ever
+      // started) -- restorePendingWipeKey no-ops if it already succeeded
+      // or there was never a wipe key to restore.
+      await restorePendingWipeKey();
       await provisionRecoveryPrekeys(ns);
-      setState("done");
+      await finishRecovery(ns);
     } catch (provErr) {
       setState("error");
       if (provErr instanceof IdentityKeyMismatchError) {
@@ -242,14 +333,75 @@ export function RecoveryImportScreen(): JSX.Element {
             type="button"
             className="iceq-btn-primary mt-4 w-full"
             onClick={() => {
-              // Identity restored + fresh prekeys provisioned.
-              // Navigate to /app. If security setup hasn't been completed
-              // on this device, the App router will redirect to /setup.
+              // Identity, peer trust, vault, and fresh prekeys are
+              // restored. If the package also had a wipe key,
+              // finishRecovery already marked setup complete and /app
+              // will NOT redirect to /setup. Otherwise (older v3 package,
+              // or the source device hadn't enabled panic wipe), the App
+              // router redirects to /setup, which skips straight past the
+              // passphrase step (a vault already exists) to "wipekey".
               navigate("/app", { replace: true });
             }}
           >
             {i18n.t("recovery.continueToApp")}
           </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (state === "passphrase") {
+    return (
+      <div className="flex h-full items-center justify-center bg-bg p-4">
+        <div className="w-full max-w-md rounded-lg border border-border bg-surface-2 p-6 shadow-lg">
+          <h2 className="text-xl font-semibold text-text">{i18n.t("setup.createPassphraseTitle")}</h2>
+          <p className="mt-2 text-sm text-text-2">{i18n.t("setup.createPassphraseHelp")}</p>
+          <div className="mt-4 space-y-3">
+            <div>
+              <label htmlFor="recovery-passphrase" className="mb-1 block text-xs text-text-2">
+                {i18n.t("setup.passphraseInput")}
+              </label>
+              <input
+                id="recovery-passphrase"
+                type="password"
+                autoComplete="new-password"
+                className="iceq-input w-full"
+                value={passphrase}
+                onChange={(e) => setPassphrase(e.target.value)}
+              />
+            </div>
+            <div>
+              <label htmlFor="recovery-passphrase-confirm" className="mb-1 block text-xs text-text-2">
+                {i18n.t("setup.passphraseConfirm")}
+              </label>
+              <input
+                id="recovery-passphrase-confirm"
+                type="password"
+                autoComplete="new-password"
+                className="iceq-input w-full"
+                value={passphraseConfirm}
+                onChange={(e) => setPassphraseConfirm(e.target.value)}
+              />
+            </div>
+          </div>
+          {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
+          <div className="mt-5 flex gap-2">
+            <button
+              type="button"
+              className="iceq-btn-secondary flex-1"
+              onClick={() => navigate("/app", { replace: true })}
+            >
+              {i18n.t("common.cancel")}
+            </button>
+            <button
+              type="button"
+              className="iceq-btn-primary flex-1"
+              disabled={!passphrase}
+              onClick={() => void handleCreatePassphrase()}
+            >
+              {i18n.t("setup.continue")}
+            </button>
+          </div>
         </div>
       </div>
     );

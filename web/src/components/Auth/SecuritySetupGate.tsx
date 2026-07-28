@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "../../store/authStore";
 import { getActiveCryptoNamespace, hasSecuritySetupCompleted, setSecuritySetupCompleted } from "../../lib/indexeddb";
-import { createSecurityPassphrase } from "../../lib/securityVault";
+import { createSecurityPassphrase, hasSecurityPassphrase } from "../../lib/securityVault";
 import { generateRecoveryKey, createRecoveryPackage } from "../../lib/recoveryPackage";
 import {
   loadOrCreateWipeKeyPair,
@@ -17,7 +17,13 @@ import QRCode from "qrcode";
 
 const MIN_PASSPHRASE_LENGTH = 12;
 
-type SetupStep = "intro" | "passphrase" | "recovery" | "confirm";
+// Step order matters: "wipekey" runs BEFORE "recovery" so the wipe key
+// already exists in IndexedDB by the time createRecoveryPackage() gathers
+// the payload -- see recoveryPackage.ts's gatherRecoveryPayload, which
+// embeds whatever wipe key it finds. Generating the recovery package
+// before the wipe key existed (the original order) meant a recovered
+// device could never restore it.
+type SetupStep = "intro" | "passphrase" | "wipekey" | "recovery" | "confirm";
 
 interface SecuritySetupGateProps {
   onSetupComplete?: () => void;
@@ -49,8 +55,15 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
 
   useEffect(() => {
     const ns = getActiveCryptoNamespace();
-    void hasSecuritySetupCompleted(ns).then((done) => {
-      if (done) navigate("/app", { replace: true });
+    void hasSecuritySetupCompleted(ns).then(async (done) => {
+      if (done) { navigate("/app", { replace: true }); return; }
+      // A vault can already exist without setup being marked complete:
+      // RecoveryImportScreen creates one so a recovered wipe key (if the
+      // package had one) can be re-encrypted immediately. If the package
+      // had no wipe key, this device still needs to enable one -- but
+      // asking for a SECOND, different passphrase here would orphan the
+      // one just created. Skip straight to "wipekey".
+      if (await hasSecurityPassphrase()) setStep("wipekey");
     });
   }, [navigate]);
 
@@ -73,7 +86,7 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
     setBusy(true);
     try {
       await createSecurityPassphrase(passphrase);
-      setStep("recovery");
+      setStep("wipekey");
     } catch (e) {
       setError((e as Error).message || i18n.t("setup.passphraseFailed"));
     } finally {
@@ -106,11 +119,15 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
     }
   }
 
-  async function handleComplete(): Promise<void> {
+  // Enables Panic Wipe: generates (or reuses, if a prior attempt's
+  // response was lost -- see loadOrCreateWipeKeyPair) an Ed25519 wipe key
+  // and enrolls its public half server-side. Runs BEFORE the recovery
+  // step so that when handleGenerateRecovery builds the recovery package,
+  // the wipe key already exists to embed -- see the SetupStep comment.
+  async function handleEnableWipeKey(): Promise<void> {
     setError("");
     setBusy(true);
     try {
-      const ns = getActiveCryptoNamespace();
       // Load-or-create implements the retry-safe enrollment pattern:
       // if a prior attempt generated a key but the server response was lost,
       // we reuse the same key instead of generating a new one.
@@ -151,6 +168,23 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
           throw uploadErr;
         }
       }
+      setStep("recovery");
+    } catch (e) {
+      setError((e as Error).message || i18n.t("setup.completeFailed"));
+    } finally {
+      // Always clear sensitive material from component memory, even on failure.
+      setAccountPassword("");
+      setBusy(false);
+    }
+  }
+
+  // Final step: the wipe key and recovery package already exist. Just
+  // mark setup complete and route into the app.
+  async function handleComplete(): Promise<void> {
+    setError("");
+    setBusy(true);
+    try {
+      const ns = getActiveCryptoNamespace();
       await setSecuritySetupCompleted(ns);
       // Signal App that setup is complete so it can update routing state
       // without waiting for the next IndexedDB poll.
@@ -159,8 +193,6 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
     } catch (e) {
       setError((e as Error).message || i18n.t("setup.completeFailed"));
     } finally {
-      // Always clear sensitive material from component memory, even on failure.
-      setAccountPassword("");
       setPassphrase("");
       setPassphraseConfirm("");
       setBusy(false);
@@ -231,6 +263,38 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
           </>
         )}
 
+        {step === "wipekey" && (
+          <>
+            <h2 className="text-xl font-semibold text-text">{i18n.t("setup.wipeKeyTitle")}</h2>
+            <p className="mt-2 text-sm text-text-2">{i18n.t("setup.wipeKeyHelp")}</p>
+            <div className="mt-4 space-y-3">
+              <div>
+                <label htmlFor="setup-account-password" className="mb-1 block text-xs font-semibold text-text">
+                  {i18n.t("setup.accountPasswordLabel")}
+                </label>
+                <p className="mb-1 text-xs text-text-2">{i18n.t("setup.accountPasswordHelp")}</p>
+                <input
+                  id="setup-account-password"
+                  type="password"
+                  autoComplete="current-password"
+                  className="iceq-input w-full"
+                  value={accountPassword}
+                  onChange={(e) => setAccountPassword(e.target.value)}
+                  disabled={busy}
+                  placeholder={i18n.t("setup.accountPasswordPlaceholder")}
+                />
+              </div>
+            </div>
+            {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
+            <div className="mt-5 flex gap-2">
+              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep("passphrase")}>{i18n.t("setup.back")}</button>
+              <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !accountPassword} onClick={handleEnableWipeKey}>
+                {busy ? i18n.t("setup.wipeKeyEnabling") : i18n.t("setup.wipeKeyEnable")}
+              </button>
+            </div>
+          </>
+        )}
+
         {step === "recovery" && (
           <>
             <h2 className="text-xl font-semibold text-text">{i18n.t("setup.recoveryTitle")}</h2>
@@ -257,7 +321,7 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
                     const blob = new Blob([recoveryPackage], { type: "application/octet-stream" });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement("a");
-                    a.href = url; a.download = "iceq-recovery-v3.iceq"; a.click();
+                    a.href = url; a.download = "iceq-recovery-v4.iceq"; a.click();
                     URL.revokeObjectURL(url);
                   }}>
                     {i18n.t("setup.downloadPackage")}
@@ -267,7 +331,7 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
             )}
             {recoveryGenerated && (
               <div className="mt-5 flex gap-2">
-                <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep("passphrase")}>{i18n.t("setup.back")}</button>
+                <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep("wipekey")}>{i18n.t("setup.back")}</button>
                 <button type="button" className="iceq-btn-primary flex-1" onClick={() => setStep("confirm")}>{i18n.t("setup.iHaveSaved")}</button>
               </div>
             )}
@@ -279,22 +343,6 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
             <h2 className="text-xl font-semibold text-text">{i18n.t("setup.confirmTitle")}</h2>
             <p className="mt-2 text-sm text-text-2">{i18n.t("setup.confirmHelp")}</p>
             <div className="mt-4 space-y-3">
-              <div>
-                <label htmlFor="setup-account-password" className="mb-1 block text-xs font-semibold text-text">
-                  {i18n.t("setup.accountPasswordLabel")}
-                </label>
-                <p className="mb-1 text-xs text-text-2">{i18n.t("setup.accountPasswordHelp")}</p>
-                <input
-                  id="setup-account-password"
-                  type="password"
-                  autoComplete="current-password"
-                  className="iceq-input w-full"
-                  value={accountPassword}
-                  onChange={(e) => setAccountPassword(e.target.value)}
-                  disabled={busy}
-                  placeholder={i18n.t("setup.accountPasswordPlaceholder")}
-                />
-              </div>
               <div className="space-y-2 text-sm text-text-2">
                 <label className="flex items-start gap-2">
                   <input type="checkbox" checked={savedConfirm} onChange={(e) => setSavedConfirm(e.target.checked)} className="mt-0.5" />
@@ -305,7 +353,7 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
             {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
             <div className="mt-5 flex gap-2">
               <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep("recovery")}>{i18n.t("setup.back")}</button>
-              <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !savedConfirm || !accountPassword} onClick={handleComplete}>
+              <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !savedConfirm} onClick={handleComplete}>
                 {busy ? i18n.t("setup.completing") : i18n.t("setup.completeSetup")}
               </button>
             </div>

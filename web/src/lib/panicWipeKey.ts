@@ -204,6 +204,73 @@ export async function clearLocalWipeKey(): Promise<void> {
   });
 }
 
+/**
+ * exportWipePrivateKeyRawForRecovery -- decrypts the locally-stored wipe
+ * private key and returns its RAW PKCS8 bytes (not a CryptoKey), for
+ * embedding into a recovery package. Unlike loadAndDecryptWipePrivateKey,
+ * which imports the key as non-extractable (["sign"] only, extractable:
+ * false, so it can never leave this function as raw bytes again), this
+ * intentionally stops one step earlier -- recovery is the one legitimate
+ * reason this codebase ever needs the raw bytes.
+ *
+ * Returns null (never throws for these) when there's nothing to export:
+ * no wipe key generated yet, or the vault is locked. Recovery package
+ * generation degrades gracefully without a wipe key rather than failing
+ * outright -- see recoveryPackage.ts's gatherRecoveryPayload.
+ */
+export async function exportWipePrivateKeyRawForRecovery(): Promise<{
+  publicKeyBytes: Uint8Array;
+  privateKeyPkcs8: Uint8Array;
+} | null> {
+  const vaultKey = getVaultKey();
+  if (!vaultKey) return null;
+
+  const ns = getActiveCryptoNamespace();
+  const record = await new Promise<{ v: number; blob: string; publicKey?: string } | undefined>((resolve, reject) => {
+    const openReq = indexedDB.open("iceq", 6);
+    openReq.onsuccess = () => {
+      const db = openReq.result;
+      try {
+        const txn = db.transaction(WIPE_KEY_STORE, "readonly");
+        const store = txn.objectStore(WIPE_KEY_STORE);
+        const getReq = store.get(cryptoRecordKey(ns, "metadata", WIPE_KEY_RECORD_SUFFIX));
+        getReq.onsuccess = () => resolve(getReq.result as { v: number; blob: string; publicKey?: string } | undefined);
+        getReq.onerror = () => reject(getReq.error);
+        txn.oncomplete = () => db.close();
+        txn.onerror = () => { db.close(); reject(txn.error); };
+      } catch (e) { db.close(); reject(e); }
+    };
+    openReq.onerror = () => reject(openReq.error);
+  });
+
+  if (!record || !record.blob || !record.publicKey) return null;
+
+  let privateKeyPkcs8: Uint8Array;
+  try {
+    privateKeyPkcs8 = await decryptPrivateKeyRawBytes(record.blob, vaultKey);
+  } catch {
+    return null;
+  }
+  return { publicKeyBytes: base64urlToBytes(record.publicKey), privateKeyPkcs8 };
+}
+
+/**
+ * importRecoveredWipeKey -- takes wipe key material already decrypted out
+ * of a recovery package (see recoveryPackage.ts's importRecoveryPackage)
+ * and re-encrypts it with THIS device's own, freshly-created vault key
+ * before persisting. The recovered key becomes indistinguishable from one
+ * generated locally: same storage shape, same public key the server
+ * already has enrolled -- so no rotation/signature is ever needed, only
+ * the idempotent-resubmit path already handled by SecuritySetupKey
+ * enrollment (see panicwipe_challenge.go's compare-before-rotate check).
+ */
+export async function importRecoveredWipeKey(publicKeyBytes: Uint8Array, privateKeyPkcs8: Uint8Array): Promise<void> {
+  const vaultKey = getVaultKey();
+  if (!vaultKey) throw new Error("security vault is locked");
+  const encryptedPrivateBlob = await encryptPrivateKey(privateKeyPkcs8, vaultKey);
+  await storeEncryptedWipePrivateKey(encryptedPrivateBlob, publicKeyBytes);
+}
+
 export async function signWipeChallenge(challenge: Uint8Array, privateKey: CryptoKey): Promise<Uint8Array> {
   const sig = await globalThis.crypto.subtle.sign(
     { name: "Ed25519" },
@@ -231,6 +298,23 @@ async function encryptPrivateKey(pkcs8Bytes: Uint8Array, vaultKey: CryptoKey): P
 }
 
 async function decryptPrivateKey(blob: string, vaultKey: CryptoKey): Promise<CryptoKey> {
+  const plaintext = await decryptPrivateKeyRawBytes(blob, vaultKey);
+  return globalThis.crypto.subtle.importKey(
+    "pkcs8",
+    plaintext as unknown as BufferSource,
+    { name: "Ed25519" },
+    false,
+    ["sign"],
+  );
+}
+
+// decryptPrivateKeyRawBytes -- the shared AES-GCM unwrap step, stopping at
+// raw PKCS8 bytes. decryptPrivateKey (above) imports those bytes into a
+// non-extractable CryptoKey for normal signing use;
+// exportWipePrivateKeyRawForRecovery (below) needs the raw bytes
+// themselves, which is why this is split out rather than inlined into
+// decryptPrivateKey.
+async function decryptPrivateKeyRawBytes(blob: string, vaultKey: CryptoKey): Promise<Uint8Array> {
   const combined = base64urlToBytes(blob);
   if (combined.length < 2) throw new Error("truncated wipe key blob");
   const ivLen = combined[0]!;
@@ -244,13 +328,7 @@ async function decryptPrivateKey(blob: string, vaultKey: CryptoKey): Promise<Cry
     ciphertext.buffer as unknown as BufferSource,
   );
 
-  return globalThis.crypto.subtle.importKey(
-    "pkcs8",
-    plaintext,
-    { name: "Ed25519" },
-    false,
-    ["sign"],
-  );
+  return new Uint8Array(plaintext);
 }
 
 function bytesToBase64url(bytes: Uint8Array): string {
