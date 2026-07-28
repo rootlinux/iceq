@@ -40,13 +40,20 @@ func (b *ScyllaIngestBackend) Claim(ctx context.Context, proposed IngestRecord, 
 	}
 	if applied {
 		// Write the erasure index so panic-wipe can find this ingest row
-		// without ALLOW FILTERING. The erasure index is idempotent (same
-		// PK, same values — Scylla INSERT is an upsert).
-		if err := b.session.Query(
-			`INSERT INTO iceq.message_ingest_erasure_index (uin, sender_uin, client_id) VALUES (?, ?, ?)`,
-			proposed.Key.SenderUIN, proposed.Key.SenderUIN, proposed.Key.ClientID,
-		).WithContext(ctx).Consistency(gocql.Quorum).Exec(); err != nil {
-			return IngestRecord{}, 0, fmt.Errorf("store: write ingest erasure index: %w", err)
+		// without ALLOW FILTERING -- for EVERY uin that appears in it: the
+		// sender, plus the receiver (direct) or every recipient (group),
+		// not just the sender. Without this, a wiped receiver/recipient's
+		// UIN would never surface in a wipe scan and this row would persist
+		// referencing them until its own TTL (see erasureIndexUINs). The
+		// erasure index is idempotent (same PK, same values — Scylla
+		// INSERT is an upsert).
+		for _, uin := range erasureIndexUINs(proposed) {
+			if err := b.session.Query(
+				`INSERT INTO iceq.message_ingest_erasure_index (uin, sender_uin, client_id) VALUES (?, ?, ?)`,
+				uin, proposed.Key.SenderUIN, proposed.Key.ClientID,
+			).WithContext(ctx).Consistency(gocql.Quorum).Exec(); err != nil {
+				return IngestRecord{}, 0, fmt.Errorf("store: write ingest erasure index: %w", err)
+			}
 		}
 		return proposed, ClaimAcquired, nil
 	}
@@ -54,7 +61,30 @@ func (b *ScyllaIngestBackend) Claim(ctx context.Context, proposed IngestRecord, 
 	if err != nil {
 		return IngestRecord{}, 0, err
 	}
-	if current.EnvelopeHash != proposed.EnvelopeHash || current.Kind != proposed.Kind || current.ReceiverUIN != proposed.ReceiverUIN || current.ConversationID != proposed.ConversationID || current.GroupID != proposed.GroupID || current.CryptoEpoch != proposed.CryptoEpoch || !sameRecipientSnapshot(current.RecipientUINs, proposed.RecipientUINs) {
+	if current.State == IngestRecipientErased {
+		// The receiver (direct) or every recipient (group) was permanently
+		// erased by a panic wipe. This check MUST run before the mismatch
+		// comparison below: the tombstone has its identifying fields cleared
+		// (see scyllastore.go's deleteIngestReceipts), which would otherwise
+		// look like a client_id collision with a different message and
+		// incorrectly return ErrIngestConflict instead of a deterministic,
+		// terminal result.
+		return current, ClaimRecipientErased, nil
+	}
+	recipientsMatch := recipientSnapshotCompatible(current.RecipientUINs, proposed.RecipientUINs)
+	if current.RecipientSetSanitized {
+		// A panic wipe has removed one or more (but not all -- that case is
+		// IngestRecipientErased above) recipients from this GROUP row's
+		// recipient_uins. A retry's proposed list is the sender's stale
+		// original and is EXPECTED to differ from the sanitized one now
+		// stored; comparing them would incorrectly reject a legitimate retry
+		// as a conflict. Every OTHER field is still compared below --
+		// sanitization only ever touches recipient_uins, so any other
+		// mismatch remains a genuine conflict (e.g. a client_id collision
+		// with a different message).
+		recipientsMatch = true
+	}
+	if current.EnvelopeHash != proposed.EnvelopeHash || current.Kind != proposed.Kind || current.ReceiverUIN != proposed.ReceiverUIN || current.ConversationID != proposed.ConversationID || current.GroupID != proposed.GroupID || current.CryptoEpoch != proposed.CryptoEpoch || !recipientsMatch {
 		return IngestRecord{}, 0, ErrIngestConflict
 	}
 	if current.State == IngestStored || current.State == IngestDelivered {
@@ -159,14 +189,14 @@ func (b *ScyllaIngestBackend) MarkDelivered(ctx context.Context, key IngestKey, 
 }
 
 func (b *ScyllaIngestBackend) load(ctx context.Context, key IngestKey) (IngestRecord, error) {
-	const query = `SELECT message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until, stored_at, delivered_at
+	const query = `SELECT message_kind, receiver_uin, conversation_id, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until, stored_at, delivered_at, recipient_set_sanitized
 	  FROM iceq.message_ingest WHERE sender_uin = ? AND client_id = ?`
 	var record IngestRecord
 	var hash []byte
 	record.Key = key
 	err := b.session.Query(query, key.SenderUIN, key.ClientID).WithContext(ctx).Consistency(gocql.Quorum).Scan(
 		&record.Kind, &record.ReceiverUIN, &record.ConversationID, &record.GroupID, &record.CryptoEpoch, &record.RecipientUINs, &record.Envelope, &hash, &record.MessageID, &record.CreatedAt, &record.ExpiresAt, &record.State,
-		&record.OwnerToken, &record.LeaseUntil, &record.StoredAt, &record.DeliveredAt,
+		&record.OwnerToken, &record.LeaseUntil, &record.StoredAt, &record.DeliveredAt, &record.RecipientSetSanitized,
 	)
 	if err != nil {
 		return IngestRecord{}, fmt.Errorf("store: load ingest: %w", err)
@@ -302,6 +332,27 @@ func (w *ScyllaDurableDirectWriter) WriteGroup(ctx context.Context, write Durabl
 		return fmt.Errorf("store: execute durable group batch: %w", err)
 	}
 	return nil
+}
+
+// erasureIndexUINs returns every uin that must be able to discover this
+// ingest row via message_ingest_erasure_index without ALLOW FILTERING: the
+// sender always, plus the receiver (direct) or every recipient (group),
+// each deduplicated against the sender's own uin.
+func erasureIndexUINs(record IngestRecord) []int64 {
+	uins := []int64{record.Key.SenderUIN}
+	switch record.Kind {
+	case IngestKindGroup:
+		for _, uin := range record.RecipientUINs {
+			if uin != record.Key.SenderUIN {
+				uins = append(uins, uin)
+			}
+		}
+	default:
+		if record.ReceiverUIN != 0 && record.ReceiverUIN != record.Key.SenderUIN {
+			uins = append(uins, record.ReceiverUIN)
+		}
+	}
+	return uins
 }
 
 func nullableTime(value time.Time) any {

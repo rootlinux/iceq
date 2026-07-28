@@ -12,6 +12,7 @@
 //	ICEQ_ACCEPTANCE=1 \
 //	ICEQ_ACCEPTANCE_PG_URL="postgres://postgres:postgres@localhost:5434/iceq?sslmode=disable" \
 //	ICEQ_ACCEPTANCE_REDIS_ADDR="localhost:6380" \
+//	ICEQ_ACCEPTANCE_REDIS_PASSWORD="iceq-acceptance-redis" \
 //	go test -count=1 -race -tags=integration -run TestAcceptanceWipeKeyRotation -v ./auth-service/handlers/
 package handlers
 
@@ -24,6 +25,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -50,8 +52,9 @@ func TestAcceptanceWipeKeyRotationSucceedsWithValidSignature(t *testing.T) {
 		t.Fatalf("connect postgres: %v", err)
 	}
 	defer pgPool.Close()
+	applyAcceptanceSchema(t, pgPool)
 
-	rdb := redis.NewClient(&redis.Options{Addr: acceptanceRedisAddr(t)})
+	rdb := redis.NewClient(&redis.Options{Addr: acceptanceRedisAddr(t), Password: os.Getenv("ICEQ_ACCEPTANCE_REDIS_PASSWORD")})
 	defer func() { _ = rdb.Close() }()
 
 	if _, err := pgPool.Exec(ctx, `INSERT INTO users (uin, username, password_hash, identity_key)
@@ -141,8 +144,9 @@ func TestAcceptanceWipeKeyIdempotentResubmitDoesNotRotate(t *testing.T) {
 		t.Fatalf("connect postgres: %v", err)
 	}
 	defer pgPool.Close()
+	applyAcceptanceSchema(t, pgPool)
 
-	rdb := redis.NewClient(&redis.Options{Addr: acceptanceRedisAddr(t)})
+	rdb := redis.NewClient(&redis.Options{Addr: acceptanceRedisAddr(t), Password: os.Getenv("ICEQ_ACCEPTANCE_REDIS_PASSWORD")})
 	defer func() { _ = rdb.Close() }()
 
 	const uin = acceptanceRotationUIN + 1

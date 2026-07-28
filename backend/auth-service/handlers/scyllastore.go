@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -112,17 +113,45 @@ func (s *ScyllaMessageStore) DeleteUserGroupMessages(ctx context.Context, uin in
 	return nil
 }
 
-// deleteIngestReceipts removes durable ingest idempotency receipts for the
-// given UIN. The message_ingest table is partitioned by (sender_uin, client_id);
-// we use the erasure index to discover the complete primary keys.
+// ingestRecipientErasedState mirrors message-service/store's
+// IngestRecipientErased state value. auth-service and message-service are
+// independently deployable and deliberately do not share Go types across
+// the module boundary -- the message_ingest schema (this value included) is
+// their contract instead. Keep in sync with
+// message-service/store/durable_ingest.go's IngestRecipientErased.
+const ingestRecipientErasedState = "recipient_erased"
+
+// deleteIngestReceipts removes or sanitizes durable ingest idempotency
+// receipts for the given UIN. The message_ingest table is partitioned by
+// (sender_uin, client_id); we use the erasure index to discover the
+// complete primary keys.
+//
+// The wiped uin can appear in a receipt in one of three roles, and each is
+// handled differently by sanitizeIngestReceipt:
+//   - sender: the whole receipt belongs to the wiped user and nobody will
+//     ever retry its client_id again. Delete it outright.
+//   - direct receiver: the receipt still belongs to a live sender. Convert
+//     it to a sanitized terminal tombstone instead of deleting it, so a
+//     sender retry gets a deterministic terminal result (see
+//     message-service/store's IngestRecipientErased) instead of silently
+//     re-creating and re-delivering the message to a uin that no longer
+//     exists.
+//   - group recipient: remove only the wiped uin from recipient_uins.
+//     Delivery to any other live recipients continues unaffected. If no
+//     recipients remain, the receipt is terminalized the same way as a
+//     direct tombstone.
+//
+// The wiped uin itself is never written into any field, table, log, hash,
+// or other provenance column -- sanitizeIngestReceipt only ever removes it
+// or records a non-identifying recipient_set_sanitized marker.
 func (s *ScyllaMessageStore) deleteIngestReceipts(ctx context.Context, uin int64) error {
 	iter := s.session.Query(`SELECT sender_uin, client_id FROM message_ingest_erasure_index WHERE uin = ?`, uin).WithContext(ctx).Iter()
 	var senderUIN int64
 	var clientID string
 	for iter.Scan(&senderUIN, &clientID) {
-		if err := s.session.Query(`DELETE FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
+		if err := s.sanitizeIngestReceipt(ctx, senderUIN, clientID, uin); err != nil {
 			_ = iter.Close()
-			return fmt.Errorf("delete ingest receipt: %w", err)
+			return fmt.Errorf("sanitize ingest receipt: %w", err)
 		}
 	}
 	if err := iter.Close(); err != nil {
@@ -132,6 +161,117 @@ func (s *ScyllaMessageStore) deleteIngestReceipts(ctx context.Context, uin int64
 		return fmt.Errorf("delete ingest erasure index: %w", err)
 	}
 	return nil
+}
+
+// sanitizeIngestReceipt applies role-aware cleanup to a single message_ingest
+// row for a wiped uin. Safe to call more than once for the same row (repeated
+// wipe-worker retries, or two different recipients of the same group message
+// wiped in separate operations): every branch either no-ops on a row that's
+// already gone, already terminal, or no longer references the uin.
+func (s *ScyllaMessageStore) sanitizeIngestReceipt(ctx context.Context, senderUIN int64, clientID string, wipedUIN int64) error {
+	if senderUIN == wipedUIN {
+		if err := s.session.Query(`DELETE FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
+			return fmt.Errorf("delete sender ingest receipt: %w", err)
+		}
+		return nil
+	}
+
+	var kind, state string
+	var receiverUIN int64
+	var recipientUINs []int64
+	var expiresAt time.Time
+	readIter := s.session.Query(`SELECT message_kind, receiver_uin, recipient_uins, state, expires_at FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
+	found := readIter.Scan(&kind, &receiverUIN, &recipientUINs, &state, &expiresAt)
+	if err := readIter.Close(); err != nil {
+		return fmt.Errorf("read ingest receipt: %w", err)
+	}
+	if !found {
+		// Already gone -- delivered and cleaned up, or a previous wipe pass
+		// already handled it. Safe to repeat.
+		return nil
+	}
+	if state == ingestRecipientErasedState {
+		// Already terminalized by an earlier wipe pass. Idempotent no-op.
+		return nil
+	}
+
+	now := time.Now().UTC()
+	remaining := remainingIngestTTLSeconds(expiresAt, now)
+	if !expiresAt.IsZero() && remaining <= 0 {
+		// Already past its own expiry -- let it expire naturally rather
+		// than writing a fresh TTL that would resurrect it.
+		return nil
+	}
+
+	if kind == "direct" {
+		if receiverUIN != wipedUIN {
+			// This uin isn't referenced by this receipt in a role we
+			// recognize; leave it untouched.
+			return nil
+		}
+		return s.terminalizeIngestReceipt(ctx, senderUIN, clientID, remaining)
+	}
+
+	// Group: remove the wiped uin from recipient_uins. Order of the
+	// remaining recipients is not meaningful downstream (Claim() compares
+	// it only when NOT sanitized), so a filtered append is sufficient.
+	filtered := make([]int64, 0, len(recipientUINs))
+	removed := false
+	for _, r := range recipientUINs {
+		if r == wipedUIN {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	if !removed {
+		// Already absent from the current recipient set.
+		return nil
+	}
+	if len(filtered) == 0 {
+		return s.terminalizeIngestReceipt(ctx, senderUIN, clientID, remaining)
+	}
+
+	query := `UPDATE message_ingest SET recipient_uins = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF EXISTS`
+	args := []any{filtered, true, senderUIN, clientID}
+	if remaining > 0 {
+		query = `UPDATE message_ingest USING TTL ? SET recipient_uins = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF EXISTS`
+		args = append([]any{remaining}, args...)
+	}
+	if err := s.session.Query(query, args...).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("sanitize group recipient_uins: %w", err)
+	}
+	return nil
+}
+
+// terminalizeIngestReceipt converts a receipt to the same sanitized terminal
+// shape message-service/store's Claim() recognizes as IngestRecipientErased:
+// state flips and every field that could identify a recipient or the
+// message content is cleared. Used both when a direct receiver is wiped and
+// when the last live recipient of a group send is wiped. Guarded by IF
+// EXISTS so a concurrent MarkDelivered cleanup (which deletes the row) does
+// not race into resurrecting it.
+func (s *ScyllaMessageStore) terminalizeIngestReceipt(ctx context.Context, senderUIN int64, clientID string, remaining int64) error {
+	query := `UPDATE message_ingest SET state = ?, receiver_uin = ?, conversation_id = ?, recipient_uins = ?, envelope = ?, envelope_hash = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF EXISTS`
+	args := []any{ingestRecipientErasedState, nil, nil, nil, nil, nil, true, senderUIN, clientID}
+	if remaining > 0 {
+		query = `UPDATE message_ingest USING TTL ? SET state = ?, receiver_uin = ?, conversation_id = ?, recipient_uins = ?, envelope = ?, envelope_hash = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF EXISTS`
+		args = append([]any{remaining}, args...)
+	}
+	if err := s.session.Query(query, args...).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("terminalize ingest receipt: %w", err)
+	}
+	return nil
+}
+
+// remainingIngestTTLSeconds mirrors message-service/store's
+// remainingTTLSeconds. Duplicated rather than imported across the
+// auth-service/message-service module boundary (see ingestRecipientErasedState).
+func remainingIngestTTLSeconds(expiresAt, now time.Time) int64 {
+	if expiresAt.IsZero() || !expiresAt.After(now) {
+		return 0
+	}
+	return int64(math.Ceil(expiresAt.Sub(now).Seconds()))
 }
 
 // deleteDirectOutboxEntries removes direct outbox rows for the given UIN
@@ -168,8 +308,16 @@ func (s *ScyllaMessageStore) deleteDirectOutboxEntries(ctx context.Context, uin 
 //   - role='recipient': the wiped user is one of several recipients. Remove
 //     only that UIN from the recipient_uins snapshot. If no valid recipients
 //     remain after removal, delete the row. Otherwise UPDATE the row with the
-//     reduced list. Uses an IF EXISTS lightweight transaction so a concurrent
+//     reduced list, using an explicit USING TTL that preserves the row's
+//     remaining lifetime (a bare UPDATE would write its touched cells with
+//     no TTL, silently turning an expiring row permanent). A row already
+//     past its own expiry is left untouched rather than resurrected with a
+//     fresh TTL. Uses an IF EXISTS lightweight transaction so a concurrent
 //     delivery (which deletes the row) does not race with the UPDATE.
+//
+// Safe to call more than once for the same row: an already-gone row, an
+// already-expired row, and a UIN already absent from recipient_uins are all
+// detected and no-opped.
 //
 // After the outbox mutation, every erasure-index row for this UIN is deleted.
 // The final DELETE FROM erasure index removes all entries regardless of role
@@ -189,35 +337,72 @@ func (s *ScyllaMessageStore) deleteGroupOutboxEntries(ctx context.Context, uin i
 				return fmt.Errorf("delete group outbox (sender): %w", err)
 			}
 		case "recipient":
-			// Read the current recipient_uins list, remove this UIN, and
-			// UPDATE or DELETE the row. Use IF EXISTS so a concurrent
-			// delivery (which deletes the row entirely) does not race.
+			// Read the current recipient_uins list and expires_at, remove
+			// this UIN, and UPDATE or DELETE the row. Use IF EXISTS so a
+			// concurrent delivery (which deletes the row entirely) does not
+			// race. expires_at is read so the UPDATE below can carry an
+			// explicit USING TTL -- an UPDATE without one writes its
+			// touched cells with NO ttl, silently turning an expiring row
+			// permanent (group_message_outbox has no table-level
+			// default_time_to_live).
 			var currentRecipients []int64
-			readIter := s.session.Query(`SELECT recipient_uins FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ?`, bucket, createdAt, messageID).WithContext(ctx).Iter()
-			readIter.Scan(&currentRecipients)
+			var expiresAt time.Time
+			readIter := s.session.Query(`SELECT recipient_uins, expires_at FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ?`, bucket, createdAt, messageID).WithContext(ctx).Iter()
+			found := readIter.Scan(&currentRecipients, &expiresAt)
 			if err := readIter.Close(); err != nil {
 				_ = iter.Close()
 				return fmt.Errorf("read group outbox recipients: %w", err)
 			}
+			if !found {
+				// Already gone -- delivered and cleaned up, or a previous
+				// wipe pass already handled it. Safe to repeat.
+				continue
+			}
+
+			now := time.Now().UTC()
+			remaining := remainingIngestTTLSeconds(expiresAt, now)
+			if !expiresAt.IsZero() && remaining <= 0 {
+				// Already past its own expiry -- let it expire naturally
+				// rather than writing a fresh TTL that would resurrect it.
+				continue
+			}
 
 			// Remove the wiped UIN from the list.
 			filtered := make([]int64, 0, len(currentRecipients))
+			removed := false
 			for _, r := range currentRecipients {
-				if r != uin {
-					filtered = append(filtered, r)
+				if r == uin {
+					removed = true
+					continue
 				}
+				filtered = append(filtered, r)
+			}
+			if !removed {
+				// Already absent from the current recipient set (a
+				// previous wipe pass already handled it).
+				continue
 			}
 
 			if len(filtered) == 0 {
-				// No valid recipients remain — delete the row.
+				// No valid recipients remain — delete the row. A DELETE
+				// carries no TTL semantics, so no resurrection risk here.
 				if err := s.session.Query(`DELETE FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS`, bucket, createdAt, messageID).WithContext(ctx).Exec(); err != nil {
 					_ = iter.Close()
 					return fmt.Errorf("delete empty group outbox: %w", err)
 				}
 			} else {
-				// Other recipients remain — UPDATE with the reduced list.
-				// IF EXISTS guards against concurrent delivery.
-				if err := s.session.Query(`UPDATE group_message_outbox SET recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS`, filtered, bucket, createdAt, messageID).WithContext(ctx).Exec(); err != nil {
+				// Other recipients remain — UPDATE with the reduced list,
+				// preserving the row's remaining TTL explicitly (or writing
+				// no TTL at all when the row was durable/non-expiring by
+				// design, i.e. expiresAt.IsZero()). IF EXISTS guards
+				// against concurrent delivery.
+				query := `UPDATE group_message_outbox SET recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS`
+				args := []any{filtered, bucket, createdAt, messageID}
+				if remaining > 0 {
+					query = `UPDATE group_message_outbox USING TTL ? SET recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS`
+					args = append([]any{remaining}, args...)
+				}
+				if err := s.session.Query(query, args...).WithContext(ctx).Exec(); err != nil {
 					_ = iter.Close()
 					return fmt.Errorf("update group outbox recipients: %w", err)
 				}

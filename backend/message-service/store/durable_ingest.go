@@ -20,6 +20,28 @@ const (
 	IngestDelivered  IngestState = "delivered"
 	IngestKindDirect IngestKind  = "direct"
 	IngestKindGroup  IngestKind  = "group"
+
+	// IngestRecipientErased marks an ingest row with no live recipient left
+	// to deliver to, because a panic wipe erased the last (or only) one. The
+	// row is never deleted outright in this case -- that would destroy the
+	// SENDER's idempotency receipt, and a legitimate retry (the sender's
+	// client has no way to know the recipient was wiped) would then look
+	// like a brand new claim and re-process the message from scratch.
+	// Instead the row is converted to a sanitized tombstone: state flips to
+	// this value and every field that could identify the wiped recipient(s)
+	// or the message content (receiver_uin, conversation_id, recipient_uins,
+	// envelope, envelope_hash) is cleared -- see
+	// auth-service/handlers/scyllastore.go's deleteIngestReceipts, which is
+	// the only writer of this state. Claim() recognizes it and returns
+	// ClaimRecipientErased deterministically instead of a generic conflict.
+	//
+	// Applies to two cases:
+	//   - DIRECT: the single receiver was erased.
+	//   - GROUP: every recipient has been erased (recipient_uins reduced to
+	//     empty). A group row with SOME recipients still live instead stays
+	//     in its normal state with recipient_uins reduced in place and
+	//     RecipientSetSanitized set -- see recipientSnapshotCompatible.
+	IngestRecipientErased IngestState = "recipient_erased"
 )
 
 type ClaimDisposition uint8
@@ -28,13 +50,19 @@ const (
 	ClaimAcquired ClaimDisposition = iota + 1
 	ClaimBusy
 	ClaimCommitted
+	// ClaimRecipientErased is returned when the stored row has been
+	// converted to a recipient-erased tombstone (see IngestRecipientErased).
+	// It is terminal: the caller must not write message content or
+	// re-attempt delivery, since the recipient no longer exists.
+	ClaimRecipientErased
 )
 
 var (
-	ErrIngestConflict  = errors.New("store: client id reused with a different envelope")
-	ErrIngestBusy      = errors.New("store: ingest is owned by another worker")
-	ErrIngestLeaseLost = errors.New("store: ingest lease was lost")
-	ErrInvalidIngest   = errors.New("store: invalid durable ingest request")
+	ErrIngestConflict         = errors.New("store: client id reused with a different envelope")
+	ErrIngestBusy             = errors.New("store: ingest is owned by another worker")
+	ErrIngestLeaseLost        = errors.New("store: ingest lease was lost")
+	ErrInvalidIngest          = errors.New("store: invalid durable ingest request")
+	ErrIngestRecipientErased  = errors.New("store: recipient was erased by a panic wipe; message cannot be delivered")
 )
 
 type IngestKey struct {
@@ -55,12 +83,19 @@ type IngestRecord struct {
 	MessageID        gocql.UUID
 	CreatedAt        time.Time
 	ExpiresAt        time.Time
-	State            IngestState
-	OwnerToken       gocql.UUID
-	LeaseUntil       time.Time
-	StoredAt         time.Time
-	DeliveredAt      time.Time
-	ExpiresInSeconds int64
+	State                 IngestState
+	OwnerToken            gocql.UUID
+	LeaseUntil            time.Time
+	StoredAt              time.Time
+	DeliveredAt           time.Time
+	ExpiresInSeconds      int64
+	// RecipientSetSanitized is true once a panic wipe has removed one or
+	// more (but not necessarily all) recipients from RecipientUINs on a
+	// GROUP row. It never identifies who was removed. When set, Claim()
+	// stops comparing RecipientUINs against what a retry proposes -- a
+	// retry's proposed list is always the sender's stale original and is
+	// expected to differ from the sanitized one. See recipientSnapshotCompatible.
+	RecipientSetSanitized bool
 }
 
 type DurableDirectRequest struct {
@@ -191,7 +226,27 @@ func deterministicMessageID(key IngestKey) gocql.UUID {
 	return id
 }
 
-func sameRecipientSnapshot(a, b []int64) bool { return slices.Equal(a, b) }
+// recipientSnapshotCompatible reports whether the stored recipient snapshot
+// exactly matches what's being proposed. Kept as an exact, order-sensitive
+// comparison deliberately: see
+// TestDurableGroupRecipientSnapshotIsImmutableAcrossReplay, which proves a
+// client cannot use a client_id replay with an expanded recipient list to
+// smuggle a new recipient into an already-claimed group message. A looser
+// (e.g. subset-tolerant) comparison cannot distinguish that attack from
+// legitimate wipe-driven shrinkage -- both produce a "stored list is a
+// subset of proposed" shape.
+//
+// This is why panic wipe does NOT rely on this comparison tolerating a
+// shrunk list: instead, once a wipe has reduced recipient_uins,
+// IngestRecord.RecipientSetSanitized is set on the row and Claim() skips
+// calling this function entirely for that row (see durable_ingest_scylla.go).
+// The exact-equality invariant this function enforces therefore stays intact
+// for every row that has NOT been sanitized -- a replay attack still cannot
+// smuggle in a new recipient by proposing an expanded list, because an
+// unsanitized row always requires an exact match.
+func recipientSnapshotCompatible(current, proposed []int64) bool {
+	return slices.Equal(current, proposed)
+}
 
 func (s *DurableIngestStore) PersistDirect(ctx context.Context, req DurableDirectRequest) (DurableIngestResult, error) {
 	if req.SenderUIN <= 0 || req.ReceiverUIN <= 0 || req.ClientID == "" || req.ConversationID == "" || len(req.Envelope) == 0 || len(req.Ciphertext) == 0 || req.ExpiresInSeconds < 0 {
@@ -221,6 +276,13 @@ func (s *DurableIngestStore) PersistDirect(ctx context.Context, req DurableDirec
 		return result, nil
 	case ClaimBusy:
 		return result, ErrIngestBusy
+	case ClaimRecipientErased:
+		// The receiver was permanently erased by a panic wipe after this
+		// claim was accepted (possibly before this exact retry). This is
+		// terminal and deterministic: never write message content, never
+		// re-attempt delivery -- the recipient no longer exists.
+		result.State = IngestRecipientErased
+		return result, ErrIngestRecipientErased
 	case ClaimAcquired:
 	default:
 		return DurableIngestResult{}, fmt.Errorf("store: unknown claim disposition %d", disposition)
@@ -294,6 +356,14 @@ func (s *DurableIngestStore) PersistGroup(ctx context.Context, req DurableGroupR
 	}
 	if disposition == ClaimBusy {
 		return result, ErrIngestBusy
+	}
+	if disposition == ClaimRecipientErased {
+		// Every recipient in this group send has been erased by a panic
+		// wipe (recipient_uins reduced to empty). Terminal and
+		// deterministic, same contract as the direct case: never write
+		// message content, never re-attempt delivery.
+		result.State = IngestRecipientErased
+		return result, ErrIngestRecipientErased
 	}
 	if disposition != ClaimAcquired {
 		return DurableIngestResult{}, fmt.Errorf("store: unknown claim disposition %d", disposition)

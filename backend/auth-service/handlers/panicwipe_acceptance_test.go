@@ -33,6 +33,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -47,6 +48,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gocql/gocql"
+	"github.com/iceq/iceq/message-service/store"
 	"github.com/iceq/iceq/shared/jwt"
 	"github.com/iceq/iceq/shared/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -313,6 +315,12 @@ func applyScyllaSchema(t *testing.T, session *gocql.Session) {
 		"012_durable_message_ingest.cql",
 		"013_group_recipient_snapshot.cql",
 		"017_user_erasure_indexes.cql",
+		// 018 ALTERs message_ingest (created by 012) to add
+		// recipient_set_sanitized -- must be applied here or every query
+		// touching that column fails with "undefined column" against this
+		// test's Scylla instance, exactly the silently-missing-migration
+		// scenario this fixture exists to catch.
+		"018_message_ingest_recipient_sanitized.cql",
 	}
 
 	migrationDir := "../../../deploy/init/migrations"
@@ -403,6 +411,14 @@ type scyllaSeedKeys struct {
 	recipientOnlyGrpOutboxBucket int8
 	recipientOnlyGrpCreatedAt    time.Time
 	recipientOnlyGrpMsgID        gocql.UUID
+
+	// Group message_ingest recipient fixture: the wiped user is a recipient
+	// (not sender) of a durable ingest receipt that also has a surviving
+	// recipient. Exercises message_ingest's own role-aware sanitization,
+	// distinct from group_message_outbox above.
+	groupIngestSenderUIN   int64
+	groupIngestClientID    string
+	groupIngestSurvivorUIN int64
 }
 
 func seedAcceptanceUserFullStack(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client,
@@ -633,6 +649,45 @@ func seedAcceptanceUserFullStack(t *testing.T, pool *pgxpool.Pool, rdb *redis.Cl
 		t.Fatalf("[%s] seed recipient-only erasure index (recipient control): %v", label, err)
 	}
 
+	// Seed a group message_ingest receipt where this user is a RECIPIENT
+	// (not sender), alongside another recipient who must survive the wipe.
+	// Mirrors the recipient-only group_message_outbox fixture above but
+	// exercises message_ingest's own role-aware sanitization path
+	// (recipient_uins reduced in place, recipient_set_sanitized marker set,
+	// row NOT deleted since the sender is untouched and a recipient remains).
+	groupIngestSenderUIN := acceptanceControlUIN
+	if uin == acceptanceControlUIN {
+		groupIngestSenderUIN = acceptanceTestUIN + 200
+	}
+	groupIngestSurvivorUIN := uin + 100
+	groupIngestClientID := "acceptance-client-" + label + "-group-ingest"
+	groupIngestMsgID, err := gocql.RandomUUID()
+	if err != nil {
+		t.Fatalf("[%s] generate group ingest msgID: %v", label, err)
+	}
+	groupIngestGroupID, err := gocql.RandomUUID()
+	if err != nil {
+		t.Fatalf("[%s] generate group ingest groupID: %v", label, err)
+	}
+	groupIngestCreatedAt := time.Now().Truncate(time.Millisecond)
+	if err := session.Query(`INSERT INTO message_ingest
+		(sender_uin, client_id, message_kind, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, state, owner_token, lease_until)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		groupIngestSenderUIN, groupIngestClientID, "group", groupIngestGroupID, int64(1),
+		[]int64{uin, groupIngestSurvivorUIN}, []byte("env"), []byte("hash12345678901234567890123456789012"),
+		groupIngestMsgID, groupIngestCreatedAt, "stored", groupIngestMsgID, groupIngestCreatedAt,
+	).WithContext(ctx).Exec(); err != nil {
+		t.Fatalf("[%s] seed group message_ingest: %v", label, err)
+	}
+	// Index every uin that appears in this receipt, mirroring Claim()'s
+	// erasureIndexUINs: sender, the wiped recipient, and the survivor.
+	for _, indexUIN := range []int64{groupIngestSenderUIN, uin, groupIngestSurvivorUIN} {
+		if err := session.Query(`INSERT INTO message_ingest_erasure_index (uin, sender_uin, client_id)
+			VALUES (?, ?, ?)`, indexUIN, groupIngestSenderUIN, groupIngestClientID).WithContext(ctx).Exec(); err != nil {
+			t.Fatalf("[%s] seed group ingest erasure index (uin %d): %v", label, indexUIN, err)
+		}
+	}
+
 	// --- NATS JetStream ---
 	js, err := nc.JetStream()
 	if err != nil {
@@ -668,6 +723,9 @@ func seedAcceptanceUserFullStack(t *testing.T, pool *pgxpool.Pool, rdb *redis.Cl
 		recipientOnlyGrpOutboxBucket: recipientGrpOutboxBucket,
 		recipientOnlyGrpCreatedAt:    recipientGrpCreatedAt,
 		recipientOnlyGrpMsgID:        recipientGrpMsgID,
+		groupIngestSenderUIN:         groupIngestSenderUIN,
+		groupIngestClientID:          groupIngestClientID,
+		groupIngestSurvivorUIN:       groupIngestSurvivorUIN,
 	}
 }
 
@@ -782,6 +840,23 @@ func verifySeededFootprintFullStack(t *testing.T, pool *pgxpool.Pool, rdb *redis
 	}
 	if grpOutboxIdxCount == 0 {
 		t.Fatalf("[%s] pre-wipe verify: group_message_outbox_erasure_index has 0 rows for uin=%d", label, uin)
+	}
+
+	// Verify the group message_ingest recipient fixture exists with both
+	// recipients still present, unsanitized.
+	var preWipeGroupIngestRecipients []int64
+	var preWipeGroupIngestSanitized bool
+	iter = session.Query(`SELECT recipient_uins, recipient_set_sanitized FROM message_ingest WHERE sender_uin = ? AND client_id = ?`,
+		keys.groupIngestSenderUIN, keys.groupIngestClientID).WithContext(ctx).Iter()
+	iter.Scan(&preWipeGroupIngestRecipients, &preWipeGroupIngestSanitized)
+	if err := iter.Close(); err != nil {
+		t.Fatalf("[%s] pre-wipe verify group ingest iter close: %v", label, err)
+	}
+	if len(preWipeGroupIngestRecipients) != 2 {
+		t.Fatalf("[%s] pre-wipe verify: group message_ingest recipient_uins = %v, want 2 entries", label, preWipeGroupIngestRecipients)
+	}
+	if preWipeGroupIngestSanitized {
+		t.Fatalf("[%s] pre-wipe verify: group message_ingest recipient_set_sanitized already true before any wipe ran", label)
 	}
 
 	// --- NATS: verify message exists ---
@@ -979,6 +1054,42 @@ func verifyZeroFootprintFullStack(t *testing.T, pool *pgxpool.Pool, rdb *redis.C
 	// recipients.
 	if len(recipientUINs) == 0 {
 		t.Errorf("[%s] recipient-only group outbox row was incorrectly deleted — control recipients still need it", label)
+	}
+
+	// Verify the group message_ingest recipient fixture: the shared receipt
+	// must still exist (the sender was not wiped and a recipient survives),
+	// the wiped UIN must be gone from recipient_uins, the surviving
+	// recipient must remain, and recipient_set_sanitized must be set. This
+	// is message_ingest's own role-aware sanitization path — distinct from
+	// (and previously entirely untested against) the group_message_outbox
+	// check above.
+	var groupIngestRecipients []int64
+	var groupIngestSanitized bool
+	iter = session.Query(`SELECT recipient_uins, recipient_set_sanitized FROM message_ingest WHERE sender_uin = ? AND client_id = ?`,
+		keys.groupIngestSenderUIN, keys.groupIngestClientID).WithContext(ctx).Iter()
+	iter.Scan(&groupIngestRecipients, &groupIngestSanitized)
+	if err := iter.Close(); err != nil {
+		t.Errorf("[%s] group ingest iter close: %v", label, err)
+	}
+	for _, r := range groupIngestRecipients {
+		if r == uin {
+			t.Errorf("[%s] group message_ingest still contains wiped UIN %d in recipient_uins", label, uin)
+		}
+	}
+	foundSurvivor := false
+	for _, r := range groupIngestRecipients {
+		if r == keys.groupIngestSurvivorUIN {
+			foundSurvivor = true
+		}
+	}
+	if !foundSurvivor {
+		t.Errorf("[%s] group message_ingest row lost surviving recipient %d — recipient_uins = %v", label, keys.groupIngestSurvivorUIN, groupIngestRecipients)
+	}
+	if len(groupIngestRecipients) == 0 {
+		t.Errorf("[%s] group message_ingest row was incorrectly emptied or deleted — surviving recipient %d still needs it", label, keys.groupIngestSurvivorUIN)
+	}
+	if !groupIngestSanitized {
+		t.Errorf("[%s] group message_ingest recipient_set_sanitized = false, want true after recipient removal", label)
 	}
 
 	// --- NATS: no messages for this user's subject ---
@@ -1411,4 +1522,383 @@ func TestAcceptanceFullStack(t *testing.T) {
 	// Cross-account isolation: control user
 	t.Log("verifying control user unchanged across all 5 storage layers...")
 	verifyControlUnchangedFullStack(t, pgPool, rdb, scyllaSession, nc, minioClient, controlKeys)
+}
+
+// TestAcceptanceGroupRecipientWipeTTLBehavior exercises, against a real
+// Scylla instance, the two TTL-loss defects found and fixed while verifying
+// Task #12 (one pre-existing in group_message_outbox, one newly-introduced
+// risk in message_ingest's recipient sanitization): recipient removal must
+// preserve the row's remaining TTL, repeated cleanup must not extend it,
+// and a row already past its own expiry must never be resurrected with a
+// fresh one. It also proves a sender retry after sanitization does not
+// recreate the wiped uin's message_ingest_erasure_index entry, using the
+// real production Claim() implementation, not a re-derivation of it.
+// pollUntil polls fn at interval until it returns true, or until deadline
+// (measured from start) has elapsed -- whichever comes first. It returns
+// the actual elapsed time at that point and whether fn returned true.
+// Bounded polling records the real observed transition time instead of
+// gambling that a single fixed sleep duration lands on the right side of
+// it, which is what made the original fixed-sleep version of the TTL
+// acceptance test flaky under scheduler/CI load: a blind time.Sleep can
+// wake up later than intended, but never earlier, so a single read after
+// it proves nothing about when the transition actually happened.
+func pollUntil(start time.Time, deadline, interval time.Duration, fn func() bool) (elapsed time.Duration, becameTrue bool) {
+	for {
+		elapsed = time.Since(start)
+		if fn() {
+			return elapsed, true
+		}
+		if elapsed >= deadline {
+			return elapsed, false
+		}
+		time.Sleep(interval)
+	}
+}
+
+func TestAcceptanceGroupRecipientWipeTTLBehavior(t *testing.T) {
+	requireAcceptanceEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	scyllaHosts := acceptanceScyllaHosts(t)
+	bootstrapCluster := gocql.NewCluster(scyllaHosts...)
+	bootstrapCluster.Timeout = 10 * time.Second
+	bootstrapCluster.ConnectTimeout = 10 * time.Second
+	bootstrapSession, err := bootstrapCluster.CreateSession()
+	if err != nil {
+		t.Fatalf("Scylla unreachable at %v: %v", scyllaHosts, err)
+	}
+	if err := bootstrapSession.Query(`CREATE KEYSPACE IF NOT EXISTS iceq WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}`).WithContext(ctx).Exec(); err != nil {
+		bootstrapSession.Close()
+		t.Fatalf("Scylla keyspace creation failed: %v", err)
+	}
+	bootstrapSession.Close()
+
+	scyllaCluster := gocql.NewCluster(scyllaHosts...)
+	scyllaCluster.Keyspace = "iceq"
+	scyllaCluster.Consistency = gocql.LocalQuorum
+	scyllaCluster.Timeout = 10 * time.Second
+	scyllaCluster.ConnectTimeout = 10 * time.Second
+	session, err := scyllaCluster.CreateSession()
+	if err != nil {
+		t.Fatalf("Scylla unreachable at %v: %v", scyllaHosts, err)
+	}
+	defer session.Close()
+	applyScyllaSchema(t, session)
+
+	msgStore, err := NewScyllaMessageStore(session)
+	if err != nil {
+		t.Fatalf("create Scylla store: %v", err)
+	}
+
+	const (
+		wipedUIN    = int64(910001)
+		survivorUIN = int64(910002)
+		senderUIN   = int64(910003)
+	)
+
+	t.Run("group_message_outbox recipient removal preserves TTL and does not extend on repeat", func(t *testing.T) {
+		// Scylla's TTL() function rejects non-frozen collection columns
+		// ("TTL expects an atomic column") -- recipient_uins is a
+		// LIST<BIGINT> and cannot be TTL-introspected directly, and
+		// group_message_outbox has no atomic sibling column touched in the
+		// same UPDATE to use as a proxy (unlike message_ingest's
+		// recipient_set_sanitized, checked in the subtest below). So this
+		// proves TTL preservation behaviorally, against real wall-clock
+		// expiry, with a short real TTL: the row must still be alive well
+		// before the original TTL elapses (proving it wasn't dropped to
+		// ~0), and must be gone shortly after the ORIGINAL TTL would have
+		// elapsed even though cleanup ran twice in between (proving
+		// neither call reset it to permanent or extended it with a fresh
+		// duration).
+		const (
+			originalTTL  = 8 // seconds
+			pollInterval = 200 * time.Millisecond
+			// Polling for "still alive" stops here, this far short of the
+			// original TTL -- the row must still be alive at that point,
+			// proving neither cleanup call truncated the TTL toward zero.
+			aliveThroughMargin = 2 * time.Second
+			// How far past the original TTL the row may still be observed
+			// before we conclude a cleanup call silently made it permanent
+			// or extended it. Generous enough to absorb Docker/CI scheduling
+			// jitter, tight enough to still catch a real defect.
+			expiryMargin = 5 * time.Second
+		)
+		bucket := int8(5)
+		createdAt := time.Now().UTC().Truncate(time.Millisecond)
+		start := time.Now()
+		msgID, err := gocql.RandomUUID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		groupID, err := gocql.RandomUUID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		expiresAt := createdAt.Add(originalTTL * time.Second)
+		if err := session.Query(`INSERT INTO group_message_outbox
+			(bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`,
+			bucket, createdAt, msgID, groupID, senderUIN, "ttl-check-client", 1,
+			[]int64{wipedUIN, survivorUIN}, []byte("env"), []byte("hash12345678901234567890123456789012"), "pending", expiresAt, originalTTL,
+		).WithContext(ctx).Exec(); err != nil {
+			t.Fatalf("seed group_message_outbox: %v", err)
+		}
+		reindex := func() {
+			if err := session.Query(`INSERT INTO group_message_outbox_erasure_index (uin, bucket, created_at, message_id, role) VALUES (?, ?, ?, ?, ?) USING TTL ?`,
+				wipedUIN, bucket, createdAt, msgID, "recipient", originalTTL).WithContext(ctx).Exec(); err != nil {
+				t.Fatalf("seed erasure index: %v", err)
+			}
+		}
+		reindex()
+
+		readRow := func() (bool, []int64) {
+			var recipients []int64
+			iter := session.Query(`SELECT recipient_uins FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ?`, bucket, createdAt, msgID).WithContext(ctx).Iter()
+			found := iter.Scan(&recipients)
+			if err := iter.Close(); err != nil {
+				t.Fatalf("read row: %v", err)
+			}
+			return found, recipients
+		}
+
+		if err := msgStore.DeleteUserGroupMessages(ctx, wipedUIN); err != nil {
+			t.Fatalf("first cleanup: %v", err)
+		}
+		found, recipients := readRow()
+		if !found {
+			t.Fatal("row gone immediately after first cleanup -- TTL must not be dropped near-zero")
+		}
+		if len(recipients) != 1 || recipients[0] != survivorUIN {
+			t.Fatalf("recipient_uins after first cleanup = %v, want [%d]", recipients, survivorUIN)
+		}
+
+		// Poll (instead of sleeping for a fixed duration and reading once)
+		// until either the row disappears or we reach a deadline safely
+		// short of the original TTL. Disappearing before that deadline
+		// means a cleanup call truncated the TTL toward zero instead of
+		// preserving it; this alone doesn't prove the opposite mistake
+		// (TTL left permanent) -- that's checked below, after a repeat
+		// cleanup, with its own bounded poll.
+		aliveDeadline := originalTTL*time.Second - aliveThroughMargin
+		earlyElapsed, wentAwayEarly := pollUntil(start, aliveDeadline, pollInterval, func() bool {
+			found, _ := readRow()
+			return !found
+		})
+		if wentAwayEarly {
+			t.Fatalf("row expired early, %s after start (original TTL was %ds; expected alive until at least %s after start) -- TTL was truncated, not preserved; start=%s observedGoneAt=%s",
+				earlyElapsed, originalTTL, aliveDeadline, start.Format(time.RFC3339Nano), start.Add(earlyElapsed).Format(time.RFC3339Nano))
+		}
+
+		// Repeat: a second wipe pass (retry after a crash, or a second
+		// recipient of the same message wiped separately) must not reset
+		// or extend the TTL.
+		reindex()
+		if err := msgStore.DeleteUserGroupMessages(ctx, wipedUIN); err != nil {
+			t.Fatalf("second (repeated) cleanup: %v", err)
+		}
+		found, recipients = readRow()
+		if !found {
+			t.Fatal("row gone immediately after repeated cleanup")
+		}
+		if len(recipients) != 1 || recipients[0] != survivorUIN {
+			t.Fatalf("recipient_uins after repeated cleanup = %v, want [%d]", recipients, survivorUIN)
+		}
+
+		// Poll until the row is actually gone, bounded by the original TTL
+		// plus expiryMargin, even though cleanup ran twice since the row was
+		// seeded. Because the previous poll already proved the row survived
+		// until aliveDeadline, any success here is sufficient proof neither
+		// cleanup call reset or extended the TTL past that margin -- and if
+		// it never happens, the failure carries exact timestamps and the
+		// last-read row state instead of a single accusatory snapshot.
+		expiryDeadline := originalTTL*time.Second + expiryMargin
+		finalElapsed, becameGone := pollUntil(start, expiryDeadline, pollInterval, func() bool {
+			found, _ := readRow()
+			return !found
+		})
+		if !becameGone {
+			stillFound, stillRecipients := readRow()
+			t.Fatalf("row still alive %s after start, past its original %ds TTL plus %s margin (deadline %s after start) -- a cleanup call silently made it permanent or extended its TTL; start=%s now=%s deadlineAt=%s found=%v recipients=%v",
+				finalElapsed, originalTTL, expiryMargin, expiryDeadline,
+				start.Format(time.RFC3339Nano), time.Now().Format(time.RFC3339Nano), start.Add(expiryDeadline).Format(time.RFC3339Nano),
+				stillFound, stillRecipients)
+		}
+	})
+
+	t.Run("group_message_outbox already-expired row is left untouched, never resurrected", func(t *testing.T) {
+		bucket := int8(6)
+		createdAt := time.Now().UTC().Truncate(time.Millisecond)
+		msgID, err := gocql.RandomUUID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		groupID, err := gocql.RandomUUID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The STORED expires_at value is in the past, but the row itself
+		// carries a long real CQL TTL so it stays queryable during this
+		// test -- deliberately exercising the "remaining <= 0" defensive
+		// branch without racing real wall-clock expiry.
+		staleExpiresAt := createdAt.Add(-time.Hour)
+		if err := session.Query(`INSERT INTO group_message_outbox
+			(bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 3600`,
+			bucket, createdAt, msgID, groupID, senderUIN, "ttl-stale-client", 1,
+			[]int64{wipedUIN, survivorUIN}, []byte("env"), []byte("hash12345678901234567890123456789012"), "pending", staleExpiresAt,
+		).WithContext(ctx).Exec(); err != nil {
+			t.Fatalf("seed stale group_message_outbox: %v", err)
+		}
+		if err := session.Query(`INSERT INTO group_message_outbox_erasure_index (uin, bucket, created_at, message_id, role) VALUES (?, ?, ?, ?, ?) USING TTL 3600`,
+			wipedUIN, bucket, createdAt, msgID, "recipient").WithContext(ctx).Exec(); err != nil {
+			t.Fatalf("seed erasure index: %v", err)
+		}
+
+		if err := msgStore.DeleteUserGroupMessages(ctx, wipedUIN); err != nil {
+			t.Fatalf("cleanup of already-expired row: %v", err)
+		}
+
+		// The row must be left exactly as seeded (skip, don't mutate) --
+		// the wiped uin is still allowed to be present here: the whole
+		// point of skipping is that this row is about to disappear via its
+		// own already-past expiry anyway, so mutating it (and risking a
+		// fresh/permanent TTL landing on it) is both unnecessary and
+		// risky. This directly proves the "remaining <= 0 -> skip" branch
+		// ran, without needing TTL() (which Scylla rejects for the
+		// non-frozen recipient_uins collection -- see the sibling subtest
+		// above for why the other two properties are proven via real
+		// wall-clock expiry instead).
+		var recipients []int64
+		iter := session.Query(`SELECT recipient_uins FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ?`, bucket, createdAt, msgID).WithContext(ctx).Iter()
+		iter.Scan(&recipients)
+		if err := iter.Close(); err != nil {
+			t.Fatalf("read row: %v", err)
+		}
+		found := false
+		for _, r := range recipients {
+			if r == wipedUIN {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("expected the already-expired row to be left untouched (wiped uin still present) -- cleanup must skip mutation, not remove it via a different path")
+		}
+	})
+
+	t.Run("message_ingest recipient removal preserves TTL and a sender retry does not recreate the erasure index", func(t *testing.T) {
+		clientID := "ttl-ingest-client"
+		groupID, err := gocql.RandomUUID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		createdAt := time.Now().UTC().Truncate(time.Millisecond)
+		expiresAt := createdAt.Add(time.Hour)
+		envelope := []byte("ttl-check-envelope")
+		hash := sha256.Sum256(envelope)
+		msgID, err := gocql.RandomUUID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := session.Query(`INSERT INTO message_ingest
+			(sender_uin, client_id, message_kind, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 3600`,
+			senderUIN, clientID, "group", groupID, int64(1), []int64{wipedUIN, survivorUIN},
+			envelope, hash[:], msgID, createdAt, expiresAt, "stored", msgID, createdAt,
+		).WithContext(ctx).Exec(); err != nil {
+			t.Fatalf("seed message_ingest: %v", err)
+		}
+		for _, indexUIN := range []int64{senderUIN, wipedUIN, survivorUIN} {
+			if err := session.Query(`INSERT INTO message_ingest_erasure_index (uin, sender_uin, client_id) VALUES (?, ?, ?) USING TTL 3600`,
+				indexUIN, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
+				t.Fatalf("seed erasure index (uin %d): %v", indexUIN, err)
+			}
+		}
+
+		// recipient_set_sanitized is an atomic boolean written in the SAME
+		// UPDATE statement as recipient_uins (see sanitizeIngestReceipt),
+		// so unlike recipient_uins itself (a non-frozen LIST, which
+		// Scylla's TTL() function rejects -- see the group_message_outbox
+		// subtests above), its TTL is a valid, directly queryable proxy
+		// for the TTL actually applied to that same write.
+		readState := func() (int, []int64, bool) {
+			var ttl int
+			var recipients []int64
+			var sanitized bool
+			iter := session.Query(`SELECT TTL(recipient_set_sanitized), recipient_uins, recipient_set_sanitized FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
+			iter.Scan(&ttl, &recipients, &sanitized)
+			if err := iter.Close(); err != nil {
+				t.Fatalf("read state: %v", err)
+			}
+			return ttl, recipients, sanitized
+		}
+		countErasureIndex := func(uin int64) int {
+			var count int
+			iter := session.Query(`SELECT COUNT(*) FROM message_ingest_erasure_index WHERE uin = ?`, uin).WithContext(ctx).Iter()
+			iter.Scan(&count)
+			if err := iter.Close(); err != nil {
+				t.Fatalf("count erasure index: %v", err)
+			}
+			return count
+		}
+
+		// Before any wipe, recipient_set_sanitized was never written (NULL
+		// -- its TTL is meaningless until the first sanitization sets it).
+		_, _, preSanitized := readState()
+		if preSanitized {
+			t.Fatal("recipient_set_sanitized = true before any wipe ran")
+		}
+
+		if err := msgStore.DeleteUserMessages(ctx, wipedUIN); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+		firstTTL, firstRecipients, firstSanitized := readState()
+		if firstTTL <= 0 || firstTTL > 3600 {
+			t.Fatalf("TTL(recipient_set_sanitized) after cleanup = %d, want in (0, 3600] -- must remain expiring, not become permanent", firstTTL)
+		}
+		if !firstSanitized {
+			t.Fatal("recipient_set_sanitized = false after wipe, want true")
+		}
+		for _, r := range firstRecipients {
+			if r == wipedUIN {
+				t.Fatal("wiped uin still in recipient_uins after cleanup")
+			}
+		}
+		if countErasureIndex(wipedUIN) != 0 {
+			t.Fatalf("message_ingest_erasure_index still has entries for the wiped uin after cleanup")
+		}
+
+		// Simulate the SENDER retrying the original send with its stale,
+		// pre-wipe recipient list, using the real production Claim()
+		// implementation (not a re-derivation of it) -- proving the retry
+		// is idempotent and does not recreate the wiped uin's index entry.
+		backend := store.NewScyllaIngestBackend(session)
+		proposed := store.IngestRecord{
+			Key:           store.IngestKey{SenderUIN: senderUIN, ClientID: clientID},
+			Kind:          store.IngestKindGroup,
+			GroupID:       groupID,
+			CryptoEpoch:   1,
+			RecipientUINs: []int64{wipedUIN, survivorUIN}, // sender's stale, pre-wipe list
+			Envelope:      envelope,
+			EnvelopeHash:  hash,
+		}
+		record, disposition, err := backend.Claim(ctx, proposed, time.Now().UTC())
+		if err != nil {
+			t.Fatalf("retry Claim() against sanitized row: %v", err)
+		}
+		if disposition != store.ClaimCommitted {
+			t.Fatalf("retry disposition = %v, want ClaimCommitted (idempotent, already stored)", disposition)
+		}
+		if len(record.RecipientUINs) != 1 || record.RecipientUINs[0] != survivorUIN {
+			t.Fatalf("Claim() returned recipients %v, want only the sanitized survivor [%d]", record.RecipientUINs, survivorUIN)
+		}
+
+		if countErasureIndex(wipedUIN) != 0 {
+			t.Fatal("sender retry recreated the wiped uin's erasure-index entry -- indexes must never be recreated by a retry")
+		}
+		secondTTL, _, _ := readState()
+		if secondTTL > firstTTL {
+			t.Fatalf("Claim() retry extended TTL: first=%d second=%d", firstTTL, secondTTL)
+		}
+	})
 }

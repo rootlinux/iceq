@@ -199,6 +199,7 @@ services:
       - ./init/migrations/012_durable_message_ingest.cql:/init/012-durable-message-ingest.cql:ro
       - ./init/migrations/013_group_recipient_snapshot.cql:/init/013-group-recipient-snapshot.cql:ro
       - ./init/migrations/017_user_erasure_indexes.cql:/init/017-user-erasure-indexes.cql:ro
+      - ./init/migrations/018_message_ingest_recipient_sanitized.cql:/init/018-message-ingest-recipient-sanitized.cql:ro
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -253,6 +254,9 @@ services:
         apply_tolerant_alter 013-group-recipient-snapshot
         echo "[scylla-init] applying erasure indexes (017)"
         cqlsh scylla 9042 -f /init/017-user-erasure-indexes.cql
+        # 018 ALTERs message_ingest (created by 012) -- must run after it,
+        # same tolerant-ALTER handling as 010/011/013 above.
+        apply_tolerant_alter 018-message-ingest-recipient-sanitized
         echo "[scylla-init] schema applied successfully"
     logging: *default-logging
 

@@ -1,0 +1,14 @@
+-- Non-identifying marker for panic-wipe group-recipient sanitization.
+--
+-- When a group recipient is erased, recipient_uins on the sender's
+-- message_ingest receipt is reduced in place (the wiped uin removed). This
+-- flag records only that a reduction happened -- never which uin was
+-- removed, never a count, never anything that could re-identify the erased
+-- user. A sender retry (same sender_uin + client_id) checks this flag before
+-- comparing the row's recipient_uins against its own cached original list,
+-- so a legitimate retry is recognized as idempotent instead of rejected as
+-- a conflicting membership change. See message-service/store/durable_ingest.go
+-- (IngestRecipientErased, recipientSnapshotCompatible) and
+-- auth-service/handlers/scyllastore.go (deleteIngestReceipts) for the two
+-- sides of this contract.
+ALTER TABLE iceq.message_ingest ADD recipient_set_sanitized BOOLEAN;
