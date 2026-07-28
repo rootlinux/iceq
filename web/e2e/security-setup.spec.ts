@@ -4,42 +4,68 @@ import {
   assertHermeticNetwork,
   installSyntheticAPI,
   seedSyntheticIdentity,
+  type SyntheticUser,
 } from "./helpers";
 
 test.use({ serviceWorkers: "block" });
 
 const SECURITY_PASSPHRASE = "BrowserSecurityPassphrase1";
+const ACCOUNT_PASSWORD = "synthetic-account-password";
 
-async function startUnconfiguredSession(page: Page): Promise<void> {
+// Both helpers take an explicit `user` (defaulting to the module-level
+// SYNTHETIC_USER for the existing single-context tests) so they stay
+// correct when a future test drives two isolated browser contexts through
+// the same setup flow at once: every write they make -- IndexedDB
+// identity, security vault, wipe key -- goes through `page`, which
+// Playwright already scopes per browser context, and `user` controls which
+// account's directory entry / session gets seeded. Nothing here reads or
+// writes shared module state, so two concurrent calls with two different
+// (page, user) pairs cannot cross-contaminate each other's identity, vault
+// or wipe key.
+async function startUnconfiguredSession(page: Page, user: SyntheticUser = SYNTHETIC_USER): Promise<void> {
   await page.goto("/login");
-  await seedSyntheticIdentity(page, SYNTHETIC_USER, { completeSecuritySetup: false });
-  await page.evaluate(async (user) => {
+  await seedSyntheticIdentity(page, user, { completeSecuritySetup: false });
+  await page.evaluate(async (account) => {
     const { useAuthStore } = await import("/src/store/authStore.ts");
     await useAuthStore.getState().setSession(
-      { uin: user.uin, username: user.username },
-      user.accessToken,
-      user.refreshToken,
+      { uin: account.uin, username: account.username },
+      account.accessToken,
+      account.refreshToken,
     );
-  }, SYNTHETIC_USER);
+  }, user);
   await expect(page).toHaveURL(/\/setup$/);
   await expect(page.getByRole("heading", { name: "Security Setup" })).toBeVisible();
 }
 
-async function completeSecuritySetup(page: Page): Promise<void> {
+// Drives the real SecuritySetupGate step order end to end -- intro ->
+// passphrase -> wipekey -> recovery -> confirm (see the SetupStep comment
+// in SecuritySetupGate.tsx). Every step performs its real client-side
+// crypto and network call through the synthetic API boundary installed by
+// installSyntheticAPI: a real local vault is created from the passphrase,
+// a real Ed25519 wipe key pair is generated and its public half uploaded,
+// and a real recovery package is generated from the real local identity.
+// Nothing here reads gate-internal state, sets the completion flag
+// directly, or short-circuits key generation/verification.
+async function completeSecuritySetup(page: Page, user: SyntheticUser = SYNTHETIC_USER): Promise<void> {
   await page.getByRole("button", { name: "Begin Setup" }).click();
   await page.locator("#setup-passphrase").fill(SECURITY_PASSPHRASE);
   await page.locator("#setup-passphrase-confirm").fill(SECURITY_PASSPHRASE);
   await page.getByRole("button", { name: "Continue" }).click();
 
+  // "wipekey" step: real account-password reauthentication, real Ed25519
+  // key generation, real signed enrollment upload -- see
+  // SecuritySetupGate.tsx's handleEnableWipeKey.
+  await page.locator("#setup-account-password").fill(ACCOUNT_PASSWORD);
+  await page.getByRole("button", { name: "Enable Panic Wipe" }).click();
+
   await page.getByRole("button", { name: "Generate Recovery Key & Package" }).click();
   await expect(page.getByText("Recovery Key", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "I Have Saved Both" }).click();
 
-  await page.locator("#setup-account-password").fill("synthetic-account-password");
   await page.getByText("I have saved my Recovery Key", { exact: false }).click();
   await page.getByRole("button", { name: "Complete Setup" }).click();
   await expect(page).toHaveURL(/\/app(?:\/|$)/);
-  await expect(page.getByText(SYNTHETIC_USER.username, { exact: false })).toBeVisible();
+  await expect(page.getByText(user.username, { exact: false })).toBeVisible();
 }
 
 async function openSettings(page: Page, testInfo: TestInfo): Promise<void> {
@@ -65,7 +91,7 @@ test("first login remains gated until security setup is durably completed", asyn
   });
   expect(enrollment).not.toBeNull();
   expect(enrollment?.public_key).toMatch(/^[A-Za-z0-9+/]{43}=$/);
-  expect(enrollment?.password).toBe("synthetic-account-password");
+  expect(enrollment?.password).toBe(ACCOUNT_PASSWORD);
 
   const stored = await page.evaluate(async () => {
     const idb = await import("/src/lib/indexeddb.ts");

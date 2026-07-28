@@ -40,6 +40,18 @@ declare global {
     __iceqE2ENetwork: BrowserNetworkEvidence;
     __iceqE2ENativeFetch: typeof fetch;
     __iceqE2EQueuePollEnvelope?: (envelope: unknown) => void;
+    // Set by e2e/bridge/e2eBridge.ts when it's loaded (production-build
+    // projects only -- see seedSyntheticIdentity's viaBridge fallback).
+    // Declared via `typeof import(...)` (a type-only query, no runtime
+    // import) rather than importing that module's own global augmentation,
+    // so helpers.ts stays independent of whether the bridge module is ever
+    // reachable by static analysis.
+    __iceqE2EBridge?: {
+      indexeddb: typeof import("../src/lib/indexeddb");
+      signal: typeof import("../src/lib/signal");
+      authStore: typeof import("../src/store/authStore");
+      signalStore: typeof import("../src/store/signalStore");
+    };
   }
 }
 
@@ -256,8 +268,16 @@ export async function seedSyntheticIdentity(
   options: { completeSecuritySetup?: boolean } = {},
 ): Promise<void> {
   const seeded = await page.evaluate(async ({ account, completeSecuritySetup }) => {
-    const idb = await import("/src/lib/indexeddb.ts");
-    const signal = await import("/src/lib/signal.ts");
+    // Dev-server source paths first (every project except
+    // e2e/production/*); fall back to the production bridge's window
+    // global (see e2e/bridge/e2eBridge.ts, built by ICEQ_E2E=1) when those
+    // 404, which only happens against a real `vite preview` build.
+    async function viaBridge<K extends keyof NonNullable<Window["__iceqE2EBridge"]>>(key: K) {
+      await import("/e2e-bridge.js");
+      return window.__iceqE2EBridge![key];
+    }
+    const idb = await import("/src/lib/indexeddb.ts").catch(() => viaBridge("indexeddb"));
+    const signal = await import("/src/lib/signal.ts").catch(() => viaBridge("signal"));
     const namespace = { uin: account.uin, deviceId: await idb.loadOrCreateDeviceId() };
     const identity = await signal.generateIdentityKeyPair();
     const registrationId = signal.generateRegistrationId();
@@ -275,9 +295,15 @@ export async function seedSyntheticIdentity(
 }
 
 export async function assertSignalHealthy(page: Page): Promise<void> {
-  await expect.poll(() => page.evaluate(async () => (
-    await import("/src/store/signalStore.ts")
-  ).useSignalStore.getState().ready)).toBe(true);
+  await expect.poll(() => page.evaluate(async () => {
+    // See seedSyntheticIdentity's viaBridge comment: dev-server source
+    // path first, production bridge window global as fallback.
+    const signalStore = await import("/src/store/signalStore.ts").catch(async () => {
+      await import("/e2e-bridge.js");
+      return window.__iceqE2EBridge!.signalStore;
+    });
+    return signalStore.useSignalStore.getState().ready;
+  })).toBe(true);
   await expect(page.getByRole("alert"), "authenticated synthetic shell must not surface bootstrap errors").toHaveCount(0);
 }
 
@@ -287,7 +313,12 @@ export async function authenticateSynthetic(page: Page): Promise<SyntheticNetwor
   await expect(page.getByRole("heading", { name: "Sign in to IceQ" })).toBeVisible();
   await seedSyntheticIdentity(page, SYNTHETIC_USER);
   await page.evaluate(async (user) => {
-    const { useAuthStore } = await import("/src/store/authStore.ts");
+    // See seedSyntheticIdentity's viaBridge comment: dev-server source
+    // path first, production bridge window global as fallback.
+    const { useAuthStore } = await import("/src/store/authStore.ts").catch(async () => {
+      await import("/e2e-bridge.js");
+      return window.__iceqE2EBridge!.authStore;
+    });
     await useAuthStore.getState().setSession(
       { uin: user.uin, username: user.username },
       user.accessToken,

@@ -17,18 +17,27 @@ import path from "node:path";
 const E2E_PROBE_PATHS = new Set(["/api/e2e-cache-probe", "/ws/e2e-cache-probe"]);
 
 function e2eProbeSink(): Plugin {
+  // configureServer wires this into `vite` (the dev server); preview mode
+  // uses a separate Connect app entirely, so the production-build service
+  // worker E2E test (which serves via `vite preview`, not `vite dev`)
+  // needs the same middleware registered through configurePreviewServer
+  // too, or its cache probes 404 instead of returning 204.
+  const respondToProbe = (request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse, next: () => void): void => {
+    const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+    if (request.headers["x-iceq-e2e-cache-probe"] !== "1" || !E2E_PROBE_PATHS.has(pathname)) {
+      next();
+      return;
+    }
+    response.statusCode = 204;
+    response.end();
+  };
   return {
     name: "iceq-e2e-probe-sink",
     configureServer(server) {
-      server.middlewares.use((request, response, next) => {
-        const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
-        if (request.headers["x-iceq-e2e-cache-probe"] !== "1" || !E2E_PROBE_PATHS.has(pathname)) {
-          next();
-          return;
-        }
-        response.statusCode = 204;
-        response.end();
-      });
+      server.middlewares.use(respondToProbe);
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(respondToProbe);
     },
   };
 }
@@ -48,6 +57,24 @@ export default defineConfig(({ mode }) => ({
     sourcemap: mode === "development",
     // The default chunking is fine; we don't have a giant vendor
     // pool, and aggressive code splitting just makes dev harder.
+    //
+    // ICEQ_E2E=1 adds a second, independent entry point (see
+    // e2e/bridge/e2eBridge.ts) that re-exports the app modules the E2E
+    // helpers need to reach directly when running against this real build
+    // via `vite preview` instead of `vite dev`. It's never linked from
+    // index.html or any app code, so it changes nothing about what a real
+    // deploy (built without ICEQ_E2E set) ships.
+    rollupOptions: process.env.ICEQ_E2E === "1" ? {
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        e2eBridge: path.resolve(__dirname, "e2e/bridge/e2eBridge.ts"),
+      },
+      output: {
+        entryFileNames: (chunkInfo) => (
+          chunkInfo.name === "e2eBridge" ? "e2e-bridge.js" : "assets/[name]-[hash].js"
+        ),
+      },
+    } : undefined,
   },
   server: {
     port: 5173,
