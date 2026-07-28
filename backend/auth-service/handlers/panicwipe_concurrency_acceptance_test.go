@@ -24,13 +24,21 @@
 // retry loop, not Scylla collection subtraction (whose interaction with
 // USING TTL was not verified against this project's real Scylla version).
 //
-// These tests prove the fix at two levels:
+// These tests prove the fix at three levels:
 //   - deterministic: call the single-CAS-attempt building block directly
 //     with two conflicting reads of the same stale snapshot and prove
 //     exactly one applies;
-//   - real concurrent: run two full wipes from goroutines released by a
-//     shared barrier, repeated multiple times, against both message_ingest
-//     and group_message_outbox.
+//   - real concurrent, one survivor: run two full wipes from goroutines
+//     released by a shared barrier, repeated multiple times, against both
+//     message_ingest and group_message_outbox, always leaving one
+//     recipient behind to prove convergence;
+//   - real concurrent, full exhaustion: the same shared-barrier release,
+//     but wiping BOTH of a row's only two recipients at once, driving the
+//     group-exhaustion/terminalize CAS branch in
+//     sanitizeGroupIngestRecipients and the empty-list DELETE branch in
+//     sanitizeGroupOutboxRecipients -- statement shapes no other test
+//     exercises -- across the TTL, no-TTL, and already-expired paths the
+//     schema permits.
 //
 // Several subtests deliberately leave a uin's erasure index pointing at a
 // row that was never successfully cleaned up (unrecognized message_kind,
@@ -200,6 +208,16 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 			t.Fatalf("count message_ingest_erasure_index: %v", err)
 		}
 		return count
+	}
+
+	readIngestTombstoneFields := func(t *testing.T, senderUIN int64, clientID string) (receiverUIN int64, conversationID string, envelope, envelopeHash []byte) {
+		t.Helper()
+		iter := session.Query(`SELECT receiver_uin, conversation_id, envelope, envelope_hash FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
+		iter.Scan(&receiverUIN, &conversationID, &envelope, &envelopeHash)
+		if err := iter.Close(); err != nil {
+			t.Fatalf("read message_ingest tombstone fields: %v", err)
+		}
+		return
 	}
 
 	seedGroupOutboxRow := func(t *testing.T, senderUIN int64, recipients []int64, clientIDSuffix string, ttlSeconds int) (bucket int8, createdAt time.Time, msgID gocql.UUID) {
@@ -469,7 +487,6 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 		if got := countIngestErasureIndex(t, uinA); got != 0 {
 			t.Fatalf("repeated wipe recreated the erasure index for an already-wiped uin: %d rows", got)
 		}
-		_ = uinB // seeded as a fellow recipient; not wiped in this subtest
 	})
 
 	// ---------------------------------------------------------------------
@@ -535,7 +552,6 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 		if got := countIngestErasureIndex(t, uinA); got == 0 {
 			t.Fatal("erasure index for uin A was deleted despite the wipe step failing -- a retried wipe job would never find this row again")
 		}
-		_, _ = uinB, uinC // seeded fellow recipients; not wiped in this subtest
 	})
 
 	// ---------------------------------------------------------------------
@@ -567,7 +583,6 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 		if sanitized {
 			t.Fatal("recipient_set_sanitized = true after a cancelled-context wipe attempt, want untouched (false)")
 		}
-		_, _ = uinB, uinC // seeded fellow recipients; not wiped in this subtest
 	})
 
 	// ---------------------------------------------------------------------
@@ -711,6 +726,415 @@ func TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects(t *testing.T) {
 				stillFound, stillRecipients := readGroupOutboxRow(t, bucket, createdAt, msgID)
 				t.Fatalf("row still alive past its original %ds TTL plus %s margin -- concurrent race made it permanent or extended it; found=%v recipients=%v",
 					originalTTL, expiryMargin, stillFound, stillRecipients)
+			}
+		})
+	})
+
+	// ---------------------------------------------------------------------
+	// Concurrent wipe of the LAST TWO recipients (full exhaustion). Every
+	// test above deliberately leaves one survivor (3 recipients, wipe 2) to
+	// prove convergence -- none of them ever drive a row's recipient list
+	// to zero, so the group-exhaustion/terminalize CAS branch in
+	// sanitizeGroupIngestRecipients (the 7-column UPDATE ... IF
+	// recipient_uins = ?) and the empty-list DELETE branch in
+	// sanitizeGroupOutboxRecipients had never actually run against real
+	// Scylla. These two subtests close that gap, each across the three
+	// paths the schema permits: a row with time remaining, a row with no
+	// expiry configured at all, and a row already past its own expiry.
+	// ---------------------------------------------------------------------
+	t.Run("message_ingest: concurrent wipe of the last two recipients terminalizes the row", func(t *testing.T) {
+		t.Run("row has time remaining", func(t *testing.T) {
+			uinA, uinB, _, senderUIN := freshUINs()
+			clientID := "exhaustion-ingest-ttl"
+			expiresAt, _ := seedGroupIngestRow(t, senderUIN, []int64{uinA, uinB}, clientID, 3600)
+
+			wipe := func(uin int64) func() error {
+				return func() error { return msgStore.DeleteUserMessages(ctx, uin) }
+			}
+			for j, err := range runReleasedTogether(wipe(uinA), wipe(uinB)) {
+				if err != nil {
+					t.Fatalf("concurrent wipe worker %d: %v", j, err)
+				}
+			}
+
+			found, recipients, sanitized, state, gotExpiresAt := readGroupIngestRow(t, senderUIN, clientID)
+			if !found {
+				t.Fatal("row gone after exhaustion wipe -- the PK (sender_uin, client_id) must persist as the minimum sender-scoped idempotency record")
+			}
+			if state != ingestRecipientErasedState {
+				t.Fatalf("state = %q, want terminal %q", state, ingestRecipientErasedState)
+			}
+			if !sanitized {
+				t.Fatal("recipient_set_sanitized = false, want true")
+			}
+			if len(recipients) != 0 {
+				t.Fatalf("recipient_uins = %v, want empty -- both wiped recipients must be gone", recipients)
+			}
+			if !gotExpiresAt.Equal(expiresAt) {
+				t.Fatalf("expires_at = %v, want unchanged original %v -- a retry must never extend TTL", gotExpiresAt, expiresAt)
+			}
+			receiverUIN, conversationID, envelope, envelopeHash := readIngestTombstoneFields(t, senderUIN, clientID)
+			if receiverUIN != 0 {
+				t.Fatalf("receiver_uin = %d, want cleared", receiverUIN)
+			}
+			if conversationID != "" {
+				t.Fatalf("conversation_id = %q, want cleared", conversationID)
+			}
+			if len(envelope) != 0 {
+				t.Fatalf("envelope = %q, want cleared -- ciphertext must not survive terminalization", envelope)
+			}
+			if len(envelopeHash) != 0 {
+				t.Fatalf("envelope_hash = %x, want cleared", envelopeHash)
+			}
+			if got := countIngestErasureIndex(t, uinA); got != 0 {
+				t.Fatalf("message_ingest_erasure_index for wiped uin A still has %d rows", got)
+			}
+			if got := countIngestErasureIndex(t, uinB); got != 0 {
+				t.Fatalf("message_ingest_erasure_index for wiped uin B still has %d rows", got)
+			}
+
+			var ttl int
+			iter := session.Query(`SELECT TTL(recipient_set_sanitized) FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
+			iter.Scan(&ttl)
+			if err := iter.Close(); err != nil {
+				t.Fatalf("read TTL: %v", err)
+			}
+			if ttl <= 0 || ttl > 3600 {
+				t.Fatalf("TTL(recipient_set_sanitized) after exhaustion = %d, want in (0, 3600] -- the terminal CAS write must preserve the original TTL, not extend or drop it", ttl)
+			}
+
+			// Retry both cleanups: idempotency and no resurrection.
+			if err := msgStore.DeleteUserMessages(ctx, uinA); err != nil {
+				t.Fatalf("repeated wipe of A: %v", err)
+			}
+			if err := msgStore.DeleteUserMessages(ctx, uinB); err != nil {
+				t.Fatalf("repeated wipe of B: %v", err)
+			}
+			found, recipients, sanitized, state, gotExpiresAt = readGroupIngestRow(t, senderUIN, clientID)
+			if !found {
+				t.Fatal("row gone after repeated cleanup")
+			}
+			if state != ingestRecipientErasedState || !sanitized || len(recipients) != 0 || !gotExpiresAt.Equal(expiresAt) {
+				t.Fatalf("repeated cleanup changed terminal state: state=%q sanitized=%v recipients=%v expiresAt=%v", state, sanitized, recipients, gotExpiresAt)
+			}
+			if got := countIngestErasureIndex(t, uinA); got != 0 {
+				t.Fatalf("repeated wipe recreated the erasure index for wiped uin A: %d rows", got)
+			}
+			if got := countIngestErasureIndex(t, uinB); got != 0 {
+				t.Fatalf("repeated wipe recreated the erasure index for wiped uin B: %d rows", got)
+			}
+		})
+
+		t.Run("row has no expiry configured", func(t *testing.T) {
+			uinA, uinB, _, senderUIN := freshUINs()
+			clientID := "exhaustion-ingest-no-ttl"
+			groupID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			msgID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			createdAt := time.Now().UTC().Truncate(time.Millisecond)
+			envelope := []byte("no-ttl-exhaustion-envelope")
+			hash := sha256.Sum256(envelope)
+			// No "USING TTL" clause and no expires_at value: a permanent
+			// receipt, which sanitizeIngestReceipt's expiresAt.IsZero()
+			// check exists specifically to treat as "not expired" rather
+			// than skip. Schema permits this: expires_at is a plain
+			// nullable TIMESTAMP
+			// (deploy/init/migrations/012_durable_message_ingest.cql).
+			if err := session.Query(`INSERT INTO message_ingest
+				(sender_uin, client_id, message_kind, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, state, owner_token, lease_until)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				senderUIN, clientID, "group", groupID, int64(1), []int64{uinA, uinB},
+				envelope, hash[:], msgID, createdAt, "stored", msgID, createdAt,
+			).WithContext(ctx).Exec(); err != nil {
+				t.Fatalf("seed no-TTL message_ingest: %v", err)
+			}
+			for _, indexUIN := range []int64{uinA, uinB, senderUIN} {
+				if err := session.Query(`INSERT INTO message_ingest_erasure_index (uin, sender_uin, client_id) VALUES (?, ?, ?) USING TTL 3600`,
+					indexUIN, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
+					t.Fatalf("seed message_ingest_erasure_index (uin %d): %v", indexUIN, err)
+				}
+			}
+
+			wipe := func(uin int64) func() error {
+				return func() error { return msgStore.DeleteUserMessages(ctx, uin) }
+			}
+			for j, err := range runReleasedTogether(wipe(uinA), wipe(uinB)) {
+				if err != nil {
+					t.Fatalf("concurrent wipe worker %d: %v", j, err)
+				}
+			}
+
+			found, recipients, sanitized, state, gotExpiresAt := readGroupIngestRow(t, senderUIN, clientID)
+			if !found {
+				t.Fatal("row gone after exhaustion wipe of a no-expiry row")
+			}
+			if state != ingestRecipientErasedState || !sanitized || len(recipients) != 0 {
+				t.Fatalf("no-expiry row not correctly terminalized: state=%q sanitized=%v recipients=%v", state, sanitized, recipients)
+			}
+			if !gotExpiresAt.IsZero() {
+				t.Fatalf("expires_at = %v, want still unset -- terminalizing a no-expiry row must not introduce one", gotExpiresAt)
+			}
+			gotReceiverUIN, gotConversationID, gotEnvelope, gotEnvelopeHash := readIngestTombstoneFields(t, senderUIN, clientID)
+			if gotReceiverUIN != 0 || gotConversationID != "" || len(gotEnvelope) != 0 || len(gotEnvelopeHash) != 0 {
+				t.Fatalf("no-expiry row tombstone fields not cleared: receiver_uin=%d conversation_id=%q envelope=%q envelope_hash=%x", gotReceiverUIN, gotConversationID, gotEnvelope, gotEnvelopeHash)
+			}
+
+			// The write must have used the plain (non-"USING TTL") CAS
+			// statement variant: proving this behaviorally against a real
+			// TTL() read, not by inspecting the query string.
+			var ttl int
+			iter := session.Query(`SELECT TTL(recipient_set_sanitized) FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
+			iter.Scan(&ttl)
+			if err := iter.Close(); err != nil {
+				t.Fatalf("read TTL: %v", err)
+			}
+			if ttl != 0 {
+				t.Fatalf("TTL(recipient_set_sanitized) = %d, want 0 (no expiry) -- the CAS write for a no-expiry row must not introduce a fresh TTL", ttl)
+			}
+			if got := countIngestErasureIndex(t, uinA); got != 0 {
+				t.Fatalf("message_ingest_erasure_index for wiped uin A still has %d rows", got)
+			}
+			if got := countIngestErasureIndex(t, uinB); got != 0 {
+				t.Fatalf("message_ingest_erasure_index for wiped uin B still has %d rows", got)
+			}
+
+			if err := msgStore.DeleteUserMessages(ctx, uinA); err != nil {
+				t.Fatalf("repeated wipe of A: %v", err)
+			}
+			if err := msgStore.DeleteUserMessages(ctx, uinB); err != nil {
+				t.Fatalf("repeated wipe of B: %v", err)
+			}
+			found, recipients, sanitized, state, gotExpiresAt = readGroupIngestRow(t, senderUIN, clientID)
+			if !found || state != ingestRecipientErasedState || !sanitized || len(recipients) != 0 || !gotExpiresAt.IsZero() {
+				t.Fatalf("repeated cleanup changed terminal state: found=%v state=%q sanitized=%v recipients=%v expiresAt=%v", found, state, sanitized, recipients, gotExpiresAt)
+			}
+		})
+
+		t.Run("row already past its own expiry", func(t *testing.T) {
+			uinA, uinB, _, senderUIN := freshUINs()
+			clientID := "exhaustion-ingest-expired"
+			groupID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			msgID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			createdAt := time.Now().UTC().Truncate(time.Millisecond)
+			// The STORED expires_at is in the past, but the row carries a
+			// long real CQL TTL so it stays queryable for this assertion --
+			// deliberately exercising the "remaining <= 0 -> skip" branch
+			// without racing real wall-clock expiry (mirrors the
+			// already-established group_message_outbox equivalent in
+			// panicwipe_acceptance_test.go).
+			staleExpiresAt := createdAt.Add(-time.Hour)
+			envelope := []byte("expired-exhaustion-envelope")
+			hash := sha256.Sum256(envelope)
+			if err := session.Query(`INSERT INTO message_ingest
+				(sender_uin, client_id, message_kind, group_id, crypto_epoch, recipient_uins, envelope, envelope_hash, message_id, created_at, expires_at, state, owner_token, lease_until)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 3600`,
+				senderUIN, clientID, "group", groupID, int64(1), []int64{uinA, uinB},
+				envelope, hash[:], msgID, createdAt, staleExpiresAt, "stored", msgID, createdAt,
+			).WithContext(ctx).Exec(); err != nil {
+				t.Fatalf("seed stale message_ingest: %v", err)
+			}
+			for _, indexUIN := range []int64{uinA, uinB, senderUIN} {
+				if err := session.Query(`INSERT INTO message_ingest_erasure_index (uin, sender_uin, client_id) VALUES (?, ?, ?) USING TTL 3600`,
+					indexUIN, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
+					t.Fatalf("seed message_ingest_erasure_index (uin %d): %v", indexUIN, err)
+				}
+			}
+
+			wipe := func(uin int64) func() error {
+				return func() error { return msgStore.DeleteUserMessages(ctx, uin) }
+			}
+			for j, err := range runReleasedTogether(wipe(uinA), wipe(uinB)) {
+				if err != nil {
+					t.Fatalf("concurrent wipe of an already-expired row worker %d: %v", j, err)
+				}
+			}
+
+			// Left exactly as seeded: skip, don't mutate. Both wiped uins
+			// are still allowed to be present here -- the row is about to
+			// vanish via its own already-past expiry, so mutating it (and
+			// risking a fresh/permanent TTL landing on it) is unnecessary
+			// and risky. This must never reach the exhaustion/terminalize
+			// CAS branch at all.
+			found, recipients, sanitized, state, gotExpiresAt := readGroupIngestRow(t, senderUIN, clientID)
+			if !found {
+				t.Fatal("already-expired row was deleted -- must be left untouched, not removed")
+			}
+			if state != "stored" {
+				t.Fatalf("state = %q, want unchanged %q -- an expired row must never be terminalized", state, "stored")
+			}
+			if sanitized {
+				t.Fatal("recipient_set_sanitized = true on an already-expired row that should have been left untouched")
+			}
+			if len(recipients) != 2 {
+				t.Fatalf("recipient_uins = %v, want both original recipients untouched", recipients)
+			}
+			if !gotExpiresAt.Equal(staleExpiresAt) {
+				t.Fatalf("expires_at = %v, want unchanged stale value %v", gotExpiresAt, staleExpiresAt)
+			}
+
+			// A retried wipe on the same still-expired row is equally safe.
+			if err := msgStore.DeleteUserMessages(ctx, uinA); err != nil {
+				t.Fatalf("repeated wipe of an already-expired row: %v", err)
+			}
+			found, recipients, _, state, _ = readGroupIngestRow(t, senderUIN, clientID)
+			if !found || state != "stored" || len(recipients) != 2 {
+				t.Fatalf("repeated wipe of an already-expired row changed it: found=%v state=%q recipients=%v", found, state, recipients)
+			}
+		})
+	})
+
+	t.Run("group_message_outbox: concurrent wipe of the last two recipients deletes the row", func(t *testing.T) {
+		t.Run("row has time remaining", func(t *testing.T) {
+			uinA, uinB, _, senderUIN := freshUINs()
+			bucket, createdAt, msgID := seedGroupOutboxRow(t, senderUIN, []int64{uinA, uinB}, "exhaustion-ttl", 3600)
+
+			wipe := func(uin int64) func() error {
+				return func() error { return msgStore.DeleteUserGroupMessages(ctx, uin) }
+			}
+			for j, err := range runReleasedTogether(wipe(uinA), wipe(uinB)) {
+				if err != nil {
+					t.Fatalf("concurrent wipe worker %d: %v", j, err)
+				}
+			}
+
+			if found, recipients := readGroupOutboxRow(t, bucket, createdAt, msgID); found {
+				t.Fatalf("group_message_outbox row still exists after both recipients wiped, recipients=%v -- an exhausted row must be deleted", recipients)
+			}
+			if got := countOutboxErasureIndex(t, uinA); got != 0 {
+				t.Fatalf("group_message_outbox_erasure_index for wiped uin A still has %d rows", got)
+			}
+			if got := countOutboxErasureIndex(t, uinB); got != 0 {
+				t.Fatalf("group_message_outbox_erasure_index for wiped uin B still has %d rows", got)
+			}
+
+			// Repeat cleanup safely: the row is already gone, both calls
+			// must be no-ops, not errors.
+			if err := msgStore.DeleteUserGroupMessages(ctx, uinA); err != nil {
+				t.Fatalf("repeated wipe of A after deletion: %v", err)
+			}
+			if err := msgStore.DeleteUserGroupMessages(ctx, uinB); err != nil {
+				t.Fatalf("repeated wipe of B after deletion: %v", err)
+			}
+			if found, _ := readGroupOutboxRow(t, bucket, createdAt, msgID); found {
+				t.Fatal("row resurrected by a repeated cleanup call")
+			}
+		})
+
+		t.Run("row has no expiry configured", func(t *testing.T) {
+			uinA, uinB, _, senderUIN := freshUINs()
+			groupID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			msgID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			createdAt := time.Now().UTC().Truncate(time.Millisecond)
+			bucket := int8(msgID[0] & 15)
+			// No "USING TTL" clause and no expires_at value: a permanent
+			// outbox row. Schema permits this: expires_at is a plain
+			// nullable TIMESTAMP.
+			if err := session.Query(`INSERT INTO group_message_outbox
+				(bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				bucket, createdAt, msgID, groupID, senderUIN, "outbox-no-ttl", 1,
+				[]int64{uinA, uinB}, []byte("env"), []byte("hash12345678901234567890123456789012"), "pending",
+			).WithContext(ctx).Exec(); err != nil {
+				t.Fatalf("seed no-TTL group_message_outbox: %v", err)
+			}
+			for _, indexUIN := range []int64{uinA, uinB} {
+				if err := session.Query(`INSERT INTO group_message_outbox_erasure_index (uin, bucket, created_at, message_id, role) VALUES (?, ?, ?, ?, ?) USING TTL 3600`,
+					indexUIN, bucket, createdAt, msgID, "recipient").WithContext(ctx).Exec(); err != nil {
+					t.Fatalf("seed group_message_outbox_erasure_index (uin %d): %v", indexUIN, err)
+				}
+			}
+
+			wipe := func(uin int64) func() error {
+				return func() error { return msgStore.DeleteUserGroupMessages(ctx, uin) }
+			}
+			for j, err := range runReleasedTogether(wipe(uinA), wipe(uinB)) {
+				if err != nil {
+					t.Fatalf("concurrent wipe worker %d: %v", j, err)
+				}
+			}
+
+			if found, recipients := readGroupOutboxRow(t, bucket, createdAt, msgID); found {
+				t.Fatalf("no-expiry group_message_outbox row still exists after both recipients wiped, recipients=%v", recipients)
+			}
+			if got := countOutboxErasureIndex(t, uinA); got != 0 {
+				t.Fatalf("group_message_outbox_erasure_index for wiped uin A still has %d rows", got)
+			}
+			if got := countOutboxErasureIndex(t, uinB); got != 0 {
+				t.Fatalf("group_message_outbox_erasure_index for wiped uin B still has %d rows", got)
+			}
+		})
+
+		t.Run("row already past its own expiry", func(t *testing.T) {
+			uinA, uinB, _, senderUIN := freshUINs()
+			groupID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			msgID, err := gocql.RandomUUID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			createdAt := time.Now().UTC().Truncate(time.Millisecond)
+			bucket := int8(msgID[0] & 15)
+			staleExpiresAt := createdAt.Add(-time.Hour)
+			if err := session.Query(`INSERT INTO group_message_outbox
+				(bucket, created_at, message_id, group_id, sender_uin, client_id, crypto_epoch, recipient_uins, envelope, envelope_hash, state, expires_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 3600`,
+				bucket, createdAt, msgID, groupID, senderUIN, "outbox-expired", 1,
+				[]int64{uinA, uinB}, []byte("env"), []byte("hash12345678901234567890123456789012"), "pending", staleExpiresAt,
+			).WithContext(ctx).Exec(); err != nil {
+				t.Fatalf("seed stale group_message_outbox: %v", err)
+			}
+			for _, indexUIN := range []int64{uinA, uinB} {
+				if err := session.Query(`INSERT INTO group_message_outbox_erasure_index (uin, bucket, created_at, message_id, role) VALUES (?, ?, ?, ?, ?) USING TTL 3600`,
+					indexUIN, bucket, createdAt, msgID, "recipient").WithContext(ctx).Exec(); err != nil {
+					t.Fatalf("seed group_message_outbox_erasure_index (uin %d): %v", indexUIN, err)
+				}
+			}
+
+			wipe := func(uin int64) func() error {
+				return func() error { return msgStore.DeleteUserGroupMessages(ctx, uin) }
+			}
+			for j, err := range runReleasedTogether(wipe(uinA), wipe(uinB)) {
+				if err != nil {
+					t.Fatalf("concurrent wipe of an already-expired row worker %d: %v", j, err)
+				}
+			}
+
+			// Left exactly as seeded: an already-expired row must never
+			// reach the exhaustion/DELETE branch, even when both of its
+			// recipients are wiped at once.
+			found, recipients := readGroupOutboxRow(t, bucket, createdAt, msgID)
+			if !found {
+				t.Fatal("already-expired group_message_outbox row was deleted -- must be left untouched, not removed by the exhaustion path")
+			}
+			if len(recipients) != 2 {
+				t.Fatalf("recipient_uins = %v, want both original recipients untouched", recipients)
+			}
+
+			if err := msgStore.DeleteUserGroupMessages(ctx, uinA); err != nil {
+				t.Fatalf("repeated wipe of an already-expired row: %v", err)
+			}
+			found, recipients = readGroupOutboxRow(t, bucket, createdAt, msgID)
+			if !found || len(recipients) != 2 {
+				t.Fatalf("repeated wipe of an already-expired row changed it: found=%v recipients=%v", found, recipients)
 			}
 		})
 	})
