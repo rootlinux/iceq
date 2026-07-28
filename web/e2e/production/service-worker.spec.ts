@@ -102,9 +102,12 @@ test("production build serves a valid, linked PWA manifest", async ({ page }) =>
 
   // Every declared icon must actually be served by the production build,
   // not just referenced -- a broken icon path fails PWA installability
-  // checks silently in real browsers.
+  // checks silently in real browsers. Assert src is non-empty first: a
+  // blank fallback would resolve to the origin root, which trivially 200s
+  // via index.html and would mask a malformed manifest entry.
   for (const icon of manifest.icons ?? []) {
-    const iconResponse = await page.request.get(new URL(icon.src ?? "", PROD_ORIGIN).toString());
+    expect(icon.src, `manifest icon entry ${JSON.stringify(icon)} must declare a src`).toBeTruthy();
+    const iconResponse = await page.request.get(new URL(icon.src!, PROD_ORIGIN).toString());
     expect(iconResponse.status(), `manifest icon ${icon.src} must be served`).toBe(200);
   }
 });

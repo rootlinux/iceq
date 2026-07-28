@@ -39,8 +39,13 @@ func TestScyllaWipeUsesUINPartitionedIndexesWithoutAllowFiltering(t *testing.T) 
 // locks in the shape of the group-recipient wipe path: every write that
 // touches a still-live message_ingest row must carry an explicit USING TTL
 // (an UPDATE without one makes the touched cells non-expiring -- see
-// remainingIngestTTLSeconds), must be guarded by IF EXISTS, and must record
-// sanitization only via the non-identifying recipient_set_sanitized marker.
+// remainingIngestTTLSeconds), must be a compare-and-set conditioned on the
+// exact recipient_uins value just read (not a bare IF EXISTS, which only
+// guards row existence and allowed a lost-update race between two
+// concurrent wipe workers -- see maxRecipientSanitizeCASAttempts and
+// TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects), and must
+// record sanitization only via the non-identifying recipient_set_sanitized
+// marker.
 func TestScyllaGroupRecipientSanitizationPreservesTTLAndUsesNonIdentifyingMarker(t *testing.T) {
 	src, err := os.ReadFile("scyllastore.go")
 	if err != nil {
@@ -49,14 +54,24 @@ func TestScyllaGroupRecipientSanitizationPreservesTTLAndUsesNonIdentifyingMarker
 	s := string(src)
 
 	for _, want := range []string{
-		// Partial sanitize: recipients remain, TTL-preserving variant.
-		"UPDATE message_ingest USING TTL ? SET recipient_uins = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF EXISTS",
-		// Terminalize (direct tombstone / group exhausted), TTL-preserving variant.
-		"UPDATE message_ingest USING TTL ? SET state = ?, receiver_uin = ?, conversation_id = ?, recipient_uins = ?, envelope = ?, envelope_hash = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF EXISTS",
+		// Partial sanitize: recipients remain. Both TTL and non-TTL (durable
+		// row) CAS variants, each conditioned on the recipient_uins value
+		// just read -- this is sanitizeGroupIngestRecipients, called only
+		// from the group branch (the direct branch has exactly one
+		// receiver_uin and cannot race, so it keeps terminalizeIngestReceipt's
+		// plain IF EXISTS -- see the sibling function's own doc comment).
+		"UPDATE message_ingest SET recipient_uins = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF recipient_uins = ?",
+		"UPDATE message_ingest USING TTL ? SET recipient_uins = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF recipient_uins = ?",
+		// Terminalize (group exhausted), same CAS conditioning, both variants.
+		"UPDATE message_ingest SET state = ?, receiver_uin = ?, conversation_id = ?, recipient_uins = ?, envelope = ?, envelope_hash = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF recipient_uins = ?",
+		"UPDATE message_ingest USING TTL ? SET state = ?, receiver_uin = ?, conversation_id = ?, recipient_uins = ?, envelope = ?, envelope_hash = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF recipient_uins = ?",
 		// The marker itself, and the shared terminal state contract with
 		// message-service/store's IngestRecipientErased.
 		"recipient_set_sanitized",
 		`ingestRecipientErasedState = "recipient_erased"`,
+		// The CAS retry bound and its context-cancellation guard.
+		"maxRecipientSanitizeCASAttempts",
+		"ctx.Err()",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing sanitization contract %q", want)
@@ -96,11 +111,17 @@ func TestScyllaGroupOutboxRecipientRemovalPreservesTTL(t *testing.T) {
 
 	for _, want := range []string{
 		"SELECT recipient_uins, expires_at FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ?",
-		"UPDATE group_message_outbox USING TTL ? SET recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS",
+		// CAS-conditioned on the exact recipient_uins value just read, not a
+		// bare IF EXISTS -- see TestAcceptanceGroupRecipientConcurrentWipeNeverResurrects.
+		"UPDATE group_message_outbox USING TTL ? SET recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF recipient_uins = ?",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing group outbox TTL-preservation contract %q", want)
 		}
+	}
+
+	if strings.Contains(s, "recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS") {
+		t.Fatal("group_message_outbox recipient_uins UPDATE must be CAS-conditioned on the read value (IF recipient_uins = ?), not a bare IF EXISTS")
 	}
 }
 

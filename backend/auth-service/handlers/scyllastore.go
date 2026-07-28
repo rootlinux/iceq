@@ -121,6 +121,19 @@ func (s *ScyllaMessageStore) DeleteUserGroupMessages(ctx context.Context, uin in
 // message-service/store/durable_ingest.go's IngestRecipientErased.
 const ingestRecipientErasedState = "recipient_erased"
 
+// maxRecipientSanitizeCASAttempts bounds the read-compute-CAS retry loop
+// used to remove a wiped uin from a group recipient list shared with other
+// live recipients (message_ingest.recipient_uins,
+// group_message_outbox.recipient_uins). Two wipe workers can legitimately
+// process different recipients of the same group message concurrently (see
+// wipejob.go's FOR UPDATE SKIP LOCKED), so a single compare-and-set attempt
+// conditioned on a stale read can lose the race to a concurrent writer. On
+// loss the caller re-reads and retries. Exhausting this bound returns an
+// error instead of reporting false success, so the wipe job is retried
+// later by the durable wipe-job worker rather than silently leaving the uin
+// in the list.
+const maxRecipientSanitizeCASAttempts = 8
+
 // deleteIngestReceipts removes or sanitizes durable ingest idempotency
 // receipts for the given UIN. The message_ingest table is partitioned by
 // (sender_uin, client_id); we use the erasure index to discover the
@@ -168,6 +181,15 @@ func (s *ScyllaMessageStore) deleteIngestReceipts(ctx context.Context, uin int64
 // wipe-worker retries, or two different recipients of the same group message
 // wiped in separate operations): every branch either no-ops on a row that's
 // already gone, already terminal, or no longer references the uin.
+//
+// The group branch is a bounded read-compute-CAS retry loop, not a single
+// read-modify-write: two wipe workers processing different recipients of the
+// SAME group row can run concurrently (see wipejob.go's FOR UPDATE SKIP
+// LOCKED), and a plain "UPDATE ... IF EXISTS" only guards row existence, not
+// the recipient_uins value each worker read. Without the CAS condition, the
+// second writer's UPDATE can silently overwrite the first's removal with a
+// stale list, resurrecting an already-wiped recipient with no future retry
+// to catch it -- see sanitizeGroupIngestRecipients.
 func (s *ScyllaMessageStore) sanitizeIngestReceipt(ctx context.Context, senderUIN int64, clientID string, wipedUIN int64) error {
 	if senderUIN == wipedUIN {
 		if err := s.session.Query(`DELETE FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Exec(); err != nil {
@@ -176,48 +198,79 @@ func (s *ScyllaMessageStore) sanitizeIngestReceipt(ctx context.Context, senderUI
 		return nil
 	}
 
-	var kind, state string
-	var receiverUIN int64
-	var recipientUINs []int64
-	var expiresAt time.Time
-	readIter := s.session.Query(`SELECT message_kind, receiver_uin, recipient_uins, state, expires_at FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
-	found := readIter.Scan(&kind, &receiverUIN, &recipientUINs, &state, &expiresAt)
-	if err := readIter.Close(); err != nil {
-		return fmt.Errorf("read ingest receipt: %w", err)
-	}
-	if !found {
-		// Already gone -- delivered and cleaned up, or a previous wipe pass
-		// already handled it. Safe to repeat.
-		return nil
-	}
-	if state == ingestRecipientErasedState {
-		// Already terminalized by an earlier wipe pass. Idempotent no-op.
-		return nil
-	}
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("sanitize ingest receipt: %w", err)
+		}
+		if attempt >= maxRecipientSanitizeCASAttempts {
+			return fmt.Errorf("sanitize ingest receipt: exhausted %d CAS attempts under contention for sender_uin=%d client_id=%s -- caller must retry this wipe job later", maxRecipientSanitizeCASAttempts, senderUIN, clientID)
+		}
 
-	now := time.Now().UTC()
-	remaining := remainingIngestTTLSeconds(expiresAt, now)
-	if !expiresAt.IsZero() && remaining <= 0 {
-		// Already past its own expiry -- let it expire naturally rather
-		// than writing a fresh TTL that would resurrect it.
-		return nil
-	}
-
-	if kind == "direct" {
-		if receiverUIN != wipedUIN {
-			// This uin isn't referenced by this receipt in a role we
-			// recognize; leave it untouched.
+		var kind, state string
+		var receiverUIN int64
+		var recipientUINs []int64
+		var expiresAt time.Time
+		readIter := s.session.Query(`SELECT message_kind, receiver_uin, recipient_uins, state, expires_at FROM message_ingest WHERE sender_uin = ? AND client_id = ?`, senderUIN, clientID).WithContext(ctx).Iter()
+		found := readIter.Scan(&kind, &receiverUIN, &recipientUINs, &state, &expiresAt)
+		if err := readIter.Close(); err != nil {
+			return fmt.Errorf("read ingest receipt: %w", err)
+		}
+		if !found {
+			// Already gone -- delivered and cleaned up, or a previous wipe pass
+			// already handled it. Safe to repeat.
 			return nil
 		}
-		return s.terminalizeIngestReceipt(ctx, senderUIN, clientID, remaining)
-	}
+		if state == ingestRecipientErasedState {
+			// Already terminalized by an earlier wipe pass. Idempotent no-op.
+			return nil
+		}
 
-	// Group: remove the wiped uin from recipient_uins. Order of the
-	// remaining recipients is not meaningful downstream (Claim() compares
-	// it only when NOT sanitized), so a filtered append is sufficient.
-	filtered := make([]int64, 0, len(recipientUINs))
+		now := time.Now().UTC()
+		remaining := remainingIngestTTLSeconds(expiresAt, now)
+		if !expiresAt.IsZero() && remaining <= 0 {
+			// Already past its own expiry -- let it expire naturally rather
+			// than writing a fresh TTL that would resurrect it.
+			return nil
+		}
+
+		switch kind {
+		case "direct":
+			if receiverUIN != wipedUIN {
+				// This uin isn't referenced by this receipt in a role we
+				// recognize; leave it untouched.
+				return nil
+			}
+			// A direct receipt has exactly one receiver_uin, so no two
+			// concurrent wipes can ever target the same row here -- a plain
+			// IF EXISTS is sufficient, no CAS/retry needed.
+			return s.terminalizeIngestReceipt(ctx, senderUIN, clientID, remaining)
+		case "group":
+			applied, err := s.sanitizeGroupIngestRecipients(ctx, senderUIN, clientID, wipedUIN, recipientUINs, remaining)
+			if err != nil {
+				return err
+			}
+			if applied {
+				return nil
+			}
+			// Lost the race to a concurrent wipe of a different recipient on
+			// this same row. Re-read the current state and retry.
+		default:
+			return fmt.Errorf("sanitize ingest receipt: unrecognized message_kind %q for sender_uin=%d client_id=%s", kind, senderUIN, clientID)
+		}
+	}
+}
+
+// sanitizeGroupIngestRecipients performs ONE compare-and-set attempt that
+// removes wipedUIN from a group message_ingest row's recipient_uins,
+// conditioned on the exact list previousRecipients (the value the caller just
+// read). Returns applied=false -- not an error -- when a concurrent wipe of a
+// different recipient on the same row committed first; the caller re-reads
+// and retries. recipient_set_sanitized is written in the same CAS statement
+// as recipient_uins so the two are never observed out of sync.
+func (s *ScyllaMessageStore) sanitizeGroupIngestRecipients(ctx context.Context, senderUIN int64, clientID string, wipedUIN int64, previousRecipients []int64, remaining int64) (bool, error) {
+	filtered := make([]int64, 0, len(previousRecipients))
 	removed := false
-	for _, r := range recipientUINs {
+	for _, r := range previousRecipients {
 		if r == wipedUIN {
 			removed = true
 			continue
@@ -225,23 +278,34 @@ func (s *ScyllaMessageStore) sanitizeIngestReceipt(ctx context.Context, senderUI
 		filtered = append(filtered, r)
 	}
 	if !removed {
-		// Already absent from the current recipient set.
-		return nil
-	}
-	if len(filtered) == 0 {
-		return s.terminalizeIngestReceipt(ctx, senderUIN, clientID, remaining)
+		// Already absent from the list this attempt read -- a concurrent
+		// wipe already removed it. Idempotent success.
+		return true, nil
 	}
 
-	query := `UPDATE message_ingest SET recipient_uins = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF EXISTS`
-	args := []any{filtered, true, senderUIN, clientID}
-	if remaining > 0 {
-		query = `UPDATE message_ingest USING TTL ? SET recipient_uins = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF EXISTS`
-		args = append([]any{remaining}, args...)
+	var query string
+	var args []any
+	if len(filtered) == 0 {
+		query = `UPDATE message_ingest SET state = ?, receiver_uin = ?, conversation_id = ?, recipient_uins = ?, envelope = ?, envelope_hash = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF recipient_uins = ?`
+		args = []any{ingestRecipientErasedState, nil, nil, nil, nil, nil, true, senderUIN, clientID, previousRecipients}
+		if remaining > 0 {
+			query = `UPDATE message_ingest USING TTL ? SET state = ?, receiver_uin = ?, conversation_id = ?, recipient_uins = ?, envelope = ?, envelope_hash = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF recipient_uins = ?`
+			args = []any{remaining, ingestRecipientErasedState, nil, nil, nil, nil, nil, true, senderUIN, clientID, previousRecipients}
+		}
+	} else {
+		query = `UPDATE message_ingest SET recipient_uins = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF recipient_uins = ?`
+		args = []any{filtered, true, senderUIN, clientID, previousRecipients}
+		if remaining > 0 {
+			query = `UPDATE message_ingest USING TTL ? SET recipient_uins = ?, recipient_set_sanitized = ? WHERE sender_uin = ? AND client_id = ? IF recipient_uins = ?`
+			args = []any{remaining, filtered, true, senderUIN, clientID, previousRecipients}
+		}
 	}
-	if err := s.session.Query(query, args...).WithContext(ctx).Exec(); err != nil {
-		return fmt.Errorf("sanitize group recipient_uins: %w", err)
+
+	applied, err := s.session.Query(query, args...).WithContext(ctx).Consistency(gocql.Quorum).SerialConsistency(gocql.Serial).MapScanCAS(map[string]any{})
+	if err != nil {
+		return false, fmt.Errorf("sanitize group recipient_uins CAS: %w", err)
 	}
-	return nil
+	return applied, nil
 }
 
 // terminalizeIngestReceipt converts a receipt to the same sanitized terminal
@@ -337,75 +401,64 @@ func (s *ScyllaMessageStore) deleteGroupOutboxEntries(ctx context.Context, uin i
 				return fmt.Errorf("delete group outbox (sender): %w", err)
 			}
 		case "recipient":
-			// Read the current recipient_uins list and expires_at, remove
-			// this UIN, and UPDATE or DELETE the row. Use IF EXISTS so a
-			// concurrent delivery (which deletes the row entirely) does not
-			// race. expires_at is read so the UPDATE below can carry an
-			// explicit USING TTL -- an UPDATE without one writes its
-			// touched cells with NO ttl, silently turning an expiring row
-			// permanent (group_message_outbox has no table-level
-			// default_time_to_live).
-			var currentRecipients []int64
-			var expiresAt time.Time
-			readIter := s.session.Query(`SELECT recipient_uins, expires_at FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ?`, bucket, createdAt, messageID).WithContext(ctx).Iter()
-			found := readIter.Scan(&currentRecipients, &expiresAt)
-			if err := readIter.Close(); err != nil {
-				_ = iter.Close()
-				return fmt.Errorf("read group outbox recipients: %w", err)
-			}
-			if !found {
-				// Already gone -- delivered and cleaned up, or a previous
-				// wipe pass already handled it. Safe to repeat.
-				continue
-			}
-
-			now := time.Now().UTC()
-			remaining := remainingIngestTTLSeconds(expiresAt, now)
-			if !expiresAt.IsZero() && remaining <= 0 {
-				// Already past its own expiry -- let it expire naturally
-				// rather than writing a fresh TTL that would resurrect it.
-				continue
-			}
-
-			// Remove the wiped UIN from the list.
-			filtered := make([]int64, 0, len(currentRecipients))
-			removed := false
-			for _, r := range currentRecipients {
-				if r == uin {
-					removed = true
-					continue
-				}
-				filtered = append(filtered, r)
-			}
-			if !removed {
-				// Already absent from the current recipient set (a
-				// previous wipe pass already handled it).
-				continue
-			}
-
-			if len(filtered) == 0 {
-				// No valid recipients remain — delete the row. A DELETE
-				// carries no TTL semantics, so no resurrection risk here.
-				if err := s.session.Query(`DELETE FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS`, bucket, createdAt, messageID).WithContext(ctx).Exec(); err != nil {
+			// Bounded read-compute-CAS retry loop, not a single
+			// read-modify-write: two wipe workers processing different
+			// recipients of the SAME group outbox row can run concurrently
+			// (see wipejob.go's FOR UPDATE SKIP LOCKED), and a plain
+			// "UPDATE ... IF EXISTS" only guards row existence, not the
+			// recipient_uins value each worker read. Without the CAS
+			// condition, the second writer's UPDATE can silently overwrite
+			// the first's removal with a stale list, resurrecting an
+			// already-wiped recipient -- see sanitizeGroupOutboxRecipients.
+			for attempt := 0; ; attempt++ {
+				if err := ctx.Err(); err != nil {
 					_ = iter.Close()
-					return fmt.Errorf("delete empty group outbox: %w", err)
+					return fmt.Errorf("group outbox recipient sanitize: %w", err)
 				}
-			} else {
-				// Other recipients remain — UPDATE with the reduced list,
-				// preserving the row's remaining TTL explicitly (or writing
-				// no TTL at all when the row was durable/non-expiring by
-				// design, i.e. expiresAt.IsZero()). IF EXISTS guards
-				// against concurrent delivery.
-				query := `UPDATE group_message_outbox SET recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS`
-				args := []any{filtered, bucket, createdAt, messageID}
-				if remaining > 0 {
-					query = `UPDATE group_message_outbox USING TTL ? SET recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS`
-					args = append([]any{remaining}, args...)
-				}
-				if err := s.session.Query(query, args...).WithContext(ctx).Exec(); err != nil {
+				if attempt >= maxRecipientSanitizeCASAttempts {
 					_ = iter.Close()
-					return fmt.Errorf("update group outbox recipients: %w", err)
+					return fmt.Errorf("group outbox recipient sanitize: exhausted %d CAS attempts under contention for bucket=%d created_at=%v message_id=%s -- caller must retry this wipe job later", maxRecipientSanitizeCASAttempts, bucket, createdAt, messageID)
 				}
+
+				// Read the current recipient_uins list and expires_at.
+				// expires_at is read so the CAS write below can carry an
+				// explicit USING TTL -- an UPDATE without one writes its
+				// touched cells with NO ttl, silently turning an expiring
+				// row permanent (group_message_outbox has no table-level
+				// default_time_to_live).
+				var currentRecipients []int64
+				var expiresAt time.Time
+				readIter := s.session.Query(`SELECT recipient_uins, expires_at FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ?`, bucket, createdAt, messageID).WithContext(ctx).Iter()
+				found := readIter.Scan(&currentRecipients, &expiresAt)
+				if err := readIter.Close(); err != nil {
+					_ = iter.Close()
+					return fmt.Errorf("read group outbox recipients: %w", err)
+				}
+				if !found {
+					// Already gone -- delivered and cleaned up, or a
+					// previous wipe pass (ours or a concurrent one) already
+					// removed it. Safe to repeat.
+					break
+				}
+
+				now := time.Now().UTC()
+				remaining := remainingIngestTTLSeconds(expiresAt, now)
+				if !expiresAt.IsZero() && remaining <= 0 {
+					// Already past its own expiry -- let it expire naturally
+					// rather than writing a fresh TTL that would resurrect it.
+					break
+				}
+
+				applied, err := s.sanitizeGroupOutboxRecipients(ctx, bucket, createdAt, messageID, uin, currentRecipients, remaining)
+				if err != nil {
+					_ = iter.Close()
+					return err
+				}
+				if applied {
+					break
+				}
+				// Lost the race to a concurrent wipe of a different
+				// recipient on this same row. Re-read and retry.
 			}
 		default:
 			// Unknown role — delete the index entry but leave the data row
@@ -421,4 +474,52 @@ func (s *ScyllaMessageStore) deleteGroupOutboxEntries(ctx context.Context, uin i
 		return fmt.Errorf("delete group outbox erasure index: %w", err)
 	}
 	return nil
+}
+
+// sanitizeGroupOutboxRecipients performs ONE compare-and-set attempt that
+// removes uin from a group_message_outbox row's recipient_uins, conditioned
+// on the exact list previousRecipients (the value the caller just read).
+// Returns applied=false -- not an error -- when a concurrent wipe of a
+// different recipient on the same row committed first; the caller re-reads
+// and retries.
+//
+// The empty-list branch deletes the row outright instead of CAS-conditioning
+// on recipient_uins: a DELETE has no partial state to lose, so IF EXISTS is
+// sufficient there -- if it doesn't apply, the row is already gone (a
+// concurrent delivery cleanup or another wipe worker's own delete), which is
+// exactly the desired end state, not contention to retry.
+func (s *ScyllaMessageStore) sanitizeGroupOutboxRecipients(ctx context.Context, bucket int8, createdAt time.Time, messageID gocql.UUID, uin int64, previousRecipients []int64, remaining int64) (bool, error) {
+	filtered := make([]int64, 0, len(previousRecipients))
+	removed := false
+	for _, r := range previousRecipients {
+		if r == uin {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	if !removed {
+		// Already absent from the list this attempt read -- a concurrent
+		// wipe already removed it. Idempotent success.
+		return true, nil
+	}
+
+	if len(filtered) == 0 {
+		if err := s.session.Query(`DELETE FROM group_message_outbox WHERE bucket = ? AND created_at = ? AND message_id = ? IF EXISTS`, bucket, createdAt, messageID).WithContext(ctx).Exec(); err != nil {
+			return false, fmt.Errorf("delete empty group outbox: %w", err)
+		}
+		return true, nil
+	}
+
+	query := `UPDATE group_message_outbox SET recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF recipient_uins = ?`
+	args := []any{filtered, bucket, createdAt, messageID, previousRecipients}
+	if remaining > 0 {
+		query = `UPDATE group_message_outbox USING TTL ? SET recipient_uins = ? WHERE bucket = ? AND created_at = ? AND message_id = ? IF recipient_uins = ?`
+		args = []any{remaining, filtered, bucket, createdAt, messageID, previousRecipients}
+	}
+	applied, err := s.session.Query(query, args...).WithContext(ctx).Consistency(gocql.Quorum).SerialConsistency(gocql.Serial).MapScanCAS(map[string]any{})
+	if err != nil {
+		return false, fmt.Errorf("update group outbox recipients CAS: %w", err)
+	}
+	return applied, nil
 }
