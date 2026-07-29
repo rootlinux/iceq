@@ -564,6 +564,9 @@ export async function resetPeerSignalState(peerUin: number, ns:CryptoNamespace):
   const address = `${peerUin}.1`;
   await idbDelete(db, STORE_SESSIONS, cryptoRecordKey(ns,"session",address));
   await idbDelete(db, STORE_PEER_IDENTITIES, cryptoRecordKey(ns,"peer-identity",address));
+  // Peer identities are pinned under the canonical bare-uin key (see
+  // lookupPeerIdentity) — the qualified delete above alone would miss it.
+  await idbDelete(db, STORE_PEER_IDENTITIES, cryptoRecordKey(ns,"peer-identity",String(peerUin)));
   db.close();
 }
 
@@ -593,12 +596,14 @@ export async function acceptPendingPeerIdentity(peerUin: number, fingerprint: st
 export async function assertInboundIdentityTrusted(peerUin: number, identityKey: ArrayBuffer, operationNs:CryptoNamespace): Promise<void> {
   const db = await openDB();
   const ns=operationNs;
-  const qualified = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, cryptoRecordKey(ns,"peer-identity",`${peerUin}.1`));
-  const bare = qualified ?? await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, cryptoRecordKey(ns,"peer-identity",String(peerUin)));
+  const resolved = await lookupPeerIdentity(db, ns, peerUin);
   const trustKey=cryptoRecordKey(ns,"peer-trust",peerUin); const trust = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, trustKey);
   const incomingFingerprint = signalIdentityToWire(identityKey);
-  if (bare && !arrayBufferEquals(bare.publicKey, identityKey)) {
-    db.close(); await persistInboundIdentityChange(String(peerUin), bare.publicKey, identityKey,ns); throw new Error("peer identity changed");
+  if (resolved.conflict) {
+    db.close(); await persistInboundIdentityChange(peerUin, resolved.conflict.canonical.publicKey, resolved.conflict.legacy.publicKey,ns); throw new Error("peer identity changed");
+  }
+  if (resolved.record && !arrayBufferEquals(resolved.record.publicKey, identityKey)) {
+    db.close(); await persistInboundIdentityChange(peerUin, resolved.record.publicKey, identityKey,ns); throw new Error("peer identity changed");
   }
   if (trust && (trust.pendingFingerprint !== undefined || trust.fingerprint !== incomingFingerprint)) {
     await idbPut(db, STORE_PEER_TRUST, { ...trust, pendingFingerprint: incomingFingerprint, updatedAt: Date.now() } satisfies StoredPeerTrust, trustKey);
@@ -607,11 +612,48 @@ export async function assertInboundIdentityTrusted(peerUin: number, identityKey:
   db.close();
 }
 
-async function persistInboundIdentityChange(identifier: string, oldKey: ArrayBuffer, newKey: ArrayBuffer, ns:CryptoNamespace): Promise<void> {
+// Peer identities have historically been keyed by whichever string shape a
+// caller happened to use ("<uin>" or "<uin>.<deviceId>"). The privacyresearch
+// library itself is inconsistent about this: SessionBuilder/SessionCipher
+// read via address.getName()/.name (bare) but write via address.toString()
+// (qualified), so a bare read could never see a qualified write or vice
+// versa — isTrustedIdentity's rotation check was silently inert. The
+// canonical key is always the bare uin; "<uin>.1" is the only legacy shape
+// (this codebase only ever uses device id 1).
+function canonicalPeerUin(identifier: string): number {
   const match = /^(\d+)(?:\.\d+)?$/.exec(identifier);
-  if (!match) return;
-  const peerUin = Number(match[1]);
-  if (!Number.isSafeInteger(peerUin) || peerUin <= 0) return;
+  const peerUin = match ? Number(match[1]) : NaN;
+  if (!Number.isSafeInteger(peerUin) || peerUin <= 0) throw new Error("invalid peer identifier");
+  return peerUin;
+}
+
+interface PeerIdentityLookup {
+  record: StoredPeerIdentity | undefined;
+  legacyKey: string | undefined;
+  conflict: { canonical: StoredPeerIdentity; legacy: StoredPeerIdentity } | undefined;
+}
+
+// Resolves both possible keys for a peer identity against the canonical
+// bare-uin key. If only the legacy qualified key holds a record, it's
+// treated as the peer's existing identity (for saveIdentity to consolidate
+// onto the canonical key). If both exist and disagree, that's an
+// unresolved ambiguity -- fail closed rather than silently preferring
+// either side.
+async function lookupPeerIdentity(db: IDBDatabase, ns: CryptoNamespace, peerUin: number): Promise<PeerIdentityLookup> {
+  const canonicalKey = cryptoRecordKey(ns, "peer-identity", String(peerUin));
+  const legacyKey = cryptoRecordKey(ns, "peer-identity", `${peerUin}.1`);
+  const canonical = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, canonicalKey);
+  const legacy = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, legacyKey);
+  if (canonical && legacy) {
+    if (arrayBufferEquals(canonical.publicKey, legacy.publicKey)) return { record: canonical, legacyKey, conflict: undefined };
+    return { record: undefined, legacyKey: undefined, conflict: { canonical, legacy } };
+  }
+  if (canonical) return { record: canonical, legacyKey: undefined, conflict: undefined };
+  if (legacy) return { record: legacy, legacyKey, conflict: undefined };
+  return { record: undefined, legacyKey: undefined, conflict: undefined };
+}
+
+async function persistInboundIdentityChange(peerUin: number, oldKey: ArrayBuffer, newKey: ArrayBuffer, ns:CryptoNamespace): Promise<void> {
   const db = await openDB();
   const trustKey=cryptoRecordKey(ns,"peer-trust",peerUin); const existing = await idbGet<StoredPeerTrust>(db, STORE_PEER_TRUST, trustKey);
   const now = Date.now();
@@ -993,12 +1035,17 @@ export class IndexedDBSignalProtocolStore implements StorageType {
     identityKey: ArrayBuffer,
     _direction: Direction,
   ): Promise<boolean> {
+    const peerUin = canonicalPeerUin(identifier);
     const db = await openDB();
-    const existing = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, cryptoRecordKey(this.namespace, "peer-identity", identifier));
+    const resolved = await lookupPeerIdentity(db, this.namespace, peerUin);
     db.close();
-    if (!existing) return true; // first sighting — accept and let saveIdentity pin it
-    if (arrayBufferEquals(existing.publicKey, identityKey)) return true;
-    await persistInboundIdentityChange(identifier, existing.publicKey, identityKey,this.namespace);
+    if (resolved.conflict) {
+      await persistInboundIdentityChange(peerUin, resolved.conflict.canonical.publicKey, resolved.conflict.legacy.publicKey, this.namespace);
+      return false;
+    }
+    if (!resolved.record) return true; // first sighting — accept and let saveIdentity pin it
+    if (arrayBufferEquals(resolved.record.publicKey, identityKey)) return true;
+    await persistInboundIdentityChange(peerUin, resolved.record.publicKey, identityKey, this.namespace);
     return false;
   }
 
@@ -1007,18 +1054,30 @@ export class IndexedDBSignalProtocolStore implements StorageType {
     publicKey: ArrayBuffer,
     _nonblockingApproval?: boolean,
   ): Promise<boolean> {
+    const peerUin = canonicalPeerUin(encodedAddress);
     const db = await openDB();
-    const key = cryptoRecordKey(this.namespace, "peer-identity", encodedAddress);
-    const existing = await idbGet<StoredPeerIdentity>(db, STORE_PEER_IDENTITIES, key);
-    if (existing && !arrayBufferEquals(existing.publicKey, publicKey)) {
+    const resolved = await lookupPeerIdentity(db, this.namespace, peerUin);
+    if (resolved.conflict) {
+      db.close();
+      await persistInboundIdentityChange(peerUin, resolved.conflict.canonical.publicKey, resolved.conflict.legacy.publicKey, this.namespace);
+      return false;
+    }
+    if (resolved.record && !arrayBufferEquals(resolved.record.publicKey, publicKey)) {
       // Identity changed — refuse to overwrite. The peer needs
       // to re-init the session from a fresh bundle.
       db.close();
-      await persistInboundIdentityChange(encodedAddress, existing.publicKey, publicKey,this.namespace);
+      await persistInboundIdentityChange(peerUin, resolved.record.publicKey, publicKey, this.namespace);
       return false;
     }
-    const rec: StoredPeerIdentity = { publicKey, firstSeenAt: Date.now() };
-    await idbPut(db, STORE_PEER_IDENTITIES, rec, key);
+    // Always write the canonical (bare-uin) key and consolidate away any
+    // legacy qualified-shape record — callers (including libsignal itself,
+    // which reads bare and writes qualified) are inconsistent about which
+    // shape they pass, so the canonical key is the only one a later
+    // isTrustedIdentity lookup is guaranteed to find.
+    const canonicalKey = cryptoRecordKey(this.namespace, "peer-identity", String(peerUin));
+    const rec: StoredPeerIdentity = { publicKey, firstSeenAt: resolved.record?.firstSeenAt ?? Date.now() };
+    await idbPut(db, STORE_PEER_IDENTITIES, rec, canonicalKey);
+    if (resolved.legacyKey) await idbDelete(db, STORE_PEER_IDENTITIES, resolved.legacyKey);
     db.close();
     return true;
   }
