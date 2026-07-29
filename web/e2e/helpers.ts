@@ -171,6 +171,36 @@ export async function installSyntheticAPI(
         const contacts = JSON.parse(localStorage.getItem("__iceq_e2e_contacts") ?? "[]") as unknown[];
         return respondJSON({ contacts });
       }
+      if (url.pathname === "/api/contacts/" && request.method === "POST") {
+        const input = JSON.parse(body || "{}") as { target_uin?: number };
+        const targetUin = input.target_uin;
+        const selfUin = Number(localStorage.getItem("iceq_account_uin"));
+        if (typeof targetUin !== "number" || !Number.isFinite(targetUin) || targetUin <= 0) {
+          return respondJSON({ code: "FIELD_INVALID", error: "invalid target_uin" }, 422);
+        }
+        if (targetUin === selfUin) {
+          return respondJSON({ code: "SELF_CONTACT_FORBIDDEN", error: "cannot add self" }, 422);
+        }
+        const target = syntheticUsers.find((candidate) => candidate.uin === targetUin);
+        if (!target) return respondJSON({ code: "USER_NOT_FOUND", error: "user not found" }, 404);
+        const contacts = JSON.parse(localStorage.getItem("__iceq_e2e_contacts") ?? "[]") as Array<{ uin: number }>;
+        if (contacts.some((c) => c.uin === targetUin)) {
+          return respondJSON({ code: "CONTACT_EXISTS", error: "already added" }, 409);
+        }
+        contacts.push({ uin: targetUin, username: target.username, avatar_url: "", status: "pending", direction: "outgoing" });
+        localStorage.setItem("__iceq_e2e_contacts", JSON.stringify(contacts));
+        return respondJSON({ status: "pending" });
+      }
+      const acceptMatch = /^\/api\/contacts\/(\d+)\/accept$/.exec(url.pathname);
+      if (acceptMatch && request.method === "PUT") {
+        const targetUin = Number(acceptMatch[1]);
+        const contacts = JSON.parse(localStorage.getItem("__iceq_e2e_contacts") ?? "[]") as Array<{ uin: number; status: string; direction?: string }>;
+        const index = contacts.findIndex((c) => c.uin === targetUin && c.status === "pending" && c.direction === "incoming");
+        if (index === -1) return respondJSON({ code: "REQUEST_NOT_FOUND", error: "no pending request" }, 404);
+        contacts[index] = { ...contacts[index], status: "accepted", direction: "" };
+        localStorage.setItem("__iceq_e2e_contacts", JSON.stringify(contacts));
+        return respondJSON({ status: "accepted" });
+      }
       if (url.pathname === "/api/groups/" && request.method === "GET") return respondJSON({ groups: [] });
       if (/^\/api\/keys\/bundle\/\d+$/.test(url.pathname) && request.method === "GET") {
         const uin = url.pathname.split("/").at(-1) ?? "";
@@ -307,12 +337,16 @@ export async function assertSignalHealthy(page: Page): Promise<void> {
   await expect(page.getByRole("alert"), "authenticated synthetic shell must not surface bootstrap errors").toHaveCount(0);
 }
 
-export async function authenticateSynthetic(page: Page): Promise<SyntheticNetwork> {
-  const network = await installSyntheticAPI(page);
+export async function authenticateSynthetic(
+  page: Page,
+  user: SyntheticUser = SYNTHETIC_USER,
+  allUsers: SyntheticUser[] = [user],
+): Promise<SyntheticNetwork> {
+  const network = await installSyntheticAPI(page, allUsers);
   await page.goto("/login");
   await expect(page.getByRole("heading", { name: "Sign in to IceQ" })).toBeVisible();
-  await seedSyntheticIdentity(page, SYNTHETIC_USER);
-  await page.evaluate(async (user) => {
+  await seedSyntheticIdentity(page, user);
+  await page.evaluate(async (u) => {
     // See seedSyntheticIdentity's viaBridge comment: dev-server source
     // path first, production bridge window global as fallback.
     const { useAuthStore } = await import("/src/store/authStore.ts").catch(async () => {
@@ -320,13 +354,13 @@ export async function authenticateSynthetic(page: Page): Promise<SyntheticNetwor
       return window.__iceqE2EBridge!.authStore;
     });
     await useAuthStore.getState().setSession(
-      { uin: user.uin, username: user.username },
-      user.accessToken,
-      user.refreshToken,
+      { uin: u.uin, username: u.username },
+      u.accessToken,
+      u.refreshToken,
     );
-  }, SYNTHETIC_USER);
+  }, user);
   await expect(page).toHaveURL(/\/app(?:\/|$)/);
-  await expect(page.getByText(SYNTHETIC_USER.username, { exact: false })).toBeVisible();
+  await expect(page.getByText(user.username, { exact: false })).toBeVisible();
   await assertSignalHealthy(page);
   return network;
 }
