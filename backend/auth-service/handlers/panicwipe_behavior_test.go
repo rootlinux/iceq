@@ -186,6 +186,178 @@ func TestLeaseClaimAndReclaim(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Behavioral: wiped_accounts marker is inserted at claim time
+// ---------------------------------------------------------------------------
+
+// TestClaimPendingJobInsertsWipedAccountsMarker proves qClaimPendingJob's
+// wiped_accounts insert actually happens against real Postgres: nothing in
+// this codebase ever ran an INSERT INTO wiped_accounts before this change
+// (see TestPanicWipeNoLongerAnonymizesUserRow, which asserts PanicWipe
+// itself must never do it), so the table -- and the IsAccountWiped check
+// every service's BearerAuth relies on -- was permanently empty. This is
+// the fix: the marker appears the moment a worker claims the job, which is
+// as early as it can appear without touching panicwipe.go.
+func TestClaimPendingJobInsertsWipedAccountsMarker(t *testing.T) {
+	pool := testPool(t)
+	ensureWipeJobsTable(t, pool)
+
+	ctx := context.Background()
+	var usersExists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')`,
+	).Scan(&usersExists); err != nil || !usersExists {
+		t.Skip("users table not available in test database — skipping wiped_accounts behavioral test")
+	}
+
+	testUin := int64(100020)
+	insertTestUser(t, pool, testUin)
+	t.Cleanup(func() {
+		pool.Exec(ctx, `DELETE FROM wiped_accounts WHERE uin = $1`, testUin)
+		pool.Exec(ctx, `DELETE FROM users WHERE uin = $1`, testUin)
+	})
+
+	var jobID int64
+	if err := pool.QueryRow(ctx, qInsertWipeJob, testUin, []string{}).Scan(&jobID); err != nil {
+		t.Fatalf("insert test job: %v", err)
+	}
+
+	// Before claim: no marker.
+	var wiped bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM wiped_accounts WHERE uin = $1)`, testUin).Scan(&wiped); err != nil {
+		t.Fatalf("check wiped_accounts before claim: %v", err)
+	}
+	if wiped {
+		t.Fatal("wiped_accounts must not have a row before the job is claimed")
+	}
+
+	wID := "test-worker-marker"
+	leaseUntil := time.Now().Add(2 * time.Minute)
+	var claimedID, claimedUin int64
+	var fileKeys []string
+	var retryCount int
+	if err := pool.QueryRow(ctx, qClaimPendingJob, leaseUntil, wID).Scan(&claimedID, &claimedUin, &fileKeys, &retryCount); err != nil {
+		t.Fatalf("claim pending job: %v", err)
+	}
+	if claimedID != jobID {
+		t.Fatalf("claimed job %d, want %d", claimedID, jobID)
+	}
+
+	// After claim: marker exists.
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM wiped_accounts WHERE uin = $1)`, testUin).Scan(&wiped); err != nil {
+		t.Fatalf("check wiped_accounts after claim: %v", err)
+	}
+	if !wiped {
+		t.Fatal("wiped_accounts must have a row immediately after the job is claimed")
+	}
+	t.Logf("wiped_accounts marker present for uin %d after claim", testUin)
+
+	pool.Exec(ctx, qDeleteWipeJob, jobID, wID)
+}
+
+// TestClaimPendingJobMarkerSurvivesReclaimWithoutDuplication proves the
+// ON CONFLICT (uin) DO NOTHING guard: reclaiming an expired lease (the same
+// scenario TestLeaseClaimAndReclaim exercises) must not error on a marker
+// that a prior claim of the same job already inserted, and must not leave
+// more than one row behind.
+func TestClaimPendingJobMarkerSurvivesReclaimWithoutDuplication(t *testing.T) {
+	pool := testPool(t)
+	ensureWipeJobsTable(t, pool)
+
+	ctx := context.Background()
+	var usersExists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')`,
+	).Scan(&usersExists); err != nil || !usersExists {
+		t.Skip("users table not available in test database — skipping wiped_accounts behavioral test")
+	}
+
+	testUin := int64(100021)
+	insertTestUser(t, pool, testUin)
+	t.Cleanup(func() {
+		pool.Exec(ctx, `DELETE FROM wiped_accounts WHERE uin = $1`, testUin)
+		pool.Exec(ctx, `DELETE FROM users WHERE uin = $1`, testUin)
+	})
+
+	var jobID int64
+	if err := pool.QueryRow(ctx, qInsertWipeJob, testUin, []string{}).Scan(&jobID); err != nil {
+		t.Fatalf("insert test job: %v", err)
+	}
+
+	var uin int64
+	var fileKeys []string
+	var retryCount int
+	wID1 := "test-worker-reclaim-1"
+	if err := pool.QueryRow(ctx, qClaimPendingJob, time.Now().Add(2*time.Minute), wID1).Scan(&jobID, &uin, &fileKeys, &retryCount); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+
+	// Expire the lease and let a second worker reclaim it, exactly as
+	// TestLeaseClaimAndReclaim does.
+	if _, err := pool.Exec(ctx, `UPDATE wipe_jobs SET lease_until = NOW() - INTERVAL '1 second' WHERE id = $1`, jobID); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+	wID2 := "test-worker-reclaim-2"
+	if err := pool.QueryRow(ctx, qClaimPendingJob, time.Now().Add(2*time.Minute), wID2).Scan(&jobID, &uin, &fileKeys, &retryCount); err != nil {
+		t.Fatalf("reclaim must not fail on an already-marked uin: %v", err)
+	}
+
+	var markerCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM wiped_accounts WHERE uin = $1`, testUin).Scan(&markerCount); err != nil {
+		t.Fatalf("count wiped_accounts rows: %v", err)
+	}
+	if markerCount != 1 {
+		t.Fatalf("wiped_accounts row count = %d after reclaim, want exactly 1", markerCount)
+	}
+
+	pool.Exec(ctx, qDeleteWipeJob, jobID, wID2)
+}
+
+// TestClaimPendingJobSkipsMarkerWhenUserRowAlreadyGone covers the narrow
+// crash-recovery path documented in processOneJob: a worker can crash after
+// final erasure's Phase 1 (users + wiped_accounts already deleted) but
+// before Phase 3 deletes the wipe_job row, and a lease expiry lets another
+// worker reclaim that same job. wiped_accounts.uin has a FOREIGN KEY to
+// users(uin) (migration 005): an unconditional INSERT would make the claim
+// query itself fail with a FK violation in this scenario, permanently
+// stalling the job (a data-modifying CTE aborts the whole statement on
+// error, including the UPDATE that already claimed the row). The claim
+// query's marker insert is therefore guarded by
+// "WHERE EXISTS (SELECT 1 FROM users ...)" — this test proves that guard by
+// claiming a job whose uin was never given a users row at all, which must
+// still succeed and must leave wiped_accounts empty for that uin.
+func TestClaimPendingJobSkipsMarkerWhenUserRowAlreadyGone(t *testing.T) {
+	pool := testPool(t)
+	ensureWipeJobsTable(t, pool)
+
+	ctx := context.Background()
+	testUin := int64(100022)
+	// Deliberately do NOT insert a users row for testUin.
+
+	var jobID int64
+	if err := pool.QueryRow(ctx, qInsertWipeJob, testUin, []string{}).Scan(&jobID); err != nil {
+		t.Fatalf("insert test job: %v", err)
+	}
+
+	wID := "test-worker-orphan-uin"
+	var uin int64
+	var fileKeys []string
+	var retryCount int
+	if err := pool.QueryRow(ctx, qClaimPendingJob, time.Now().Add(2*time.Minute), wID).Scan(&jobID, &uin, &fileKeys, &retryCount); err != nil {
+		t.Fatalf("claim must succeed even when the user row is already gone (FK-guarded insert): %v", err)
+	}
+
+	var markerCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM wiped_accounts WHERE uin = $1`, testUin).Scan(&markerCount); err != nil {
+		t.Fatalf("count wiped_accounts rows: %v", err)
+	}
+	if markerCount != 0 {
+		t.Fatalf("wiped_accounts row count = %d for a uin with no users row, want 0", markerCount)
+	}
+
+	pool.Exec(ctx, qDeleteWipeJob, jobID, wID)
+}
+
+// ---------------------------------------------------------------------------
 // Behavioral: ownership-guarded renewal
 // ---------------------------------------------------------------------------
 

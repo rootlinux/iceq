@@ -162,8 +162,6 @@ func NewGetHistoryHandler(deps HistoryDeps) http.HandlerFunc {
 			writeError(w, http.StatusForbidden, "NOT_A_MEMBER", "requesting user is not a member of this conversation")
 			return
 		}
-		_ = otherUIN // not needed for the query path; the partition
-		// key (convID) is the same either way.
 
 		// --- Query ---------------------------------------------------
 		// 5 s is generous for a single-partition read on a
@@ -172,6 +170,30 @@ func NewGetHistoryHandler(deps HistoryDeps) http.HandlerFunc {
 		// coordinator or a network blip.
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
+
+		// Defense-in-depth: the requester's own token already proves they
+		// are not wiped (BearerAuth's jwt.Manager.Verify rejects a wiped
+		// requester before this handler ever runs). What that check cannot
+		// see is the OTHER party -- otherUIN may have been panic-wiped
+		// after this conversation's messages were sent but before physical
+		// Scylla cleanup (an async background job, see
+		// auth-service/handlers/wipejob.go) has caught up. Checking
+		// wiped_accounts here closes that window without waiting on
+		// cleanup. A wiped counterpart collapses to the exact same
+		// empty-page shape a legitimately exhausted or never-existent
+		// conversation returns -- never a distinct error -- so this can
+		// never be used as an oracle to learn that a specific UIN
+		// panic-wiped their account.
+		wiped, err := isAccountWiped(ctx, deps.PG, otherUIN)
+		if err != nil {
+			log.Printf("[message-service] check wiped_accounts: %v", err)
+			writeError(w, http.StatusInternalServerError, "STORE_ERROR", "could not fetch history")
+			return
+		}
+		if wiped {
+			writeHistoryResponse(w, convID, "", []store.MessageRow{}, false, dmRowToMessage)
+			return
+		}
 
 		rows, err := deps.Store.GetHistory(ctx, store.HistoryRequest{
 			ConversationID: convID,
@@ -273,7 +295,30 @@ func NewGetGroupHistoryHandler(deps HistoryDeps) http.HandlerFunc {
 			return
 		}
 
-		writeHistoryResponse(w, "", groupIDStr, rows, len(rows) < limit, groupRowToMessage)
+		// Defense-in-depth, same rationale as NewGetHistoryHandler: a
+		// message's sender may have been panic-wiped after sending but
+		// before async Scylla cleanup (auth-service/handlers/wipejob.go)
+		// deletes their authored rows. hasMore is captured from the
+		// unfiltered page -- it describes the real Scylla cursor position,
+		// which filtering afterward must not disturb.
+		hasMore := len(rows) < limit
+		wipedSenders, err := wipedUINsAmong(ctx, deps.PG, distinctSenderUINs(rows))
+		if err != nil {
+			log.Printf("[message-service] check wiped senders: %v", err)
+			writeError(w, http.StatusInternalServerError, "STORE_ERROR", "could not fetch group history")
+			return
+		}
+		if len(wipedSenders) > 0 {
+			filtered := make([]store.GroupMessageRow, 0, len(rows))
+			for _, row := range rows {
+				if !wipedSenders[row.SenderUIN] {
+					filtered = append(filtered, row)
+				}
+			}
+			rows = filtered
+		}
+
+		writeHistoryResponse(w, "", groupIDStr, rows, hasMore, groupRowToMessage)
 	}
 }
 
@@ -454,6 +499,61 @@ func isGroupMember(ctx context.Context, pg groupDB, groupID gocql.UUID, uin int6
 		return false, err
 	}
 	return true, nil
+}
+
+// isAccountWiped reports whether uin currently has an active wiped_accounts
+// marker. The row is inserted by auth-service's wipe-job worker the instant
+// a panic-wipe job is claimed (see auth-service/handlers/wipejob.go's
+// qClaimPendingJob) and removed once physical storage cleanup fully
+// completes -- see that file for the exact transient lifecycle and the
+// invariant that no permanent row survives. This mirrors shared/jwt's
+// IsAccountWiped (used by every service's BearerAuth to reject a wiped
+// REQUESTER's token) but answers a different question: whether the
+// CONVERSATION PEER, not the caller, has been wiped. It reuses the PG
+// connection this service already holds (HistoryDeps.PG) -- no new
+// cross-service dependency.
+func isAccountWiped(ctx context.Context, pg groupDB, uin int64) (bool, error) {
+	var wiped bool
+	err := pg.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM wiped_accounts WHERE uin = $1)`, uin).Scan(&wiped)
+	return wiped, err
+}
+
+// distinctSenderUINs returns the unique SenderUIN values present in rows, in
+// first-seen order. A history page holds at most maxHistoryLimit (50) rows,
+// so the result is always small and bounded.
+func distinctSenderUINs(rows []store.GroupMessageRow) []int64 {
+	seen := make(map[int64]bool, len(rows))
+	uins := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		if !seen[row.SenderUIN] {
+			seen[row.SenderUIN] = true
+			uins = append(uins, row.SenderUIN)
+		}
+	}
+	return uins
+}
+
+// wipedUINsAmong returns the subset of candidateUINs that currently have a
+// wiped_accounts marker, as a set for O(1) membership checks. One batched
+// query covers an entire history page instead of one query per row.
+func wipedUINsAmong(ctx context.Context, pg groupDB, candidateUINs []int64) (map[int64]bool, error) {
+	if len(candidateUINs) == 0 {
+		return nil, nil
+	}
+	rows, err := pg.Query(ctx, `SELECT uin FROM wiped_accounts WHERE uin = ANY($1)`, candidateUINs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	wiped := make(map[int64]bool)
+	for rows.Next() {
+		var uin int64
+		if err := rows.Scan(&uin); err != nil {
+			return nil, err
+		}
+		wiped[uin] = true
+	}
+	return wiped, rows.Err()
 }
 
 // writeError was here historically but moved to common.go

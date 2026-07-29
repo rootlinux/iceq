@@ -176,18 +176,37 @@ const (
 	qEnrollWipePublicKey = `INSERT INTO user_security_settings (uin, wipe_public_key) VALUES ($1, $2) ON CONFLICT (uin) DO UPDATE SET wipe_public_key = EXCLUDED.wipe_public_key WHERE user_security_settings.wipe_public_key IS NULL`
 	qUpdateWipePublicKey  = `UPDATE user_security_settings SET wipe_public_key = $3 WHERE uin = $1 AND wipe_public_key = $2`
 
+	// qInsertWipedAccountMarker creates the transient wiped_accounts row
+	// inside PanicWipe's own transaction -- the PRIMARY insertion path. It
+	// must be visible to every other request touching this uin (BearerAuth's
+	// IsAccountWiped check, and the history endpoints' peer/sender checks)
+	// the instant PanicWipe's transaction commits, not only once a worker
+	// happens to poll and claim the wipe job. ON CONFLICT DO NOTHING makes
+	// a hypothetical repeat call harmless. wiped_accounts.uin has a FOREIGN
+	// KEY to users(uin) (migration 005); it is always satisfied here
+	// because PanicWipe runs strictly before the user row is ever deleted
+	// (only the worker's later final-erasure step deletes it). The
+	// worker's own claim-time insert (wipejob.go's qClaimPendingJob) is
+	// now only an idempotent recovery backstop for this same row, not the
+	// primary path.
+	qInsertWipedAccountMarker = `INSERT INTO wiped_accounts (uin) VALUES ($1) ON CONFLICT (uin) DO NOTHING`
+
 	// Account erasure design:
 	//
-	// PanicWipe deletes every FK-referencing row and disables the account
-	// (advances session_epoch) inside a single PG transaction. The user row
-	// is NOT anonymized — it stays in place temporarily so the wipe_job row
-	// can reference it.
+	// PanicWipe deletes every FK-referencing row, disables the account
+	// (advances session_epoch), inserts the wiped_accounts marker, and
+	// inserts the wipe_job row, all inside ONE PG transaction — so a wiped
+	// user already fails every wiped_accounts-aware check (BearerAuth,
+	// DM/group history) the instant the HTTP response is sent, before any
+	// worker has run. The user row is NOT anonymized — it stays in place
+	// temporarily so the wipe_job row can reference it.
 	//
 	// After the background worker confirms all external storage deletion
 	// (Scylla, NATS, MinIO), it executes a final PG transaction that
 	// permanently deletes the user row, wiped_accounts entries, and the
 	// completed wipe-job row. Zero rows associated with the wiped UIN
-	// remain in any PostgreSQL table. There is no "deleted_<UIN>" tombstone.
+	// remain in any PostgreSQL table. There is no "deleted_<UIN>" tombstone,
+	// and no permanent wiped-account record survives cleanup.
 
 	// ------------------------------------------------------------------------
 	// Contact management queries (added by the contacts addendum,

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -35,10 +37,25 @@ func NewScyllaMessageStore(session *gocql.Session) (*ScyllaMessageStore, error) 
 }
 
 // DeleteUserMessages removes every direct-message footprint for the given UIN:
-// messages ciphertext rows, message_deletion_index entries, message_ingest
-// receipts, message_outbox entries, and all associated erasure indexes.
+// messages ciphertext rows, message_deletion_index entries (both this user's
+// own and the counterpart's now-orphaned mirror), message_ingest receipts,
+// message_outbox entries, and all associated erasure indexes.
 func (s *ScyllaMessageStore) DeleteUserMessages(ctx context.Context, uin int64) error {
-	// 1. Direct ciphertext rows via deletion index.
+	// 1. Direct ciphertext rows via deletion index. message_deletion_index
+	// holds one pointer row per DM participant (see messagestore.go's
+	// SaveMessage and durable_ingest_scylla.go's WriteDirect), both pointing
+	// at the SAME messages row. Deleting that shared row via this user's own
+	// index entry would otherwise orphan the counterpart's mirror entry: it
+	// would keep pointing at a row that no longer exists, and its
+	// conversation_id clustering key embeds this wiped UIN as plaintext on
+	// the counterpart's own partition. The counterpart UIN is derived from
+	// conversation_id -- already in hand from this same scan, no extra read
+	// -- and its mirror row is captured and deleted alongside the shared
+	// row, before it can be orphaned. A plain unconditional DELETE (not a
+	// CAS) is sufficient here: unlike the group_message_outbox/message_ingest
+	// recipient lists, no two writers ever race to mutate the SAME row's
+	// contents, so a concurrent wipe of both DM participants just makes each
+	// DELETE redundant with the other's, never conflicting.
 	iter := s.session.Query(`SELECT conversation_id, created_at, id FROM message_deletion_index WHERE uin = ?`, uin).WithContext(ctx).Iter()
 	var conversationID string
 	var createdAt time.Time
@@ -48,12 +65,18 @@ func (s *ScyllaMessageStore) DeleteUserMessages(ctx context.Context, uin int64) 
 			_ = iter.Close()
 			return fmt.Errorf("delete sent message: %w", err)
 		}
+		if counterpartUIN, ok := dmCounterpartUIN(conversationID, uin); ok {
+			if err := s.session.Query(`DELETE FROM message_deletion_index WHERE uin = ? AND conversation_id = ? AND created_at = ? AND id = ?`, counterpartUIN, conversationID, createdAt, id).WithContext(ctx).Exec(); err != nil {
+				_ = iter.Close()
+				return fmt.Errorf("delete counterpart deletion index: %w", err)
+			}
+		}
 	}
 	if err := iter.Close(); err != nil {
 		return fmt.Errorf("scan message deletion index: %w", err)
 	}
 
-	// Delete the deletion index itself.
+	// Delete this user's own deletion index rows.
 	if err := s.session.Query(`DELETE FROM message_deletion_index WHERE uin = ?`, uin).WithContext(ctx).Exec(); err != nil {
 		return fmt.Errorf("delete message deletion index: %w", err)
 	}
@@ -69,6 +92,34 @@ func (s *ScyllaMessageStore) DeleteUserMessages(ctx context.Context, uin int64) 
 	}
 
 	return nil
+}
+
+// dmCounterpartUIN parses a "dm:<min>:<max>" conversation_id and returns the
+// participant that is NOT knownUIN. Mirrors message-service/handlers'
+// parseDMMembers validation exactly (canonical form, min < max, both
+// positive) -- auth-service and message-service are independently
+// deployable and do not share Go types across the module boundary, only the
+// wire format both sides must agree on. ok is false when the format is
+// invalid or knownUIN is not one of the two parsed participants (e.g. a
+// group conversation_id, or a row that doesn't belong to this uin).
+func dmCounterpartUIN(conversationID string, knownUIN int64) (int64, bool) {
+	parts := strings.Split(conversationID, ":")
+	if len(parts) != 3 || parts[0] != "dm" {
+		return 0, false
+	}
+	a, errA := strconv.ParseInt(parts[1], 10, 64)
+	b, errB := strconv.ParseInt(parts[2], 10, 64)
+	if errA != nil || errB != nil || a <= 0 || b <= 0 || a >= b {
+		return 0, false
+	}
+	switch knownUIN {
+	case a:
+		return b, true
+	case b:
+		return a, true
+	default:
+		return 0, false
+	}
 }
 
 // DeleteUserGroupMessages removes every group-message footprint for the given UIN:

@@ -579,6 +579,22 @@ func TestWorkerExecutesFinalUserErasureAfterStorageCleanup(t *testing.T) {
 	}
 }
 
+func TestClaimQueryInsertsWipedAccountsMarker(t *testing.T) {
+	src := mustReadFile(t, "wipejob.go")
+
+	// The claim query must populate wiped_accounts the moment a job is
+	// claimed -- otherwise the table (and every service's BearerAuth
+	// IsAccountWiped check against it) stays permanently empty, since
+	// PanicWipe itself is forbidden from inserting into it (see
+	// TestPanicWipeNoLongerAnonymizesUserRow above).
+	if !strings.Contains(src, "INSERT INTO wiped_accounts") {
+		t.Fatal("qClaimPendingJob must insert into wiped_accounts when a job is claimed")
+	}
+	if !strings.Contains(src, "ON CONFLICT (uin) DO NOTHING") {
+		t.Fatal("wiped_accounts insert must be idempotent across reclaims (ON CONFLICT (uin) DO NOTHING)")
+	}
+}
+
 func TestPanicWipeNoLongerAnonymizesUserRow(t *testing.T) {
 	src := mustReadFile(t, "panicwipe.go")
 
@@ -586,13 +602,34 @@ func TestPanicWipeNoLongerAnonymizesUserRow(t *testing.T) {
 	if strings.Contains(src, "'deleted_'") {
 		t.Fatal("PanicWipe must not anonymize users row — the worker deletes it after storage cleanup")
 	}
-	// Must not insert into wiped_accounts.
-	if strings.Contains(src, "INSERT INTO wiped_accounts") {
-		t.Fatal("PanicWipe must not insert into wiped_accounts — the worker handles final erasure")
-	}
 	// Must disable the account (advance session_epoch).
 	if !strings.Contains(src, "session_epoch") {
 		t.Fatal("PanicWipe must advance session_epoch to disable the account")
+	}
+}
+
+// TestPanicWipeInsertsWipedAccountsMarkerInItsOwnTransaction supersedes the
+// old invariant this file used to enforce ("PanicWipe must not insert into
+// wiped_accounts — the worker handles final erasure"). That was correct for
+// the claim-time-only design; it no longer is. The marker must now be
+// visible to every wiped_accounts-aware check (BearerAuth, DM/group
+// history) the instant PanicWipe's own transaction commits, not only once
+// a worker happens to poll and claim the job — so PanicWipe must be the
+// PRIMARY insertion path. See TestClaimQueryInsertsWipedAccountsMarker
+// (wipejob.go's qClaimPendingJob) for the now-secondary recovery backstop,
+// and the acceptance-tier TestPanicWipeMarksWipedAccountBeforeWorkerClaimsJob
+// for the full behavioral proof against real Postgres.
+func TestPanicWipeInsertsWipedAccountsMarkerInItsOwnTransaction(t *testing.T) {
+	src := mustReadFile(t, "panicwipe.go")
+
+	if !strings.Contains(src, "qInsertWipedAccountMarker") {
+		t.Fatal("PanicWipe must insert the wiped_accounts marker inside its own transaction (qInsertWipedAccountMarker)")
+	}
+	// The insert must happen on `tx` (the transaction), not `deps.Pool`
+	// directly — otherwise it would not roll back together with the rest
+	// of the account mutation on failure.
+	if !strings.Contains(src, "tx.Exec(ctx, qInsertWipedAccountMarker, uin)") {
+		t.Fatal("wiped_accounts marker insert must run on the same transaction as the rest of PanicWipe, so a rollback rolls it back too")
 	}
 }
 

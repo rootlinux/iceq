@@ -7,10 +7,15 @@
 //  2. Capture exact file-object keys from Postgres BEFORE they are deleted.
 //  3. Atomic PG transaction: delete prekeys, tokens, memberships, contacts,
 //     file ownership, security settings, disable the account (set
-//     session_epoch), AND insert a durable wipe_job row. The job is
-//     committed atomically with the account mutation — if job insertion
-//     fails, the entire transaction rolls back so the account is never
-//     disabled without a corresponding cleanup job.
+//     session_epoch), insert the transient wiped_accounts marker, AND
+//     insert a durable wipe_job row. Every piece is committed atomically
+//     with the account mutation — if any insert fails, the entire
+//     transaction rolls back so the account is never disabled without a
+//     corresponding cleanup job and wiped-account marker. This means a
+//     wiped user already fails every wiped_accounts-aware check
+//     (BearerAuth, DM/group history) the instant this transaction commits
+//     — before the HTTP response is even sent, and long before any
+//     worker has polled.
 //  4. Best-effort Redis auxiliary cleanup.
 //
 // After the PG transaction commits, a background worker picks up the job
@@ -19,7 +24,7 @@
 // transaction that permanently deletes the user row, wiped_accounts
 // entries, and the completed wipe-job row — leaving zero rows associated
 // with the wiped UIN in any PostgreSQL table. There is no "deleted_<UIN>"
-// tombstone.
+// tombstone, and no permanent wiped-account record survives cleanup.
 //
 // Recovery: if the blocklist SET succeeds but any subsequent step before
 // the PG commit fails, the blocklist key is removed so the account is not
@@ -398,19 +403,21 @@ func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 //  2. Capture exact file-object keys from Postgres BEFORE they are deleted.
 //  3. Atomic PG transaction: delete prekeys, tokens, memberships, contacts,
 //     file ownership, security settings, disable the account (set
-//     session_epoch), AND insert a durable wipe_job row. The job is
-//     committed atomically with the account mutation — if job insertion
-//     fails, the entire transaction rolls back so the account is never
-//     disabled without a corresponding cleanup job.
+//     session_epoch), insert the transient wiped_accounts marker, AND
+//     insert a durable wipe_job row. Every piece is committed atomically
+//     with the account mutation — if any insert fails, the entire
+//     transaction rolls back so the account is never disabled without a
+//     corresponding cleanup job and wiped-account marker.
 //  4. Best-effort Redis auxiliary cleanup.
 //
 // Recovery: if the blocklist SET succeeds but any subsequent step before
 // the PG commit fails, the blocklist key is removed so the account is not
 // permanently inaccessible. The caller can retry the wipe.
 //
-// Always returns (jobID, nil) on success. A wipe job is always created —
-// even with no storage layers, the worker must execute final PG erasure
-// (delete user row, wiped_accounts, and the job itself).
+// Always returns (jobID, nil) on success. A wipe job and a wiped_accounts
+// marker are always created together — even with no storage layers, the
+// worker must execute final PG erasure (delete user row, wiped_accounts,
+// and the job itself).
 func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) (int64, error) {
 	if deps.Pool == nil {
 		return 0, errors.New("panicwipe: pg pool is nil")
@@ -506,7 +513,19 @@ func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) (int64, error
 		return 0, fmt.Errorf("panicwipe: disable account: %w", err)
 	}
 
-	// ----- 3a. Insert cleanup job INSIDE the transaction --------------------
+	// ----- 3a. Insert the wiped_accounts marker INSIDE the transaction ------
+	// Primary insertion path (see qInsertWipedAccountMarker's doc comment):
+	// committed atomically with the account mutation, so BearerAuth's
+	// IsAccountWiped check and the history endpoints' peer/sender checks
+	// already see this uin as wiped the instant this transaction commits —
+	// before the HTTP response is sent, independent of whether any worker
+	// has polled yet. The worker's own claim-time insert
+	// (wipejob.go's qClaimPendingJob) is only a recovery backstop now.
+	if _, err := tx.Exec(ctx, qInsertWipedAccountMarker, uin); err != nil {
+		return 0, fmt.Errorf("panicwipe: insert wiped_accounts marker: %w", err)
+	}
+
+	// ----- 3b. Insert cleanup job INSIDE the transaction --------------------
 	// The wipe_job row is committed atomically with the account mutation.
 	// If this INSERT fails, the entire transaction rolls back — the wipe
 	// is never committed without a corresponding cleanup job. This

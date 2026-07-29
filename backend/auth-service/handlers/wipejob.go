@@ -88,21 +88,59 @@ var (
 	//   2. processing jobs whose lease has expired (crashed worker).
 	// FOR UPDATE SKIP LOCKED prevents multiple workers from grabbing the
 	// same row and ensures no blocking on contended rows.
+	//
+	// The "marked" CTE is now only an idempotent RECOVERY BACKSTOP for the
+	// wiped_accounts row, not the primary insertion path: PanicWipe itself
+	// (panicwipe.go) inserts the marker inside its own PG transaction,
+	// committed atomically with the account mutation and the wipe_job row,
+	// so every service's BearerAuth (via jwt.Manager.IsAccountWiped) and
+	// the history endpoints' peer/sender checks already see this uin as
+	// wiped from the moment PanicWipe's HTTP response is sent -- no gap
+	// waiting for a worker to poll. This CTE's insert only does real work
+	// if that primary insert is ever somehow missing by the time a job is
+	// claimed (there is no known path that causes this; it exists purely
+	// so a claim can never be blocked on a missing marker). The marker is
+	// guaranteed to be deleted again by processOneJob's final-erasure
+	// Phase 1 once all storage cleanup confirms -- see that code for the
+	// matching DELETE -- so its lifetime exactly brackets "a wipe job
+	// exists for this uin", never longer.
+	//
+	// ON CONFLICT (uin) DO NOTHING makes the insert idempotent across
+	// reclaims of the same job (expired lease, retries). The
+	// "WHERE EXISTS (SELECT 1 FROM users ...)" guard handles a narrow
+	// crash-recovery case: wiped_accounts.uin has a FOREIGN KEY to
+	// users(uin) (migration 005), and a worker can crash after final
+	// erasure's Phase 1 already deleted both rows but before Phase 3
+	// deletes the wipe_job row (see processOneJob) -- a later reclaim of
+	// that same job must not attempt to resurrect a marker for a uin whose
+	// user row is permanently gone, which would fail the FK constraint and,
+	// because a data-modifying CTE aborts the entire statement on error,
+	// would make the claim itself fail and stall the job forever.
 	qClaimPendingJob = `
-		UPDATE wipe_jobs
-		SET status      = 'processing',
-		    lease_until = $1,
-		    worker_id   = $2,
-		    updated_at  = NOW()
-		WHERE id = (
-			SELECT id FROM wipe_jobs
-			WHERE (status IN ('pending', 'retrying') AND next_retry_at <= NOW())
-			   OR (status = 'processing' AND lease_until IS NOT NULL AND lease_until < NOW())
-			ORDER BY next_retry_at, id
-			LIMIT 1
-			FOR UPDATE SKIP LOCKED
+		WITH claimed AS (
+			UPDATE wipe_jobs
+			SET status      = 'processing',
+			    lease_until = $1,
+			    worker_id   = $2,
+			    updated_at  = NOW()
+			WHERE id = (
+				SELECT id FROM wipe_jobs
+				WHERE (status IN ('pending', 'retrying') AND next_retry_at <= NOW())
+				   OR (status = 'processing' AND lease_until IS NOT NULL AND lease_until < NOW())
+				ORDER BY next_retry_at, id
+				LIMIT 1
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING id, uin, file_keys, retry_count
+		),
+		marked AS (
+			INSERT INTO wiped_accounts (uin)
+			SELECT c.uin FROM claimed c
+			WHERE EXISTS (SELECT 1 FROM users u WHERE u.uin = c.uin)
+			ON CONFLICT (uin) DO NOTHING
+			RETURNING uin
 		)
-		RETURNING id, uin, file_keys, retry_count
+		SELECT id, uin, file_keys, retry_count FROM claimed
 	`
 
 	// qRenewLease extends lease_until for a long-running cleanup so the job
