@@ -162,12 +162,12 @@ type historyFakeStore struct {
 	calls []store.GroupHistoryRequest
 }
 
-func (s *historyFakeStore) GetHistory(context.Context, store.HistoryRequest) ([]store.MessageRow, error) {
-	return nil, nil
+func (s *historyFakeStore) GetHistory(context.Context, store.HistoryRequest) ([]store.MessageRow, bool, error) {
+	return nil, false, nil
 }
-func (s *historyFakeStore) GetGroupHistory(_ context.Context, r store.GroupHistoryRequest) ([]store.GroupMessageRow, error) {
+func (s *historyFakeStore) GetGroupHistory(_ context.Context, r store.GroupHistoryRequest) ([]store.GroupMessageRow, bool, error) {
 	s.calls = append(s.calls, r)
-	return s.rows, nil
+	return s.rows, false, nil
 }
 
 func TestGroupListIsScopedToAuthenticatedMember(t *testing.T) {

@@ -19,20 +19,22 @@ import (
 // GetHistory and GetGroupHistory, so these tests can prove the Scylla store
 // is never even queried once a counterpart is already known wiped.
 type wipedCheckFakeStore struct {
-	dmRows     []store.MessageRow
-	dmCalls    int
-	groupRows  []store.GroupMessageRow
-	groupCalls int
+	dmRows       []store.MessageRow
+	dmHasMore    bool
+	dmCalls      int
+	groupRows    []store.GroupMessageRow
+	groupHasMore bool
+	groupCalls   int
 }
 
-func (s *wipedCheckFakeStore) GetHistory(context.Context, store.HistoryRequest) ([]store.MessageRow, error) {
+func (s *wipedCheckFakeStore) GetHistory(context.Context, store.HistoryRequest) ([]store.MessageRow, bool, error) {
 	s.dmCalls++
-	return s.dmRows, nil
+	return s.dmRows, s.dmHasMore, nil
 }
 
-func (s *wipedCheckFakeStore) GetGroupHistory(context.Context, store.GroupHistoryRequest) ([]store.GroupMessageRow, error) {
+func (s *wipedCheckFakeStore) GetGroupHistory(context.Context, store.GroupHistoryRequest) ([]store.GroupMessageRow, bool, error) {
 	s.groupCalls++
-	return s.groupRows, nil
+	return s.groupRows, s.groupHasMore, nil
 }
 
 func TestDirectHistoryReturnsEmptyWhenCounterpartIsWiped(t *testing.T) {

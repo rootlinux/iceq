@@ -47,8 +47,9 @@ import (
 // next_cursor is the CreatedAt of the LAST row returned
 // (which is the OLDEST row on this page, because the rows
 // are in DESC order). Pass it back as `before` to fetch
-// the next page. A null value means "no more pages" —
-// the response was a partial page (< limit rows).
+// the next page. A null value means "no more pages" — proven
+// by fetching one row past the page (see store.GetHistory /
+// store.GetGroupHistory), not inferred from page size.
 //
 // E2EE contract: the response body carries the
 // base64url-encoded ciphertext bytes from each row. We
@@ -65,8 +66,8 @@ type HistoryDeps struct {
 }
 
 type historyStore interface {
-	GetHistory(context.Context, store.HistoryRequest) ([]store.MessageRow, error)
-	GetGroupHistory(context.Context, store.GroupHistoryRequest) ([]store.GroupMessageRow, error)
+	GetHistory(context.Context, store.HistoryRequest) ([]store.MessageRow, bool, error)
+	GetGroupHistory(context.Context, store.GroupHistoryRequest) ([]store.GroupMessageRow, bool, error)
 }
 
 // ----------------------------------------------------------------------------
@@ -191,11 +192,11 @@ func NewGetHistoryHandler(deps HistoryDeps) http.HandlerFunc {
 			return
 		}
 		if wiped {
-			writeHistoryResponse(w, convID, "", []store.MessageRow{}, false, dmRowToMessage)
+			writeHistoryResponse(w, convID, "", []store.MessageRow{}, nil, dmRowToMessage)
 			return
 		}
 
-		rows, err := deps.Store.GetHistory(ctx, store.HistoryRequest{
+		rows, hasMore, err := deps.Store.GetHistory(ctx, store.HistoryRequest{
 			ConversationID: convID,
 			Before:         before,
 			Limit:          limit,
@@ -212,7 +213,12 @@ func NewGetHistoryHandler(deps HistoryDeps) http.HandlerFunc {
 			return
 		}
 
-		writeHistoryResponse(w, convID, "", rows, len(rows) < limit, dmRowToMessage)
+		var cursor *time.Time
+		if hasMore && len(rows) > 0 {
+			c := rows[len(rows)-1].CreatedAt
+			cursor = &c
+		}
+		writeHistoryResponse(w, convID, "", rows, cursor, dmRowToMessage)
 	}
 }
 
@@ -280,7 +286,7 @@ func NewGetGroupHistoryHandler(deps HistoryDeps) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
-		rows, err := deps.Store.GetGroupHistory(ctx, store.GroupHistoryRequest{
+		rows, hasMore, err := deps.Store.GetGroupHistory(ctx, store.GroupHistoryRequest{
 			GroupID: groupID,
 			Before:  before,
 			Limit:   limit,
@@ -298,10 +304,17 @@ func NewGetGroupHistoryHandler(deps HistoryDeps) http.HandlerFunc {
 		// Defense-in-depth, same rationale as NewGetHistoryHandler: a
 		// message's sender may have been panic-wiped after sending but
 		// before async Scylla cleanup (auth-service/handlers/wipejob.go)
-		// deletes their authored rows. hasMore is captured from the
-		// unfiltered page -- it describes the real Scylla cursor position,
-		// which filtering afterward must not disturb.
-		hasMore := len(rows) < limit
+		// deletes their authored rows. Both hasMore AND the cursor are
+		// captured from the unfiltered page -- filtering afterward must not
+		// disturb where the next page starts, or a page where every sender
+		// happens to be wiped would collapse to an empty response with a
+		// misleadingly-absent cursor, silently truncating any real history
+		// still behind it.
+		var cursor *time.Time
+		if hasMore && len(rows) > 0 {
+			c := rows[len(rows)-1].CreatedAt
+			cursor = &c
+		}
 		wipedSenders, err := wipedUINsAmong(ctx, deps.PG, distinctSenderUINs(rows))
 		if err != nil {
 			log.Printf("[message-service] check wiped senders: %v", err)
@@ -318,7 +331,7 @@ func NewGetGroupHistoryHandler(deps HistoryDeps) http.HandlerFunc {
 			rows = filtered
 		}
 
-		writeHistoryResponse(w, "", groupIDStr, rows, hasMore, groupRowToMessage)
+		writeHistoryResponse(w, "", groupIDStr, rows, cursor, groupRowToMessage)
 	}
 }
 
@@ -370,14 +383,18 @@ func groupRowToMessage(convID, groupID string, row any) historyMessage {
 type rowConverter func(convID, groupID string, row any) historyMessage
 
 // writeHistoryResponse marshals rows to JSON, sets the
-// Content-Type, and computes next_cursor. hasMore=false
-// means the caller should treat next_cursor as
-// "no more pages".
+// Content-Type, and writes next_cursor exactly as the caller
+// computed it. Callers derive cursor from the real store page
+// (proven by an exact hasMore signal, see store.GetHistory /
+// store.GetGroupHistory) — this function does no inference of
+// its own, since a caller-side display filter (e.g. the
+// wiped-sender filter in NewGetGroupHistoryHandler) can make
+// the displayed row count diverge from the real page.
 func writeHistoryResponse(
 	w http.ResponseWriter,
 	convID, groupID string,
 	rows any,
-	hasMore bool,
+	cursor *time.Time,
 	convert rowConverter,
 ) {
 	// Reflect on the slice type so we can iterate without
@@ -397,21 +414,9 @@ func writeHistoryResponse(
 		}
 	}
 
-	// next_cursor: the CreatedAt of the last (oldest)
-	// row in DESC order. nil when we returned a partial
-	// page, signaling end-of-history to the client.
-	var nextCursor *time.Time
-	if !hasMore && len(msgs) > 0 {
-		// partial page: end of stream
-		nextCursor = nil
-	} else if len(msgs) > 0 {
-		last := msgs[len(msgs)-1].CreatedAt
-		nextCursor = &last
-	}
-
 	resp := historyResponse{
 		Messages:   msgs,
-		NextCursor: nextCursor,
+		NextCursor: cursor,
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

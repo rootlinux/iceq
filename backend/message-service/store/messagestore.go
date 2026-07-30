@@ -56,10 +56,18 @@
 // ----------
 //
 // GetHistory and GetGroupHistory return rows in DESCENDING
-// order (newest first). The cursor is the created_at of the
-// last row the caller received. Pass a zero time.Time to mean
-// "from the present". The caller iterates until a partial
-// page comes back; that signals end-of-history.
+// order (newest first), plus an exact hasMore signal. The
+// cursor is the created_at of the last row the caller
+// received. Pass a zero time.Time to mean "from the present".
+//
+// hasMore is determined by fetching one row beyond the
+// requested limit: if that extra row exists, it proves more
+// data is available and is discarded before returning (the
+// caller never sees more than limit rows). This is exact,
+// unlike inferring "more data" from "got a full page" --
+// a page that happens to end exactly at the last row in
+// existence is indistinguishable from a page with more
+// behind it unless you actually check one row further.
 package store
 
 import (
@@ -369,10 +377,23 @@ func (m *MessageStore) SaveGroupMessage(ctx context.Context, req SaveGroupReques
 // GetHistory — paginated 1:1 chat history.
 // ----------------------------------------------------------------------------
 
+// paginationPage trims a fetch of up to limit+1 rows down to at most limit
+// and reports whether the extra row proves more data exists beyond this
+// page. fetched must be the count AFTER any row-level filtering (e.g. the
+// expired-row skip in GetHistory/GetGroupHistory) has already been applied,
+// so a row dropped by that filtering can never be mistaken for proof of a
+// further page.
+func paginationPage(fetched, limit int) (keep int, hasMore bool) {
+	if fetched > limit {
+		return limit, true
+	}
+	return fetched, false
+}
+
 // GetHistory returns up to req.Limit rows of the messages
 // table for the given conversation_id, ordered by created_at
-// DESC. The Before cursor is exclusive: rows with
-// created_at < Before are returned.
+// DESC, plus an exact hasMore. The Before cursor is exclusive:
+// rows with created_at < Before are returned.
 //
 // Limit normalization:
 //   - 0  -> defaultHistoryLimit (20)
@@ -382,13 +403,13 @@ func (m *MessageStore) SaveGroupMessage(ctx context.Context, req SaveGroupReques
 // A zero Before is treated as "give me the newest page".
 // We do NOT use time.Now() inside this function — the handler
 // layer should pass time.Now() if it wants the freshest page.
-func (m *MessageStore) GetHistory(ctx context.Context, req HistoryRequest) ([]MessageRow, error) {
+func (m *MessageStore) GetHistory(ctx context.Context, req HistoryRequest) ([]MessageRow, bool, error) {
 	limit := req.Limit
 	if limit == 0 {
 		limit = defaultHistoryLimit
 	}
 	if limit < 0 {
-		return nil, ErrInvalidLimit
+		return nil, false, ErrInvalidLimit
 	}
 	if limit > maxHistoryLimit {
 		limit = maxHistoryLimit
@@ -409,7 +430,7 @@ func (m *MessageStore) GetHistory(ctx context.Context, req HistoryRequest) ([]Me
 	  LIMIT ?`
 
 	iter := m.session.
-		Query(q, req.ConversationID, before, limit).
+		Query(q, req.ConversationID, before, limit+1).
 		WithContext(ctx).
 		Consistency(gocql.Quorum).
 		Iter()
@@ -436,21 +457,22 @@ func (m *MessageStore) GetHistory(ctx context.Context, req HistoryRequest) ([]Me
 		rows = append(rows, row)
 	}
 	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("store: history iter: %w", err)
+		return nil, false, fmt.Errorf("store: history iter: %w", err)
 	}
-	return rows, nil
+	keep, hasMore := paginationPage(len(rows), limit)
+	return rows[:keep], hasMore, nil
 }
 
 // GetGroupHistory mirrors GetHistory for the
 // group_messages table. The query shape and limit semantics
 // are identical; only the partition-key column changes.
-func (m *MessageStore) GetGroupHistory(ctx context.Context, req GroupHistoryRequest) ([]GroupMessageRow, error) {
+func (m *MessageStore) GetGroupHistory(ctx context.Context, req GroupHistoryRequest) ([]GroupMessageRow, bool, error) {
 	limit := req.Limit
 	if limit == 0 {
 		limit = defaultHistoryLimit
 	}
 	if limit < 0 {
-		return nil, ErrInvalidLimit
+		return nil, false, ErrInvalidLimit
 	}
 	if limit > maxHistoryLimit {
 		limit = maxHistoryLimit
@@ -467,7 +489,7 @@ func (m *MessageStore) GetGroupHistory(ctx context.Context, req GroupHistoryRequ
 	  LIMIT ?`
 
 	iter := m.session.
-		Query(q, req.GroupID, before, limit).
+		Query(q, req.GroupID, before, limit+1).
 		WithContext(ctx).
 		Consistency(gocql.Quorum).
 		Iter()
@@ -493,9 +515,10 @@ func (m *MessageStore) GetGroupHistory(ctx context.Context, req GroupHistoryRequ
 		rows = append(rows, row)
 	}
 	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("store: group history iter: %w", err)
+		return nil, false, fmt.Errorf("store: group history iter: %w", err)
 	}
-	return rows, nil
+	keep, hasMore := paginationPage(len(rows), limit)
+	return rows[:keep], hasMore, nil
 }
 
 // ----------------------------------------------------------------------------
