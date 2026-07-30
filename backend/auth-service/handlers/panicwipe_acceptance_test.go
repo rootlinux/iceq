@@ -207,59 +207,19 @@ func (c *productionNATSCleaner) PurgeUserStreams(ctx context.Context, uin int64)
 // Schema bootstrap — apply real migrations
 // ---------------------------------------------------------------------------
 
-var pgMigrationFiles = []string{
-	"001_session_epoch.sql",
-	"002_prekey_bundle_registration_id.sql",
-	"003_contacts_requested_by.sql",
-	"005_wiped_accounts.sql",
-	"006_file_object_owners.sql",
-	"007_file_object_grants.sql",
-	"008_group_crypto_epoch.sql",
-	"009_sender_key_distribution_inbox.sql",
-	"014_panic_wipe_pin.sql",
-	"015_wipe_public_key.sql",
-	"016_wipe_jobs.sql",
-}
-
+// applyAcceptanceSchema bootstraps the real production schema (see
+// ensurePostgresSchema in pg_schema_bootstrap_test.go) and then resets this
+// package's acceptance tables to a clean slate. The reset is specific to the
+// acceptance suite's assumption that it owns the entire disposable database
+// exclusively — callers outside that suite (e.g. crypto_binding_test.go)
+// must call ensurePostgresSchema directly instead, since they share the
+// database with unrelated tests and must not wipe other tests' rows.
 func applyAcceptanceSchema(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
+	ensurePostgresSchema(t, pool)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	// Match the production fresh-volume bootstrap order: the base schema is
-	// created by postgres-init.sql before any numbered migration runs. Guard the
-	// bootstrap so the acceptance test remains safe to re-run against its
-	// disposable database without re-creating the sequence and base tables.
-	var usersTable *string
-	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.users')::text`).Scan(&usersTable); err != nil {
-		t.Fatalf("inspect PG base schema: %v", err)
-	}
-	if usersTable == nil {
-		basePath := "../../../deploy/init/postgres-init.sql"
-		baseRaw, err := os.ReadFile(basePath)
-		if err != nil {
-			t.Fatalf("read PG base schema %s: %v", basePath, err)
-		}
-		if _, err := pool.Exec(ctx, string(baseRaw)); err != nil {
-			t.Fatalf("apply PG base schema %s: %v", basePath, err)
-		}
-	}
-
-	// Apply real migration files from the deploy/init/migrations directory.
-	// Execute each file as one PostgreSQL script so dollar-quoted DO blocks are
-	// preserved exactly as production runs them.
-	migrationDir := "../../../deploy/init/migrations"
-	for _, filename := range pgMigrationFiles {
-		path := migrationDir + "/" + filename
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("read PG migration %s: %v", path, err)
-		}
-		if _, err := pool.Exec(ctx, string(raw)); err != nil {
-			t.Fatalf("apply PG migration %s: %v", filename, err)
-		}
-	}
-	t.Log("acceptance schema created from real migration files")
 
 	// Clean leftover rows from previous runs.
 	for _, table := range []string{

@@ -33,6 +33,7 @@ func cryptoTestPool(t *testing.T) *pgxpool.Pool {
 		t.Skipf("PostgreSQL ping failed: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	ensurePostgresSchema(t, pool)
 	return pool
 }
 
