@@ -2,12 +2,89 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// AuthenticatedRateLimitActions is the complete set of action strings
+// registered with AuthenticatedRateLimitConfig across every service.
+// Each entry maps to a Redis key of the form ratelimit:auth:{uin}:{action}.
+//
+// When adding a new rate-limited endpoint, add its action string here so
+// the panic-wipe Redis cleaner can deterministically delete the key without
+// SCAN or KEYS. Missing an action here means a rate-limit key tied to the
+// wiped UIN survives until its natural TTL expiry — a privacy regression.
+//
+// Audit point: grep -rn 'Action:' backend/ --include="*.go" | grep -v _test.go
+var AuthenticatedRateLimitActions = []string{
+	// auth-service (handlers + refresh limiter)
+	"auth:logout",
+	"auth:me",
+	"auth:crypto-binding",
+	"auth:panic-wipe",
+	"auth:panic-pin",
+	"auth:panic-wipe-public-key",
+	"auth:panic-wipe-public-key-get",
+	"auth:panic-wipe-challenge",
+	"auth:refresh",
+	"contacts:list",
+	"contacts:add",
+	"contacts:accept",
+	"contacts:block",
+	"contacts:remove",
+	// ws-gateway
+	"ws:connect",
+	"ws:frame",
+	"transport:poll",
+	"transport:send",
+	// presence-service
+	"presence:read",
+	"presence:bulk",
+	// message-service
+	"messages:history",
+	"messages:group-history",
+	// file-service
+	"files:upload",
+	"files:download",
+	"files:avatar-upload",
+	"files:grant",
+	"files:grant:revoke",
+	// key-service
+	"keys:bundle:upload",
+	"keys:prekeys:add",
+	"keys:prekeys:count",
+}
+
+// AuthenticatedRateLimitKeysForUIN returns every ratelimit:auth key that may
+// exist for the given UIN. Keys are constructed deterministically — no SCAN,
+// no KEYS, no unbounded iteration. The returned keys are safe to DEL
+// unconditionally: DEL on a non-existent key is a no-op.
+func AuthenticatedRateLimitKeysForUIN(uin int64) []string {
+	keys := make([]string, 0, len(AuthenticatedRateLimitActions))
+	for _, action := range AuthenticatedRateLimitActions {
+		k, err := AuthenticatedRateLimitKey(uin, action)
+		if err != nil {
+			// Statically-defined actions never fail key construction.
+			// If they do, it's a bug caught at dev time — skip
+			// without panicking so a bad action doesn't block the
+			// rest of the wipe.
+			continue
+		}
+		keys = append(keys, "ratelimit:"+k)
+	}
+	return keys
+}
+
+// AuthenticatedRateLimitKeyPrefix returns the prefix shared by every
+// authenticated rate-limit key for a given UIN. Useful for SCAN-based
+// verification when an exhaustive check is needed (acceptance tests).
+func AuthenticatedRateLimitKeyPrefix(uin int64) string {
+	return fmt.Sprintf("ratelimit:auth:%d:", uin)
+}
 
 const authenticatedRateLimitScript = `
 local current = redis.call("INCR", KEYS[1])

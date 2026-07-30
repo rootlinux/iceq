@@ -757,6 +757,7 @@ func (r *WipeJobRunner) scheduleRetry(ctx context.Context, jobID int64, failedPh
 // poll:cursor-order:{uin}          | Poll cursor ordered set          | Yes
 // poll:{{uin}}:*                   | Hash-tag poll keys               | Yes (SCAN + DEL)
 // login_attempts:{uin}             | Legacy login counter             | Yes
+// ratelimit:auth:{uin}:{action}    | Authenticated rate-limit bucket  | Yes (deterministic DEL, one key per action)
 //
 // The blocklist key (jwt:blocklist:wipe:{uin}) is INTENTIONALLY excluded
 // from this phase. It was set by PanicWipe with a 7-day TTL

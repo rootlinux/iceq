@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,5 +123,41 @@ func TestAuthenticatedRateLimitMiddlewareRejectsMissingVerifiedUIN(t *testing.T)
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+}
+
+func TestAuthenticatedRateLimitKeysForUIN_ReturnsCorrectFormat(t *testing.T) {
+	keys := AuthenticatedRateLimitKeysForUIN(123456)
+	if len(keys) != len(AuthenticatedRateLimitActions) {
+		t.Fatalf("got %d keys, want %d (one per action)", len(keys), len(AuthenticatedRateLimitActions))
+	}
+
+	// Verify every key has the expected prefix and contains the UIN.
+	for i, key := range keys {
+		if !strings.HasPrefix(key, "ratelimit:auth:123456:") {
+			t.Fatalf("key[%d] = %q, missing ratelimit:auth:123456: prefix", i, key)
+		}
+		// The action part must be non-empty (everything after the prefix).
+		action := strings.TrimPrefix(key, "ratelimit:auth:123456:")
+		if action == "" || action == key {
+			t.Fatalf("key[%d] = %q, no action suffix after prefix", i, key)
+		}
+	}
+}
+
+func TestAuthenticatedRateLimitKeyPrefix(t *testing.T) {
+	prefix := AuthenticatedRateLimitKeyPrefix(42)
+	if prefix != "ratelimit:auth:42:" {
+		t.Fatalf("prefix = %q, want ratelimit:auth:42:", prefix)
+	}
+}
+
+func TestAuthenticatedRateLimitActions_NoDuplicates(t *testing.T) {
+	seen := make(map[string]bool)
+	for _, action := range AuthenticatedRateLimitActions {
+		if seen[action] {
+			t.Fatalf("duplicate action %q in AuthenticatedRateLimitActions", action)
+		}
+		seen[action] = true
 	}
 }

@@ -208,6 +208,17 @@ func (a *redisWipeAdapter) CleanupUserKeys(ctx context.Context, uin int64) error
 		}
 	}
 
+	// Authenticated rate-limit keys — deterministically constructed,
+	// no SCAN. Each action in AuthenticatedRateLimitActions maps to
+	// exactly one key for this UIN. Deleting them removes the last
+	// Redis footprint tied to the wiped UIN (rate-limit counters
+	// would otherwise persist until their window TTL expires).
+	for _, key := range middleware.AuthenticatedRateLimitKeysForUIN(uin) {
+		if err := a.rdb.Del(ctx, key).Err(); err != nil {
+			return fmt.Errorf("redis del rate-limit %s: %w", key, err)
+		}
+	}
+
 	// Hash-tag poll keys — SCAN + DEL.
 	patterns := []string{
 		"poll:{" + s + "}:*",
@@ -556,6 +567,14 @@ func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) (int64, error
 		log.Printf("[auth-service] panicwipe: del undelivered queue failed: %v", err)
 	}
 	cleanupPollKeys(ctx, deps.Redis, uin)
+	// Rate-limit keys: deterministically constructed per action, no SCAN.
+	// These otherwise survive until their window TTL expires and would be
+	// the last Redis keys referencing the wiped UIN.
+	for _, key := range middleware.AuthenticatedRateLimitKeysForUIN(uin) {
+		if err := deps.Redis.Del(ctx, key).Err(); err != nil {
+			log.Printf("[auth-service] panicwipe: del rate-limit key %s failed: %v", key, err)
+		}
+	}
 
 	log.Printf("[auth-service] panic_wipe_executed wipe_job=%d", jobID)
 	return jobID, nil

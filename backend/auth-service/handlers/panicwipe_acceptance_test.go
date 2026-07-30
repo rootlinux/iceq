@@ -907,6 +907,16 @@ func verifyZeroFootprintFullStack(t *testing.T, pool *pgxpool.Pool, rdb *redis.C
 			t.Errorf("[%s] redis key %s still exists", label, key)
 		}
 	}
+	// Authenticated rate-limit keys — deterministically constructed,
+	// one per action. Must be zero for the wiped UIN.
+	for _, key := range middleware.AuthenticatedRateLimitKeysForUIN(uin) {
+		exists, err := rdb.Exists(ctx, key).Result()
+		if err != nil {
+			t.Errorf("[%s] redis exists rate-limit %s: %v", label, key, err)
+		} else if exists != 0 {
+			t.Errorf("[%s] redis rate-limit key %s still exists", label, key)
+		}
+	}
 	// Hash-tag poll keys.
 	for _, pattern := range []string{
 		"poll:{" + s + "}:*",
