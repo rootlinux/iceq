@@ -90,8 +90,14 @@ func loadConfig() config {
 		ScyllaHosts:     envOr("ICEQ_SCYLLA_HOSTS", "scylla:9042"),
 		ScyllaKeyspace:  envOr("ICEQ_SCYLLA_KEYSPACE", "iceq"),
 		MinioEndpoint:   envOr("ICEQ_MINIO_ENDPOINT", "minio:9000"),
-		MinioAccessKey:  envOr("ICEQ_MINIO_ACCESS_KEY", "minioadmin"),
-		MinioSecretKey:  envOr("ICEQ_MINIO_SECRET_KEY", "minioadmin"),
+		// Falls back to MINIO_ROOT_USER/MINIO_ROOT_PASSWORD before the
+		// hardcoded default, matching file-service's loadConfig -- those
+		// are the only MinIO credential vars deploy/.env.example actually
+		// documents, so without this fallback auth-service silently
+		// authenticates as "minioadmin"/"minioadmin" against whatever
+		// root credentials the deployment really set.
+		MinioAccessKey:  envFirst([]string{"ICEQ_MINIO_ACCESS_KEY", "MINIO_ROOT_USER"}, "minioadmin"),
+		MinioSecretKey:  envFirst([]string{"ICEQ_MINIO_SECRET_KEY", "MINIO_ROOT_PASSWORD"}, "minioadmin"),
 		JWTSecret:       envOr("ICEQ_JWT_SECRET", ""),
 		AllowedOrigins:  envOr("ICEQ_ALLOWED_ORIGINS", "https://localhost"),
 		ShutdownTimeout: 10 * time.Second,
@@ -101,6 +107,15 @@ func loadConfig() config {
 func envOr(name, fallback string) string {
 	if v, ok := os.LookupEnv(name); ok && v != "" {
 		return v
+	}
+	return fallback
+}
+
+func envFirst(names []string, fallback string) string {
+	for _, name := range names {
+		if v, ok := os.LookupEnv(name); ok && v != "" {
+			return v
+		}
 	}
 	return fallback
 }

@@ -577,6 +577,15 @@ services:
         condition: service_healthy
       nats:
         condition: service_healthy
+      # auth-service opens its own gocql session at startup (main.go,
+      # unconditional -- log.Fatalf on any error, no retry) to back the
+      # wipe-job worker's Scylla cleanup phase (WipeJobRunner.Scylla).
+      # Without this gate it races Scylla's ~60s start_period and loses on
+      # every cold start. Mirrors message-service's already-correct pattern.
+      scylla:
+        condition: service_healthy
+      scylla-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "-t", "1", "http://127.0.0.1:8080/api/auth/health"]
       interval: 10s
