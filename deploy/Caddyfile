@@ -32,7 +32,7 @@
         X-Frame-Options           "DENY"
         Referrer-Policy           "no-referrer"
         Permissions-Policy        "camera=(), microphone=(), geolocation=()"
-        Content-Security-Policy   "default-src 'self'; script-src 'self'; connect-src 'self' wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests"
+        Content-Security-Policy   "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests"
         -Server
         -X-Powered-By
     }

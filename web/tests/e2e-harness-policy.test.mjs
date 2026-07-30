@@ -110,3 +110,44 @@ test("a normal production build (no ICEQ_E2E) contains no trace of the e2e bridg
   const html = readFileSync(new URL("index.html", distDir), "utf8");
   assert.doesNotMatch(html, /e2e-bridge/, "index.html must not reference the e2e bridge");
 });
+
+// --- Production CSP: WebAssembly is required by the cryptographic library ---
+// The CurveASM WebAssembly module (curve25519 / Double Ratchet) is
+// bundled in the main JS payload. Browsers that strictly enforce CSP
+// (Safari / WebKit) block WebAssembly.instantiate() when script-src
+// lacks the narrow wasm-unsafe-eval keyword — a keyword that allows
+// WASM compilation without opening the general unsafe-eval hole for
+// JavaScript.
+
+test("production script-src allows wasm-unsafe-eval and rejects unsafe-eval", () => {
+  const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
+  const caddyfile = readFileSync(`${repoRoot}/deploy/Caddyfile`, "utf8");
+
+  // Extract the Content-Security-Policy header line from the
+  // (security_headers) snippet — the single source of truth for
+  // every response the edge emits.
+  const cspMatch = caddyfile.match(/Content-Security-Policy\s+"([^"]+)"/);
+  assert.ok(cspMatch, "Caddyfile must define a Content-Security-Policy header");
+  const csp = cspMatch[1];
+
+  // script-src MUST include wasm-unsafe-eval so WebAssembly.instantiate
+  // works in Safari / WebKit.
+  assert.match(csp, /script-src[^;]*'wasm-unsafe-eval'/, "script-src must allow 'wasm-unsafe-eval' for cryptographic WASM");
+
+  // The general eval hole must stay closed.
+  assert.doesNotMatch(csp, /'unsafe-eval'/, "script-src must not allow general 'unsafe-eval'");
+
+  // Production enforces HTTPS everywhere — upgrade-insecure-requests
+  // converts any stale HTTP reference the browser encounters.
+  assert.match(csp, /upgrade-insecure-requests/, "CSP must include upgrade-insecure-requests for production TLS enforcement");
+});
+
+test("production Caddyfile has no preview-only HTTP listener", () => {
+  const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
+  const caddyfile = readFileSync(`${repoRoot}/deploy/Caddyfile`, "utf8");
+
+  // The preview-only :80 block exists solely for the disposable
+  // preview stack (iceq-rc1-preview). It must never reach the
+  // public / production branch.
+  assert.doesNotMatch(caddyfile, /^:80\s*\{/m, "production Caddyfile must not contain a preview-only :80 HTTP listener block");
+});
