@@ -13,17 +13,20 @@ import {
   storeEncryptedWipePrivateKey,
 } from "../src/lib/panicWipeKey.ts";
 
-const NAMESPACE: CryptoNamespace = { uin: 3001, deviceId: "wipe_key_recon_test_dev" };
+const PASSPHRASE = "correct horse battery staple wipe key test";
 
-test.beforeEach(async () => {
-  setActiveCryptoNamespace(NAMESPACE);
+/** Sets the active namespace, locks any prior vault handle, and creates a
+ *  fresh security vault so every test owns an isolated key namespace. */
+async function bootstrapVault(ns: CryptoNamespace): Promise<void> {
+  setActiveCryptoNamespace(ns);
   lockSecurityVault();
-  await createSecurityPassphrase("correct horse battery staple wipe key test");
-});
+  await createSecurityPassphrase(PASSPHRASE);
+}
 
 // --- reconcileWipeKey --------------------------------------------------
 
 test("reconcileWipeKey reports a match when the server's key equals the local key", async () => {
+  await bootstrapVault({ uin: 3001, deviceId: "wipe_key_recon_dev_0001" });
   const local = new Uint8Array(32);
   local[0] = 1;
   const result = await reconcileWipeKey(local, async () => ({ public_key: bytesToBase64std(local) }));
@@ -31,6 +34,7 @@ test("reconcileWipeKey reports a match when the server's key equals the local ke
 });
 
 test("reconcileWipeKey reports a mismatch when a different key is enrolled", async () => {
+  await bootstrapVault({ uin: 3002, deviceId: "wipe_key_recon_dev_0002" });
   const local = new Uint8Array(32);
   local[0] = 1;
   const serverKey = new Uint8Array(32);
@@ -40,6 +44,7 @@ test("reconcileWipeKey reports a mismatch when a different key is enrolled", asy
 });
 
 test("reconcileWipeKey reports server-has-no-key when nothing is enrolled yet", async () => {
+  await bootstrapVault({ uin: 3003, deviceId: "wipe_key_recon_dev_0003" });
   const local = new Uint8Array(32);
   local[0] = 1;
   const result = await reconcileWipeKey(local, async () => ({ public_key: null }));
@@ -49,6 +54,7 @@ test("reconcileWipeKey reports server-has-no-key when nothing is enrolled yet", 
 // --- clearLocalWipeKey ---------------------------------------------------
 
 test("clearLocalWipeKey removes the stored key so loadAndDecryptWipePrivateKey returns null", async () => {
+  await bootstrapVault({ uin: 3004, deviceId: "wipe_key_recon_dev_0004" });
   await storeEncryptedWipePrivateKey("opaque-blob", new Uint8Array(32));
   await clearLocalWipeKey();
   const loaded = await loadAndDecryptWipePrivateKey();
@@ -58,6 +64,7 @@ test("clearLocalWipeKey removes the stored key so loadAndDecryptWipePrivateKey r
 // --- loadOrCreateWipeKeyPair in-flight guard -----------------------------
 
 test("concurrent loadOrCreateWipeKeyPair calls in the same tick share one generated key", async () => {
+  await bootstrapVault({ uin: 3005, deviceId: "wipe_key_recon_dev_0005" });
   const [a, b] = await Promise.all([loadOrCreateWipeKeyPair(), loadOrCreateWipeKeyPair()]);
   assert.equal(a.isNew, true);
   assert.equal(b.isNew, true);
@@ -66,6 +73,7 @@ test("concurrent loadOrCreateWipeKeyPair calls in the same tick share one genera
 });
 
 test("the in-flight guard clears after resolving: a later call is independent", async () => {
+  await bootstrapVault({ uin: 3006, deviceId: "wipe_key_recon_dev_0006" });
   const first = await loadOrCreateWipeKeyPair();
   await storeEncryptedWipePrivateKey(first.encryptedPrivateBlob, first.publicKeyBytes);
 

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "../../store/authStore";
 import { getActiveCryptoNamespace, hasSecuritySetupCompleted, setSecuritySetupCompleted } from "../../lib/indexeddb";
-import { createSecurityPassphrase, hasSecurityPassphrase } from "../../lib/securityVault";
+import { createSecurityPassphrase, hasSecurityPassphrase, isVaultUnlocked, unlockSecurityVault } from "../../lib/securityVault";
 import { generateRecoveryKey, createRecoveryPackage } from "../../lib/recoveryPackage";
 import {
   loadOrCreateWipeKeyPair,
@@ -23,7 +23,7 @@ const MIN_PASSPHRASE_LENGTH = 12;
 // embeds whatever wipe key it finds. Generating the recovery package
 // before the wipe key existed (the original order) meant a recovered
 // device could never restore it.
-type SetupStep = "intro" | "passphrase" | "wipekey" | "recovery" | "confirm";
+type SetupStep = "intro" | "passphrase" | "unlock" | "wipekey" | "recovery" | "confirm";
 
 interface SecuritySetupGateProps {
   onSetupComplete?: () => void;
@@ -53,6 +53,15 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
   // authenticate to the auth-service.
   const [accountPassword, setAccountPassword] = useState("");
 
+  // Security Passphrase for vault unlock after a page reload. Never sent to
+  // the server — validated locally against the IndexedDB verification blob.
+  const [unlockPassphrase, setUnlockPassphrase] = useState("");
+
+  // Whether a vault already exists in IndexedDB. Controls navigation guards:
+  // when true, the intro screen must not expose passphrase creation and the
+  // wipe-key Back button must return to unlock, not passphrase.
+  const [hasExistingVault, setHasExistingVault] = useState(false);
+
   useEffect(() => {
     const ns = getActiveCryptoNamespace();
     void hasSecuritySetupCompleted(ns).then(async (done) => {
@@ -63,9 +72,32 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
       // had no wipe key, this device still needs to enable one -- but
       // asking for a SECOND, different passphrase here would orphan the
       // one just created. Skip straight to "wipekey".
-      if (await hasSecurityPassphrase()) setStep("wipekey");
+      //
+      // HOWEVER: the in-memory vaultKey does NOT survive page reloads.
+      // If the vault exists in IndexedDB but the in-memory key is null,
+      // the wipekey step will fail with "security vault is locked" because
+      // every wipe-key operation (load, create, encrypt, decrypt) requires
+      // the unwrapped vault key. Show the unlock form first.
+      if (await hasSecurityPassphrase()) {
+        setHasExistingVault(true);
+        if (isVaultUnlocked()) {
+          setStep("wipekey");
+        } else {
+          setStep("unlock");
+        }
+      }
     });
   }, [navigate]);
+
+  // Clear sensitive fields whenever the step changes — belt-and-suspenders
+  // on top of the per-handler/per-button clearing. This catches navigation
+  // via browser back/forward that might remount the component on a different
+  // step without going through our explicit handlers.
+  useEffect(() => {
+    setPassphrase("");
+    setPassphraseConfirm("");
+    setUnlockPassphrase("");
+  }, [step]);
 
   // Render QR code after the canvas mounts, not during state update.
   useEffect(() => {
@@ -86,9 +118,35 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
     setBusy(true);
     try {
       await createSecurityPassphrase(passphrase);
+      setHasExistingVault(true);
+      setPassphrase("");
+      setPassphraseConfirm("");
       setStep("wipekey");
     } catch (e) {
       setError((e as Error).message || i18n.t("setup.passphraseFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Vault unlock after a page reload. Validates the Security Passphrase
+  // locally against the IndexedDB verification blob — never calls the
+  // server. The passphrase is cleared from component state immediately
+  // after derivation, whether the attempt succeeds or fails.
+  async function handleUnlockVault(): Promise<void> {
+    setError("");
+    setBusy(true);
+    try {
+      const ok = await unlockSecurityVault(unlockPassphrase);
+      setUnlockPassphrase("");
+      if (!ok) {
+        setError(i18n.t("setup.unlockFailed"));
+        return;
+      }
+      setStep("wipekey");
+    } catch {
+      setUnlockPassphrase("");
+      setError(i18n.t("setup.unlockFailed"));
     } finally {
       setBusy(false);
     }
@@ -206,25 +264,32 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
           <>
             <h2 className="text-xl font-semibold text-text">{i18n.t("setup.title")}</h2>
             <p className="mt-3 text-sm text-text-2">{i18n.t("setup.intro")}</p>
-            <div className="mt-4 space-y-3 text-sm text-text-2">
-              <div>
-                <strong className="text-text">{i18n.t("setup.loginPasswordLabel")}</strong>{" "}
-                {i18n.t("setup.loginPasswordDesc")}
+            {!hasExistingVault && (
+              <div className="mt-4 space-y-3 text-sm text-text-2">
+                <div>
+                  <strong className="text-text">{i18n.t("setup.loginPasswordLabel")}</strong>{" "}
+                  {i18n.t("setup.loginPasswordDesc")}
+                </div>
+                <div>
+                  <strong className="text-text">{i18n.t("setup.passphraseLabel")}</strong>{" "}
+                  {i18n.t("setup.passphraseDesc")}
+                </div>
+                <div>
+                  <strong className="text-text">{i18n.t("setup.recoveryKeyLabel")}</strong>{" "}
+                  {i18n.t("setup.recoveryKeyDesc")}
+                </div>
               </div>
-              <div>
-                <strong className="text-text">{i18n.t("setup.passphraseLabel")}</strong>{" "}
-                {i18n.t("setup.passphraseDesc")}
-              </div>
-              <div>
-                <strong className="text-text">{i18n.t("setup.recoveryKeyLabel")}</strong>{" "}
-                {i18n.t("setup.recoveryKeyDesc")}
-              </div>
-            </div>
+            )}
+            {hasExistingVault && (
+              <p className="mt-4 text-sm text-text-2">{i18n.t("setup.vaultAlreadyExists")}</p>
+            )}
             <p className="mt-4 text-xs text-text-2">{i18n.t("setup.warning")}</p>
             <div className="mt-6 space-y-3">
-              <button type="button" className="iceq-btn-primary w-full" onClick={() => setStep("passphrase")}>
-                {i18n.t("setup.beginSetup")}
-              </button>
+              {!hasExistingVault && (
+                <button type="button" className="iceq-btn-primary w-full" onClick={() => setStep("passphrase")}>
+                  {i18n.t("setup.beginSetup")}
+                </button>
+              )}
               <button
                 type="button"
                 className="iceq-btn-secondary w-full text-sm"
@@ -255,9 +320,41 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
             </div>
             {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
             <div className="mt-5 flex gap-2">
-              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep("intro")}>{i18n.t("setup.back")}</button>
+              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => { setPassphrase(""); setPassphraseConfirm(""); setStep("intro"); }}>{i18n.t("setup.back")}</button>
               <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !passphrase} onClick={handleCreatePassphrase}>
                 {busy ? i18n.t("setup.creating") : i18n.t("setup.continue")}
+              </button>
+            </div>
+          </>
+        )}
+
+        {step === "unlock" && (
+          <>
+            <h2 className="text-xl font-semibold text-text">{i18n.t("setup.unlockTitle")}</h2>
+            <p className="mt-2 text-sm text-text-2">{i18n.t("setup.unlockHelp")}</p>
+            <div className="mt-4 space-y-3">
+              <div>
+                <label htmlFor="setup-unlock-passphrase" className="mb-1 block text-xs font-semibold text-text">
+                  {i18n.t("setup.unlockPassphraseLabel")}
+                </label>
+                <p className="mb-1 text-xs text-text-2">{i18n.t("setup.unlockPassphraseHelp")}</p>
+                <input
+                  id="setup-unlock-passphrase"
+                  type="password"
+                  autoComplete="new-password"
+                  className="iceq-input w-full"
+                  value={unlockPassphrase}
+                  onChange={(e) => setUnlockPassphrase(e.target.value)}
+                  disabled={busy}
+                  placeholder={i18n.t("setup.unlockPassphrasePlaceholder")}
+                />
+              </div>
+            </div>
+            {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
+            <div className="mt-5 flex gap-2">
+              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => { setUnlockPassphrase(""); setStep("intro"); }}>{i18n.t("setup.back")}</button>
+              <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !unlockPassphrase} onClick={handleUnlockVault}>
+                {busy ? i18n.t("setup.unlocking") : i18n.t("setup.unlockAction")}
               </button>
             </div>
           </>
@@ -287,7 +384,7 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
             </div>
             {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
             <div className="mt-5 flex gap-2">
-              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep("passphrase")}>{i18n.t("setup.back")}</button>
+              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep(hasExistingVault ? "unlock" : "passphrase")}>{i18n.t("setup.back")}</button>
               <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !accountPassword} onClick={handleEnableWipeKey}>
                 {busy ? i18n.t("setup.wipeKeyEnabling") : i18n.t("setup.wipeKeyEnable")}
               </button>

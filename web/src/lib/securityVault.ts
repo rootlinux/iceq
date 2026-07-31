@@ -55,6 +55,16 @@ async function importDerivedKey(keyBytes: Uint8Array, usages: KeyUsage[]): Promi
 export async function createSecurityPassphrase(passphrase: string): Promise<void> {
   assertPassphrasePolicy(passphrase);
 
+  // Refuse to overwrite an existing vault. Overwriting would change the
+  // salt and verification blob, orphaning any encrypted Panic Wipe private
+  // key already stored in IndexedDB under the old vault key. There is no
+  // automatic reset or recovery path here — if a legitimate vault-reset is
+  // ever needed, it must be a separate, explicit, authenticated operation.
+  const ns = getActiveCryptoNamespace();
+  if (await hasSecurityPassphrase()) {
+    throw new Error("security vault already exists — cannot overwrite");
+  }
+
   const salt = new Uint8Array(SALT_BYTES);
   globalThis.crypto.getRandomValues(salt);
 
@@ -77,7 +87,6 @@ export async function createSecurityPassphrase(passphrase: string): Promise<void
   );
 
   const blob = encodeVaultBlob(iv, new Uint8Array(ciphertext));
-  const ns = getActiveCryptoNamespace();
 
   await saveSecurityVaultSalt(ns, bytesToBase64url(salt));
   await saveSecurityVaultBlob(ns, blob);
@@ -103,7 +112,7 @@ export async function unlockSecurityVault(passphrase: string): Promise<boolean> 
 
   let derived: CryptoKey;
   try {
-    derived = await importDerivedKey(keyBytes, ["decrypt"]);
+    derived = await importDerivedKey(keyBytes, ["encrypt", "decrypt"]);
   } catch {
     return false;
   }
