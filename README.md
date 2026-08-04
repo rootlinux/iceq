@@ -10,7 +10,6 @@
 [![TypeScript](https://img.shields.io/badge/frontend-React%20%2B%20TypeScript-3178C6?logo=typescript&logoColor=white)](web/package.json)
 [![Signal Protocol](https://img.shields.io/badge/crypto-Signal%20Protocol%20%2B%20Sender%20Keys-4CE1A1)](#e2ee-design)
 [![Tests](https://img.shields.io/badge/tests-Go%20%2B%20unit%20%2B%20e2e-59D8FF)](#development)
-[![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 </div>
 
@@ -446,7 +445,3 @@ GitHub Actions workflow [`security-ci.yml`](.github/workflows/security-ci.yml) r
 - **Metadata-reduced message storage** - optional message TTL is available, but conversation IDs and sender/receiver routing metadata still need a deeper minimization redesign
 - **Independent review and production acceptance** — repository tests do not replace a cryptographic audit, penetration test, backup/restore rehearsal, or clearnet real-user acceptance
 - **Tor runtime** — opt-in Compose assets exist, but boot, consensus publication, onion reachability, and DNS-leak testing are intentionally deferred until after clearnet acceptance
-
-## License
-
-MIT — see [LICENSE](LICENSE).
