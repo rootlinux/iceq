@@ -143,6 +143,31 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
 
+		// Use the same parent-before-child lock order as login and PanicWipe.
+		// This prevents a refresh rotation from holding a refresh_tokens row
+		// while waiting on the users FK lock as PanicWipe waits in the opposite
+		// direction. The marker check also rejects a rotation that was already
+		// past JWT verification when PanicWipe committed.
+		var lockedUIN int64
+		if err := tx.QueryRow(ctx, qLockUserRow, claims.UIN).Scan(&lockedUIN); err != nil {
+			log.Printf("[auth-service] refresh: lock user row: %v", err)
+			clearSessionCookies(w)
+			writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED", "session is no longer valid")
+			return
+		}
+		var wiped bool
+		if err := tx.QueryRow(ctx, qCheckWipedAccount, claims.UIN).Scan(&wiped); err != nil {
+			log.Printf("[auth-service] refresh: wiped-account check: %v", err)
+			clearSessionCookies(w)
+			writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED", "session is no longer valid")
+			return
+		}
+		if wiped {
+			clearSessionCookies(w)
+			writeError(w, http.StatusUnauthorized, "REFRESH_REVOKED", "session is no longer valid")
+			return
+		}
+
 		err = tx.QueryRow(ctx, qConsumeRefreshTokenByHash, tokenHash).
 			Scan(&dbUIN, &dbExpiresAt)
 		if err != nil {

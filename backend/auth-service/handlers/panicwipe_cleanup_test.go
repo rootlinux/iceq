@@ -100,6 +100,38 @@ func TestPanicWipeRevokesSessionsBeforePGTransaction(t *testing.T) {
 	}
 }
 
+func TestPanicWipeLocksUserBeforeDeletingRefreshTokens(t *testing.T) {
+	src := mustReadFile(t, "panicwipe.go")
+	panicWipeStart := strings.Index(src, "func PanicWipe(")
+	if panicWipeStart < 0 {
+		t.Fatal("PanicWipe function not found")
+	}
+	panicWipeSource := src[panicWipeStart:]
+
+	begin := strings.Index(panicWipeSource, "deps.Pool.Begin(ctx)")
+	lock := strings.Index(panicWipeSource, "tx.QueryRow(ctx, qLockUserRow, uin)")
+	deleteRefreshTokens := strings.Index(panicWipeSource, "tx.Exec(ctx, qWipeRefreshTokens, uin)")
+
+	if begin < 0 || lock < 0 || deleteRefreshTokens < 0 {
+		t.Fatalf(
+			"required wipe serialization statements missing: begin=%d lock=%d delete_refresh_tokens=%d",
+			begin,
+			lock,
+			deleteRefreshTokens,
+		)
+	}
+	if lock <= begin {
+		t.Fatalf("user-row lock (pos=%d) must run inside the wipe transaction (begin pos=%d)", lock, begin)
+	}
+	if lock >= deleteRefreshTokens {
+		t.Fatalf(
+			"user-row lock (pos=%d) must precede refresh-token deletion (pos=%d) so login cannot insert a token after the wipe DELETE",
+			lock,
+			deleteRefreshTokens,
+		)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Behavioral: recovery defer removes blocklist on failure
 // ---------------------------------------------------------------------------

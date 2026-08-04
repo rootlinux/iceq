@@ -23,22 +23,40 @@ import (
 type fakeNatsCleaner struct {
 	calls int
 }
+type recordingWipeNotifier struct {
+	subject string
+	data    []byte
+	err     error
+}
 type fakeMinioCleaner struct {
 	objectCalls int
 	grantCalls  int
 }
 type fakeMinioError struct{}
 
-func (f *fakeNatsCleaner) PurgeUserStreams(ctx context.Context, uin int64) error { f.calls++; return nil }
+func (f *fakeNatsCleaner) PurgeUserStreams(ctx context.Context, uin int64) error {
+	f.calls++
+	return nil
+}
+func (n *recordingWipeNotifier) Publish(subject string, data []byte) error {
+	n.subject = subject
+	n.data = append([]byte(nil), data...)
+	return n.err
+}
 func (f *fakeMinioCleaner) DeleteUserObjects(ctx context.Context, uin int64, fileKeys []string) error {
 	f.objectCalls++
 	return nil
 }
-func (f *fakeMinioCleaner) DeleteUserGrants(ctx context.Context, uin int64) error { f.grantCalls++; return nil }
+func (f *fakeMinioCleaner) DeleteUserGrants(ctx context.Context, uin int64) error {
+	f.grantCalls++
+	return nil
+}
 func (f *fakeMinioError) DeleteUserObjects(ctx context.Context, uin int64, fileKeys []string) error {
 	return errors.New("minio offline")
 }
-func (f *fakeMinioError) DeleteUserGrants(ctx context.Context, uin int64) error { return errors.New("grant store offline") }
+func (f *fakeMinioError) DeleteUserGrants(ctx context.Context, uin int64) error {
+	return errors.New("grant store offline")
+}
 
 // TestPanicWipeSignatureErrorSanitized verifies that signature verification errors
 // do not leak internal infrastructure details (Redis hosts, PG errors, base64 details).
@@ -194,11 +212,13 @@ func (*recordingMessageStore) DeleteUserGroupMessages(context.Context, int64) er
 func TestManualPanicWipeHandlerUsesAuthenticatedUINAndClearsCookies(t *testing.T) {
 	const authenticatedUIN int64 = 10000001
 	lookup, _ := testPinHashLookup(t)
+	notifier := &recordingWipeNotifier{}
 
 	var wipedUIN int64
 	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
-		PanicWipeDeps:     PanicWipeDeps{},
+		PanicWipeDeps:      PanicWipeDeps{},
 		LookupPanicPinHash: lookup,
+		WipeNotifier:       notifier,
 		Wipe: func(ctx context.Context, deps PanicWipeDeps, uin int64) (int64, error) {
 			wipedUIN = uin
 			return 0, nil
@@ -217,6 +237,12 @@ func TestManualPanicWipeHandlerUsesAuthenticatedUINAndClearsCookies(t *testing.T
 	if wipedUIN != authenticatedUIN {
 		t.Fatalf("wiped UIN = %d, want %d", wipedUIN, authenticatedUIN)
 	}
+	if notifier.subject != "account.wiped.10000001" {
+		t.Fatalf("wipe notification subject = %q, want %q", notifier.subject, "account.wiped.10000001")
+	}
+	if len(notifier.data) != 0 {
+		t.Fatalf("wipe notification payload = %q, want empty non-identifying payload", notifier.data)
+	}
 	if rr.Body.Len() == 0 {
 		t.Fatalf("body = %q, want non-empty 202 body", rr.Body.String())
 	}
@@ -231,12 +257,49 @@ func TestManualPanicWipeHandlerUsesAuthenticatedUINAndClearsCookies(t *testing.T
 	}
 }
 
+func TestManualPanicWipeHandlerReturnsAcceptedWhenLiveNotificationFails(t *testing.T) {
+	lookup, _ := testPinHashLookup(t)
+	notifier := &recordingWipeNotifier{err: errors.New("nats unavailable")}
+	wipeCalls := 0
+
+	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
+		LookupPanicPinHash: lookup,
+		WipeNotifier:       notifier,
+		Wipe: func(context.Context, PanicWipeDeps, int64) (int64, error) {
+			wipeCalls++
+			return 42, nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/panic-wipe", strings.NewReader(`{"pin":"1234"}`))
+	req = req.WithContext(middleware.WithUIN(req.Context(), 10000001))
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body = %q", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	if wipeCalls != 1 {
+		t.Fatalf("wipe calls = %d, want 1", wipeCalls)
+	}
+	if notifier.subject != "account.wiped.10000001" {
+		t.Fatalf("wipe notification subject = %q, want target subject", notifier.subject)
+	}
+	for _, cookie := range []string{refreshCookieName, accessCookieName} {
+		cleared := findCookie(rr.Result().Cookies(), cookie)
+		if cleared == nil || cleared.MaxAge != -1 {
+			t.Fatalf("cookie %q = %#v, want cleared after committed wipe", cookie, cleared)
+		}
+	}
+}
+
 func TestManualPanicWipeHandlerPassesMessageStoreDependencyToWipe(t *testing.T) {
 	store := &recordingMessageStore{}
 	lookup, _ := testPinHashLookup(t)
 	var got MessageStore
 	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
-		PanicWipeDeps:     PanicWipeDeps{Scylla: store},
+		PanicWipeDeps:      PanicWipeDeps{Scylla: store},
 		LookupPanicPinHash: lookup,
 		Wipe: func(_ context.Context, deps PanicWipeDeps, _ int64) (int64, error) {
 			got = deps.Scylla
@@ -259,8 +322,10 @@ func TestManualPanicWipeHandlerPassesMessageStoreDependencyToWipe(t *testing.T) 
 
 func TestManualPanicWipeHandlerClearsCookiesOnFailureWithoutMetadata(t *testing.T) {
 	lookup, _ := testPinHashLookup(t)
+	notifier := &recordingWipeNotifier{}
 	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
 		LookupPanicPinHash: lookup,
+		WipeNotifier:       notifier,
 		Wipe: func(ctx context.Context, deps PanicWipeDeps, uin int64) (int64, error) {
 			return 0, errors.New("storage unavailable for sensitive user")
 		},
@@ -277,6 +342,9 @@ func TestManualPanicWipeHandlerClearsCookiesOnFailureWithoutMetadata(t *testing.
 	}
 	if body := rr.Body.String(); body == "" || containsAny(body, []string{"10000002", "storage unavailable", "sensitive user"}) {
 		t.Fatalf("body leaks metadata or is empty: %q", body)
+	}
+	if notifier.subject != "" {
+		t.Fatalf("notification subject = %q, want none before a committed wipe", notifier.subject)
 	}
 	refresh := findCookie(rr.Result().Cookies(), refreshCookieName)
 	access := findCookie(rr.Result().Cookies(), accessCookieName)
@@ -350,13 +418,78 @@ func TestManualPanicWipeHandlerAcceptsCorrectPin(t *testing.T) {
 	}
 }
 
+func TestManualPanicWipeHandlerAcceptsConfiguredPinWhenWipeKeyAlsoExists(t *testing.T) {
+	pinHash, err := hashPassword("1234")
+	if err != nil {
+		t.Fatalf("hash pin: %v", err)
+	}
+	pubKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate wipe key: %v", err)
+	}
+
+	var wiped bool
+	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
+		Wipe:               func(context.Context, PanicWipeDeps, int64) (int64, error) { wiped = true; return 0, nil },
+		LookupPanicPinHash: func(context.Context, int64) (string, error) { return pinHash, nil },
+		ChallengeSignatureDeps: &ChallengeSignatureDeps{
+			LookupWipePublicKey: func(context.Context, int64) (ed25519.PublicKey, error) { return pubKey, nil },
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/panic-wipe", strings.NewReader(`{"pin":"1234"}`))
+	req = req.WithContext(middleware.WithUIN(req.Context(), 10000001))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rr.Code, rr.Body.String())
+	}
+	if !wiped {
+		t.Fatal("wipe was not invoked despite a correct explicitly-configured panic PIN")
+	}
+}
+
+func TestManualPanicWipeHandlerRejectsWrongConfiguredPinWhenWipeKeyAlsoExists(t *testing.T) {
+	pinHash, err := hashPassword("1234")
+	if err != nil {
+		t.Fatalf("hash pin: %v", err)
+	}
+	pubKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate wipe key: %v", err)
+	}
+
+	var wiped bool
+	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
+		Wipe:               func(context.Context, PanicWipeDeps, int64) (int64, error) { wiped = true; return 0, nil },
+		LookupPanicPinHash: func(context.Context, int64) (string, error) { return pinHash, nil },
+		ChallengeSignatureDeps: &ChallengeSignatureDeps{
+			LookupWipePublicKey: func(context.Context, int64) (ed25519.PublicKey, error) { return pubKey, nil },
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/panic-wipe", strings.NewReader(`{"pin":"9999"}`))
+	req = req.WithContext(middleware.WithUIN(req.Context(), 10000001))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"code":"INVALID_PIN"`) {
+		t.Fatalf("body = %s, want INVALID_PIN", rr.Body.String())
+	}
+	if wiped {
+		t.Fatal("account was wiped despite an incorrect panic PIN")
+	}
+}
+
 func TestWipeInvokesNatsCleanerWhenDepsHasNats(t *testing.T) {
 	cleaner := &fakeNatsCleaner{}
 	lookup, _ := testPinHashLookup(t)
 	var gotNATS NatsCleaner
 
 	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
-		PanicWipeDeps:     PanicWipeDeps{NATS: cleaner},
+		PanicWipeDeps:      PanicWipeDeps{NATS: cleaner},
 		LookupPanicPinHash: lookup,
 		Wipe: func(_ context.Context, deps PanicWipeDeps, _ int64) (int64, error) {
 			gotNATS = deps.NATS
@@ -412,7 +545,7 @@ func TestWipeInvokesMinioCleanerWhenSet(t *testing.T) {
 	lookup, _ := testPinHashLookup(t)
 	var gotMinio MinioCleaner
 	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
-		PanicWipeDeps:     PanicWipeDeps{Minio: cleaner},
+		PanicWipeDeps:      PanicWipeDeps{Minio: cleaner},
 		LookupPanicPinHash: lookup,
 		Wipe: func(_ context.Context, deps PanicWipeDeps, _ int64) (int64, error) {
 			gotMinio = deps.Minio
@@ -449,7 +582,7 @@ func TestWipeSucceedsWhenMinioReturnsErrors(t *testing.T) {
 	errCleaner := &fakeMinioError{}
 	lookup, _ := testPinHashLookup(t)
 	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
-		PanicWipeDeps:     PanicWipeDeps{Minio: errCleaner},
+		PanicWipeDeps:      PanicWipeDeps{Minio: errCleaner},
 		LookupPanicPinHash: lookup,
 		Wipe: func(_ context.Context, deps PanicWipeDeps, _ int64) (int64, error) {
 			if deps.Minio != nil {
@@ -483,7 +616,7 @@ func TestPanicWipeRemovesBlocklistOnPGTransactionFailure(t *testing.T) {
 
 	var blocklistRemoved bool
 	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
-		PanicWipeDeps:     PanicWipeDeps{Redis: rdb},
+		PanicWipeDeps:      PanicWipeDeps{Redis: rdb},
 		LookupPanicPinHash: lookup,
 		Wipe: func(ctx context.Context, deps PanicWipeDeps, uin int64) (int64, error) {
 			// Simulate: blocklist SET succeeds, but PG fails.
@@ -579,7 +712,7 @@ func TestManualPanicWipeHandlerCarriesNatsAndMinio(t *testing.T) {
 	var gotNATS NatsCleaner
 	var gotMinio MinioCleaner
 	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
-		PanicWipeDeps:     PanicWipeDeps{NATS: natsCleaner, Minio: minioCleaner},
+		PanicWipeDeps:      PanicWipeDeps{NATS: natsCleaner, Minio: minioCleaner},
 		LookupPanicPinHash: lookup,
 		Wipe: func(_ context.Context, deps PanicWipeDeps, _ int64) (int64, error) {
 			gotNATS = deps.NATS
@@ -604,7 +737,7 @@ func TestManualPanicWipeHandlerCarriesNatsAndMinio(t *testing.T) {
 	}
 }
 
-func TestPanicWipeRejectsMigratedAccountWithPin(t *testing.T) {
+func TestPanicWipeDoesNotFallbackToPinWhenSignatureFieldsArePresent(t *testing.T) {
 	pinHash, err := hashPassword("1234")
 	if err != nil {
 		t.Fatalf("hash pin: %v", err)
@@ -619,8 +752,9 @@ func TestPanicWipeRejectsMigratedAccountWithPin(t *testing.T) {
 			LookupWipePublicKey: func(context.Context, int64) (ed25519.PublicKey, error) { return dummyPubKey, nil },
 		},
 	})
-	// Migrated account (has wipe_public_key) sends PIN — must be rejected
-	req := httptest.NewRequest(http.MethodPost, "/api/auth/panic-wipe", strings.NewReader(`{"pin":"1234"}`))
+	// Once the caller submits any signature field, the handler must remain on
+	// the signature verifier and must not fall back to an otherwise valid PIN.
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/panic-wipe", strings.NewReader(`{"pin":"1234","signature":"incomplete"}`))
 	req = req.WithContext(middleware.WithUIN(req.Context(), 10000001))
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
@@ -628,7 +762,74 @@ func TestPanicWipeRejectsMigratedAccountWithPin(t *testing.T) {
 		t.Fatalf("status = %d, want 401; body=%s", rr.Code, rr.Body.String())
 	}
 	if wiped {
-		t.Fatal("migrated account wipe was invoked via PIN path")
+		t.Fatal("wipe was invoked by falling back to PIN after an incomplete signature request")
+	}
+}
+
+func TestPanicWipeDoesNotFallbackToValidPinAfterInvalidSignature(t *testing.T) {
+	const uin int64 = 10000002
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	pinHash, err := hashPassword("1234")
+	if err != nil {
+		t.Fatalf("hash pin: %v", err)
+	}
+	pub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate wipe key: %v", err)
+	}
+	challenge := make([]byte, 32)
+	if _, err := rand.Read(challenge); err != nil {
+		t.Fatalf("generate challenge: %v", err)
+	}
+	challengeID := "invalid-signature-with-valid-pin"
+	challengeKey := wipeChallengePrefix + itoa(uin) + ":" + challengeID
+	if err := rdb.Set(
+		context.Background(),
+		challengeKey,
+		base64.StdEncoding.EncodeToString(challenge),
+		wipeChallengeTTL,
+	).Err(); err != nil {
+		t.Fatalf("store challenge: %v", err)
+	}
+	_, wrongPrivateKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate wrong signing key: %v", err)
+	}
+
+	var wiped bool
+	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
+		Wipe:               func(context.Context, PanicWipeDeps, int64) (int64, error) { wiped = true; return 0, nil },
+		LookupPanicPinHash: func(context.Context, int64) (string, error) { return pinHash, nil },
+		ChallengeSignatureDeps: &ChallengeSignatureDeps{
+			LookupWipePublicKey: func(context.Context, int64) (ed25519.PublicKey, error) { return pub, nil },
+			Redis:               rdb,
+		},
+	})
+	body, err := json.Marshal(manualPanicWipeRequest{
+		Pin:         "1234",
+		ChallengeID: challengeID,
+		Signature:   base64.StdEncoding.EncodeToString(ed25519.Sign(wrongPrivateKey, challenge)),
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/panic-wipe", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(middleware.WithUIN(req.Context(), uin))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"code":"INVALID_SIGNATURE"`) {
+		t.Fatalf("body = %s, want INVALID_SIGNATURE", rr.Body.String())
+	}
+	if wiped {
+		t.Fatal("wipe was invoked by falling back to a valid PIN after signature verification failed")
 	}
 }
 
@@ -700,7 +901,7 @@ func TestWipeOfUserADoesNotDeleteUserBObjects(t *testing.T) {
 	// Simulate PG: captureFileKeys will query file_objects. We inject a
 	// fake Wipe that receives the captured keys and passes them to MinIO.
 	handler := NewManualPanicWipeHandler(ManualPanicWipeDeps{
-		PanicWipeDeps:     PanicWipeDeps{Minio: recorder},
+		PanicWipeDeps:      PanicWipeDeps{Minio: recorder},
 		LookupPanicPinHash: lookup,
 		Wipe: func(ctx context.Context, deps PanicWipeDeps, uin int64) (int64, error) {
 			// Simulate what PanicWipe does: capture keys, then pass to MinIO.

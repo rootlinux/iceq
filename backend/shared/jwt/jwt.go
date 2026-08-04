@@ -419,6 +419,20 @@ func (m *Manager) IsAccountWiped(ctx context.Context, uin int64) (bool, error) {
 	return wiped, err
 }
 
+// IsAccountWipedOrMissing is the durable authority for destructive
+// live-session revocation. The temporary wiped_accounts marker covers the
+// interval while the cleanup worker runs; the missing users row covers the
+// permanent state after final erasure removes that marker.
+func (m *Manager) IsAccountWipedOrMissing(ctx context.Context, uin int64) (bool, error) {
+	var wipedOrMissing bool
+	err := m.pg.QueryRow(ctx, `
+		SELECT
+			EXISTS (SELECT 1 FROM wiped_accounts WHERE uin = $1)
+			OR NOT EXISTS (SELECT 1 FROM users WHERE uin = $1)
+	`, uin).Scan(&wipedOrMissing)
+	return wipedOrMissing, err
+}
+
 // SessionEpoch returns the current session_epoch for the user. The
 // zero-value time.Time is returned (along with no error) when the user
 // does not exist — Verify never relies on this distinction because a

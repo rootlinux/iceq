@@ -188,7 +188,14 @@ var (
 	// Runs in a single transaction inside the worker after Scylla, NATS,
 	// and MinIO cleanup all succeed. After this transaction, zero rows
 	// associated with the wiped UIN remain in any PostgreSQL table.
+	//
+	// FK-safe deletion order: refresh_tokens (no CASCADE, and a concurrent
+	// login that slips past the serialization boundary could insert a row
+	// after PanicWipe's initial DELETE) → wiped_accounts (FK to users) →
+	// users. All other FK children were deleted by PanicWipe's own
+	// transaction or carry ON DELETE CASCADE.
 	qFinalUserErasure = `
+		DELETE FROM refresh_tokens WHERE uin = $1;
 		DELETE FROM wiped_accounts WHERE uin = $1;
 		DELETE FROM users WHERE uin = $1;
 	`
@@ -604,6 +611,15 @@ func (r *WipeJobRunner) processOneJob(parent context.Context) {
 		// Rollback is a no-op after commit; safe to defer unconditionally.
 		defer func() { _ = tx.Rollback(finalCtx) }()
 
+		// Defense in depth: delete any remaining refresh_tokens before the
+		// user row. The FK refresh_tokens.uin → users(uin) has no CASCADE;
+		// this also cleans up legacy rows created before login/wipe
+		// serialization was enforced.
+		if _, txErr = tx.Exec(finalCtx, `DELETE FROM refresh_tokens WHERE uin = $1`, uin); txErr != nil {
+			log.Printf("[auth-service] wipe-worker: final erasure refresh_tokens failed for job %d uin %d: %v", jobID, uin, txErr)
+			r.scheduleRetry(finalCtx, jobID, []string{"final-erasure"}, retryCount, wID)
+			return
+		}
 		if _, txErr = tx.Exec(finalCtx, `DELETE FROM wiped_accounts WHERE uin = $1`, uin); txErr != nil {
 			log.Printf("[auth-service] wipe-worker: final erasure wiped_accounts failed for job %d uin %d: %v", jobID, uin, txErr)
 			r.scheduleRetry(finalCtx, jobID, []string{"final-erasure"}, retryCount, wID)

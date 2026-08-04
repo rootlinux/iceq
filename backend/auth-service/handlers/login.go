@@ -221,10 +221,9 @@ func NewLoginHandler(deps LoginDeps) http.HandlerFunc {
 		}
 
 		// ------------------------------------------------------------
-		// 4. Mint a fresh access + refresh pair. Both tokens
-		// are signed with the same secret but carry different
-		// `type` claims so the ws-gateway and the /refresh
-		// endpoint can reject cross-type use at the parser.
+		// 4. Rehash legacy password hashes (best-effort, non-fatal).
+		//    Done before the serialization transaction so a rehash
+		//    failure does not roll back the session issuance.
 		// ------------------------------------------------------------
 		if passwordResult.NeedsRehash {
 			rehash, err := hashPassword(req.Password)
@@ -235,9 +234,67 @@ func NewLoginHandler(deps LoginDeps) http.HandlerFunc {
 			}
 		}
 
-		tokens, err := issueSession(ctx, deps.Pool, deps.Manager, uin)
+		// ------------------------------------------------------------
+		// 5. Serialize with PanicWipe via SELECT ... FOR UPDATE on
+		//    the user row. PanicWipe acquires the same row lock before
+		//    deleting refresh tokens, so the two transactions cannot
+		//    pass each other. After acquiring the lock we check the
+		//    wiped_accounts marker inside the same transaction —
+		//    the check and the session issuance are atomic.
+		// ------------------------------------------------------------
+		tx, txErr := deps.Pool.Begin(ctx)
+		if txErr != nil {
+			log.Printf("[auth-service] login: begin tx: %v", txErr)
+			writeError(w, http.StatusServiceUnavailable, "AUTH_SERVICE_UNAVAILABLE", "service is temporarily unavailable")
+			return
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+
+		// Lock the user row. PanicWipe takes the same conflicting lock
+		// at the beginning of its transaction; this guarantees that either
+		// PanicWipe committed before we acquired the lock (wiped_accounts
+		// marker is visible) or it blocks until we commit (marker is
+		// absent, session is created, then PanicWipe deletes it).
+		var lockUIN int64
+		if err := tx.QueryRow(ctx, qLockUserRow, uin).Scan(&lockUIN); err != nil {
+			// No rows means the user row was deleted between the
+			// initial lookup and now (worker final erasure). Every
+			// other error is a database failure. Both are fail-closed.
+			log.Printf("[auth-service] login: lock user row: %v", err)
+			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid credentials")
+			return
+		}
+
+		// Check the wiped_accounts marker inside the locked transaction.
+		var wiped bool
+		if err := tx.QueryRow(ctx, qCheckWipedAccount, uin).Scan(&wiped); err != nil {
+			// Fail-closed: cannot determine whether the account is
+			// wiped, so reject the login. A 503 would leak whether
+			// the account exists, so return the generic 401.
+			log.Printf("[auth-service] login: wiped-account check: %v", err)
+			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid credentials")
+			return
+		}
+		if wiped {
+			// The account was wiped between password verification
+			// and now. Reject with the same generic 401 as a wrong
+			// password — the bcrypt already ran, so the timing is
+			// indistinguishable.
+			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid credentials")
+			return
+		}
+
+		// Issue the session inside the transaction. The refresh-token
+		// row is committed atomically with the wiped-account check.
+		tokens, err := issueSessionTx(ctx, tx, deps.Manager, uin)
 		if err != nil {
 			log.Printf("[auth-service] issue login session: %v", err)
+			writeError(w, http.StatusInternalServerError, "TOKEN_ISSUE_FAILED", "could not issue session")
+			return
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			log.Printf("[auth-service] login: commit tx: %v", err)
 			writeError(w, http.StatusInternalServerError, "TOKEN_ISSUE_FAILED", "could not issue session")
 			return
 		}

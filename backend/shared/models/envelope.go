@@ -80,6 +80,11 @@ const (
 	// The web client subscribes to `notification.<uin>` and surfaces
 	// these in a toast / notification list.
 	EnvelopeTypeNotification = "notification"
+
+	// EnvelopeTypeAccountWiped is a terminal server-to-client control frame.
+	// It is sent only after the wipe event has been verified against durable
+	// account state and immediately before the 4403 close handshake.
+	EnvelopeTypeAccountWiped = "account_wiped"
 )
 
 // ----------------------------------------------------------------------------
@@ -176,6 +181,23 @@ type Envelope struct {
 	ID      string          `json:"id"`
 	TS      int64           `json:"ts"`
 	Payload json.RawMessage `json:"payload"`
+}
+
+// IsReservedServerControlEnvelope reports whether raw is the irreversible
+// account-deletion control frame. Generic NATS, Redis, polling, and hub fanout
+// paths must reject this type: only the ws-gateway's durable-account-verified
+// terminal path is allowed to emit it directly to an authenticated socket.
+func IsReservedServerControlEnvelope(raw []byte) bool {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil {
+		return false
+	}
+	encodedType, ok := object["type"]
+	if !ok {
+		return false
+	}
+	var exactType string
+	return json.Unmarshal(encodedType, &exactType) == nil && exactType == EnvelopeTypeAccountWiped
 }
 
 // NewEnvelope constructs a server-side envelope with a fresh UUID and

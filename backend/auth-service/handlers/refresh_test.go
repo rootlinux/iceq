@@ -113,11 +113,15 @@ func (m *atomicRefreshManager) BumpSessionEpoch(context.Context, int64) error {
 }
 
 type atomicRefreshDB struct {
-	mu        sync.Mutex
-	present   bool
-	revoked   bool
-	revokeErr error
-	commitErr error
+	mu         sync.Mutex
+	present    bool
+	userExists bool
+	wiped      bool
+	queries    []string
+	consumed   bool
+	revoked    bool
+	revokeErr  error
+	commitErr  error
 }
 
 type alwaysAllowRefreshLimiter struct{}
@@ -175,13 +179,24 @@ func (t *atomicRefreshTx) Exec(_ context.Context, query string, _ ...any) (pgcon
 func (t *atomicRefreshTx) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return nil, errors.New("unused")
 }
-func (t *atomicRefreshTx) QueryRow(context.Context, string, ...any) pgx.Row {
+func (t *atomicRefreshTx) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
+	t.db.queries = append(t.db.queries, query)
+	if query == qLockUserRow {
+		if !t.db.userExists {
+			return atomicRefreshRow{err: pgx.ErrNoRows}
+		}
+		return atomicRefreshRow{uin: 4242, kind: "lock"}
+	}
+	if query == qCheckWipedAccount {
+		return atomicRefreshRow{wiped: t.db.wiped, kind: "wiped"}
+	}
 	if !t.db.present {
 		return atomicRefreshRow{err: pgx.ErrNoRows}
 	}
 	t.db.present = false
+	t.db.consumed = true
 	return atomicRefreshRow{uin: 4242, expires: time.Now().Add(time.Hour)}
 }
 func (t *atomicRefreshTx) Conn() *pgx.Conn { return nil }
@@ -189,6 +204,8 @@ func (t *atomicRefreshTx) Conn() *pgx.Conn { return nil }
 type atomicRefreshRow struct {
 	uin     int64
 	expires time.Time
+	wiped   bool
+	kind    string
 	err     error
 }
 
@@ -196,13 +213,21 @@ func (r atomicRefreshRow) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
+	if r.kind == "lock" {
+		*(dest[0].(*int64)) = r.uin
+		return nil
+	}
+	if r.kind == "wiped" {
+		*(dest[0].(*bool)) = r.wiped
+		return nil
+	}
 	*(dest[0].(*int64)) = r.uin
 	*(dest[1].(*time.Time)) = r.expires
 	return nil
 }
 
 func TestRefreshConcurrentUseAtomicallyMintsExactlyOnePair(t *testing.T) {
-	db := &atomicRefreshDB{present: true}
+	db := &atomicRefreshDB{present: true, userExists: true}
 	manager := &atomicRefreshManager{}
 	h := NewRefreshHandler(RefreshDeps{
 		Pool:    db,
@@ -241,8 +266,29 @@ func TestRefreshConcurrentUseAtomicallyMintsExactlyOnePair(t *testing.T) {
 	}
 }
 
+func TestRefreshLocksUserAndRejectsWipedAccountBeforeConsumingToken(t *testing.T) {
+	db := &atomicRefreshDB{present: true, userExists: true, wiped: true}
+	h := NewRefreshHandler(RefreshDeps{
+		Pool: db, Manager: &atomicRefreshManager{}, Limiter: alwaysAllowRefreshLimiter{},
+	})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, refreshRequest("valid-refresh-token"))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.consumed {
+		t.Fatal("refresh token was consumed after the account was marked wiped")
+	}
+	if len(db.queries) < 2 || db.queries[0] != qLockUserRow || db.queries[1] != qCheckWipedAccount {
+		t.Fatalf("query order = %v, want user lock then wiped-account check", db.queries)
+	}
+}
+
 func TestRefreshReuseRevocationFailureNeverClaimsSessionsWereRevoked(t *testing.T) {
-	db := &atomicRefreshDB{revokeErr: errors.New("injected revoke failure")}
+	db := &atomicRefreshDB{userExists: true, revokeErr: errors.New("injected revoke failure")}
 	h := NewRefreshHandler(RefreshDeps{Pool: db, Manager: &atomicRefreshManager{}, Limiter: alwaysAllowRefreshLimiter{}})
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, refreshRequest("reused-refresh-token"))
@@ -258,7 +304,7 @@ func TestRefreshReuseRevocationFailureNeverClaimsSessionsWereRevoked(t *testing.
 }
 
 func TestRefreshReuseCommitFailureNeverClaimsSessionsWereRevoked(t *testing.T) {
-	db := &atomicRefreshDB{commitErr: errors.New("injected commit failure")}
+	db := &atomicRefreshDB{userExists: true, commitErr: errors.New("injected commit failure")}
 	h := NewRefreshHandler(RefreshDeps{Pool: db, Manager: &atomicRefreshManager{}, Limiter: alwaysAllowRefreshLimiter{}})
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, refreshRequest("reused-refresh-token"))

@@ -82,14 +82,14 @@ type config struct {
 
 func loadConfig() config {
 	return config{
-		Port:            envOr("PORT", "8080"),
-		PostgresDSN:     envOr("ICEQ_PG_DSN", "postgres://postgres:postgres@postgres:5432/iceq?sslmode=disable"),
-		RedisAddr:       envOr("ICEQ_REDIS_ADDR", "redis:6379"),
-		RedisPassword:   envOr("ICEQ_REDIS_PASSWORD", ""),
-		NATSURL:         envOr("ICEQ_NATS_URL", "nats://nats:4222"),
-		ScyllaHosts:     envOr("ICEQ_SCYLLA_HOSTS", "scylla:9042"),
-		ScyllaKeyspace:  envOr("ICEQ_SCYLLA_KEYSPACE", "iceq"),
-		MinioEndpoint:   envOr("ICEQ_MINIO_ENDPOINT", "minio:9000"),
+		Port:           envOr("PORT", "8080"),
+		PostgresDSN:    envOr("ICEQ_PG_DSN", "postgres://postgres:postgres@postgres:5432/iceq?sslmode=disable"),
+		RedisAddr:      envOr("ICEQ_REDIS_ADDR", "redis:6379"),
+		RedisPassword:  envOr("ICEQ_REDIS_PASSWORD", ""),
+		NATSURL:        envOr("ICEQ_NATS_URL", "nats://nats:4222"),
+		ScyllaHosts:    envOr("ICEQ_SCYLLA_HOSTS", "scylla:9042"),
+		ScyllaKeyspace: envOr("ICEQ_SCYLLA_KEYSPACE", "iceq"),
+		MinioEndpoint:  envOr("ICEQ_MINIO_ENDPOINT", "minio:9000"),
 		// Falls back to MINIO_ROOT_USER/MINIO_ROOT_PASSWORD before the
 		// hardcoded default, matching file-service's loadConfig -- those
 		// are the only MinIO credential vars deploy/.env.example actually
@@ -307,6 +307,7 @@ func main() {
 		r.With(authMW, rate("auth:panic-wipe", 3, time.Hour), csrfMW).Post("/panic-wipe", handlers.NewManualPanicWipeHandler(handlers.ManualPanicWipeDeps{
 			PanicWipeDeps:          panicWipeDeps,
 			ChallengeSignatureDeps: challengeSigDeps,
+			WipeNotifier:           bus,
 		}))
 		r.With(authMW, rate("auth:panic-pin", 5, time.Hour), csrfMW).Put("/panic-pin", handlers.NewSetPanicPinHandler(handlers.SetPanicPinDeps{
 			Pool: pgPool,

@@ -44,3 +44,21 @@ func TestIsAccountWipedReturnsDurableMarker(t *testing.T) {
 		t.Fatalf("wiped=%v err=%v, want true nil", wiped, err)
 	}
 }
+
+func TestIsAccountWipedOrMissingReturnsDurableDeletionState(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  bool
+	}{
+		{name: "live account", got: false},
+		{name: "wiped or missing account", got: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Manager{pg: wipePG{wiped: tc.got}}
+			wiped, err := m.IsAccountWipedOrMissing(context.Background(), 10000001)
+			if err != nil || wiped != tc.got {
+				t.Fatalf("wiped=%v err=%v, want %v nil", wiped, err, tc.got)
+			}
+		})
+	}
+}

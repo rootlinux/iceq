@@ -143,6 +143,16 @@ type NatsCleaner interface {
 	PurgeUserStreams(ctx context.Context, uin int64) error
 }
 
+// WipeNotifier emits an ephemeral Core NATS event after the destructive
+// Postgres transaction has committed. The event carries the UIN only in the
+// subject and an empty payload; it is not persisted by IceQ's delivery stream.
+// ws-gateway uses it to close already-open browser sessions immediately rather
+// than relying on the next client heartbeat to observe the short-lived wipe
+// marker.
+type WipeNotifier interface {
+	Publish(subject string, data []byte) error
+}
+
 type MinioCleaner interface {
 	DeleteUserObjects(ctx context.Context, uin int64, fileKeys []string) error
 	DeleteUserGrants(ctx context.Context, uin int64) error
@@ -152,14 +162,14 @@ type MinioCleaner interface {
 // cleanup.
 //
 // Two-phase deletion:
-//   1. CleanupUserKeys — deletes user data keys (presence, poll, undelivered,
-//      login attempts). Called during the "redis" wipe phase. Does NOT
-//      delete the blocklist key.
-//   2. DeleteBlocklistKey — deletes the panic-wipe blocklist key
-//      (jwt:blocklist:wipe:{uin}). Called ONLY after the final PG erasure
-//      transaction commits (user row no longer exists, all connections
-//      terminated). Until then the blocklist key must remain to reject
-//      in-flight sessions.
+//  1. CleanupUserKeys — deletes user data keys (presence, poll, undelivered,
+//     login attempts). Called during the "redis" wipe phase. Does NOT
+//     delete the blocklist key.
+//  2. DeleteBlocklistKey — deletes the panic-wipe blocklist key
+//     (jwt:blocklist:wipe:{uin}). Called ONLY after the final PG erasure
+//     transaction commits (user row no longer exists, all connections
+//     terminated). Until then the blocklist key must remain to reject
+//     in-flight sessions.
 //
 // Blocklist key lifetime:
 //   - Set by PanicWipe with a 7-day TTL (panicWipeBlocklistTTL).
@@ -261,8 +271,8 @@ type PanicWipeDeps struct {
 	// interface is satisfied by the message-service's gocql
 	// session in a later step.
 	Scylla MessageStore
-	NATS  NatsCleaner  // optional: nil means skip NATS cleanup
-	Minio MinioCleaner // optional: nil means skip MinIO cleanup
+	NATS   NatsCleaner  // optional: nil means skip NATS cleanup
+	Minio  MinioCleaner // optional: nil means skip MinIO cleanup
 }
 
 // ManualPanicWipeDeps wires the authenticated manual panic-wipe
@@ -276,10 +286,11 @@ type PanicWipeDeps struct {
 // existing caller relies on.
 type ManualPanicWipeDeps struct {
 	PanicWipeDeps
-	Wipe                    func(context.Context, PanicWipeDeps, int64) (int64, error)
-	Timeout                 time.Duration
-	LookupPanicPinHash      func(ctx context.Context, uin int64) (string, error)
-	ChallengeSignatureDeps  *ChallengeSignatureDeps
+	Wipe                   func(context.Context, PanicWipeDeps, int64) (int64, error)
+	WipeNotifier           WipeNotifier
+	Timeout                time.Duration
+	LookupPanicPinHash     func(ctx context.Context, uin int64) (string, error)
+	ChallengeSignatureDeps *ChallengeSignatureDeps
 }
 
 type manualPanicWipeRequest struct {
@@ -342,9 +353,11 @@ func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 			hasWipePublicKey = pubKey != nil
 		}
 
-		if hasWipePublicKey {
-			// Challenge-signature path is mandatory for migrated accounts.
-			if req.ChallengeID == "" || req.Signature == "" {
+		// An explicitly submitted signature request must never fall back to a
+		// weaker verifier. Both fields and an enrolled public key are required.
+		signatureRequested := req.ChallengeID != "" || req.Signature != ""
+		if signatureRequested {
+			if !hasWipePublicKey || req.ChallengeID == "" || req.Signature == "" {
 				writeError(w, http.StatusUnauthorized, "SIGNATURE_REQUIRED", "challenge_id and signature are required")
 				return
 			}
@@ -353,14 +366,10 @@ func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 				writeError(w, http.StatusUnauthorized, "INVALID_SIGNATURE", "invalid or expired signature")
 				return
 			}
-			// Successful challenge-signature → retire any lingering PIN hash.
-			if deps.Pool != nil {
-				if _, err := deps.Pool.Exec(ctx, qNullPanicPinHash, uin); err != nil {
-					log.Printf("[auth-service] panicwipe: null pin hash after signature verification failed: %v", err)
-				}
-			}
 		} else {
-			// Legacy PIN path: check if a PIN hash exists.
+			// A configured PIN is an explicit alternative authorization method,
+			// including on accounts that also have a wipe signing key. If no PIN
+			// exists, key-enabled accounts must use challenge-signature.
 			var pinHash string
 			if deps.LookupPanicPinHash != nil {
 				var err error
@@ -375,6 +384,9 @@ func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 					writeError(w, http.StatusUnauthorized, "INVALID_PIN", "incorrect panic PIN")
 					return
 				}
+			} else if hasWipePublicKey {
+				writeError(w, http.StatusUnauthorized, "SIGNATURE_REQUIRED", "challenge_id and signature are required")
+				return
 			} else {
 				// No wipe_public_key AND no panic_pin_hash → security setup required.
 				writeError(w, http.StatusForbidden, "SECURITY_SETUP_REQUIRED", "panic wipe requires security setup (wipe key or PIN)")
@@ -392,6 +404,17 @@ func NewManualPanicWipeHandler(deps ManualPanicWipeDeps) http.HandlerFunc {
 			writeError(w, http.StatusServiceUnavailable, "PANIC_WIPE_FAILED",
 				"could not wipe account; please retry")
 			return
+		}
+
+		// The wipe is now durable. Notify every currently-open WebSocket for
+		// this UIN before writing the HTTP response. This is deliberately
+		// best-effort: a NATS outage cannot roll back an already-committed
+		// deletion, while the Redis/PG checks still fail closed on reconnect.
+		// Core NATS does not retain this subject and the payload is empty.
+		if deps.WipeNotifier != nil {
+			if err := deps.WipeNotifier.Publish("account.wiped."+itoa(uin), nil); err != nil {
+				log.Printf("[auth-service] panic wipe live-session notification failed")
+			}
 		}
 
 		// PG data is wiped and the cleanup job is committed atomically.
@@ -476,6 +499,16 @@ func PanicWipe(ctx context.Context, deps PanicWipeDeps, uin int64) (int64, error
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	// Serialize the entire destructive transaction with login before deleting
+	// refresh tokens. Login takes the same row lock before checking the
+	// wiped_accounts marker and issuing a session. Taking this lock first means
+	// there is no window in which login can insert a refresh token after the
+	// DELETE below but before the wipe marker commits.
+	var lockedUIN int64
+	if err := tx.QueryRow(ctx, qLockUserRow, uin).Scan(&lockedUIN); err != nil {
+		return 0, fmt.Errorf("panicwipe: lock account: %w", err)
+	}
 
 	// DELETE FROM one_time_prekeys WHERE uin = $1
 	if _, err := tx.Exec(ctx, qWipeOneTimePrekeys, uin); err != nil {

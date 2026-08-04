@@ -167,14 +167,25 @@ const (
 	qWipeFileGrants       = `DELETE FROM file_object_grants WHERE owner_uin = $1 OR grantee_uin = $1`
 	qWipeFileObjects      = `DELETE FROM file_objects WHERE owner_uin = $1`
 	qSelectFileObjectKeys = `SELECT object_key FROM file_objects WHERE owner_uin = $1`
-	qNullPanicPinHash     = `UPDATE user_security_settings SET panic_pin_hash = NULL WHERE uin = $1 AND wipe_public_key IS NOT NULL`
 	qSelectPasswordHash   = `SELECT password_hash FROM users WHERE uin = $1`
 	// qEnrollWipePublicKey inserts or sets the wipe key only if no key is
 	// currently enrolled (atomic set-if-null). ON CONFLICT DO UPDATE with a
 	// WHERE clause ensures: new row → INSERT, existing row with NULL key →
 	// UPDATE, existing row with non-NULL key → no-op (RowsAffected=0).
 	qEnrollWipePublicKey = `INSERT INTO user_security_settings (uin, wipe_public_key) VALUES ($1, $2) ON CONFLICT (uin) DO UPDATE SET wipe_public_key = EXCLUDED.wipe_public_key WHERE user_security_settings.wipe_public_key IS NULL`
-	qUpdateWipePublicKey  = `UPDATE user_security_settings SET wipe_public_key = $3 WHERE uin = $1 AND wipe_public_key = $2`
+	qUpdateWipePublicKey = `UPDATE user_security_settings SET wipe_public_key = $3 WHERE uin = $1 AND wipe_public_key = $2`
+
+	// qLockUserRow acquires a row-level lock on the user row. Used by login
+	// to serialize with PanicWipe, which acquires the same lock before any
+	// destructive database write. The two operations cannot pass each other. The
+	// lock is held until the calling transaction commits or rolls back.
+	qLockUserRow = `SELECT uin FROM users WHERE uin = $1 FOR UPDATE`
+
+	// qCheckWipedAccount returns true when the wiped_accounts marker exists
+	// for the given UIN. Used inside the login transaction (after FOR UPDATE
+	// lock) to reject logins for wiped accounts atomically with session
+	// creation.
+	qCheckWipedAccount = `SELECT EXISTS (SELECT 1 FROM wiped_accounts WHERE uin = $1)`
 
 	// qInsertWipedAccountMarker creates the transient wiped_accounts row
 	// inside PanicWipe's own transaction -- the PRIMARY insertion path. It
