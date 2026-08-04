@@ -25,6 +25,54 @@ test("non-service-worker specs block workers and the offline policy spec keeps t
   assert.doesNotMatch(read("e2e/offline-recovery.spec.ts"), /serviceWorkers: "block"/);
 });
 
+test("live production-stack spec keeps the real service worker enabled", () => {
+  const liveSpec = read("e2e/live-panic-wipe.spec.ts");
+  const liveConfig = read("playwright.live.config.ts");
+  const defaultConfig = read("playwright.config.ts");
+  assert.doesNotMatch(
+    liveSpec,
+    /serviceWorkers:\s*["']block["']/,
+    "the live production-stack check must not manufacture a service-worker registration failure",
+  );
+  assert.match(
+    liveConfig,
+    /process\.env\.ICEQ_LIVE_BASE_URL\s*\?\?\s*["']https:\/\/localhost:8443["']/,
+    "the live test must default to the repository's isolated clearnet rehearsal listener",
+  );
+  assert.doesNotMatch(liveSpec, /localhost:9543/, "the spec must not override the live config with a removed temporary stack port");
+  assert.match(liveConfig, /testMatch:\s*["']live-panic-wipe\.spec\.ts["']/, "the dedicated live config must select the real-backend spec");
+  assert.match(
+    liveConfig,
+    /name:\s*["']chromium-live["'][\s\S]*--ignore-certificate-errors/,
+    "the local TLS Chromium project must let its service worker trust Caddy's disposable certificate",
+  );
+  assert.match(liveSpec, /navigator\.serviceWorker\.ready/, "the live spec must prove that the real service worker becomes active");
+  assert.match(liveSpec, /unexpectedResponses/, "expected negative API controls must be audited separately from JavaScript errors");
+  assert.doesNotMatch(liveSpec, /localStorage\.clear\(\)/, "the live wipe test must inspect local residue rather than erase its own evidence");
+  assert.match(liveSpec, /wrong local passphrase must not leave the browser/, "the live spec must prove local passphrase verification makes no request");
+  assert.match(liveSpec, /expect\(unlockInput\)\.toBeVisible/, "the post-reload vault boundary must be mandatory");
+  assert.doesNotMatch(liveSpec, /failure\.method === "(?:POST|PUT)"/, "aborted security writes must never be allowlisted");
+  assert.match(
+    liveSpec,
+    /isCompletedNoContentResponse\(failure, diagnostics\.responses\)/,
+    "Chromium 204 response-finalization events must be accepted only when correlated with a recorded successful response",
+  );
+  assert.match(
+    liveSpec,
+    /response\.requestId === failure\.requestId[\s\S]*response\.status === 204[\s\S]*response\.method === failure\.method[\s\S]*response\.path === failure\.path[\s\S]*response\.phase === failure\.phase/,
+    "the 204 correlation must bind the exact Playwright request identity, status, method, path and lifecycle phase",
+  );
+  assert.match(liveSpec, /failure\.path === "\/api\/keys\/bundle"/);
+  assert.match(liveSpec, /failure\.path === "\/api\/auth\/panic-wipe-public-key"/);
+  assert.match(liveSpec, /key bundle publication must succeed/);
+  assert.match(liveSpec, /wipe-key enrollment must succeed/);
+  assert.match(
+    defaultConfig,
+    /testIgnore:\s*\[[\s\S]*["']\*\*\/live-panic-wipe\.spec\.ts["'][\s\S]*\]/,
+    "the synthetic default E2E suite must exclude the real-backend spec",
+  );
+});
+
 test("synthetic transport handles the production poll route and rejects the obsolete route", () => {
   const helpers = read("e2e/helpers.ts");
   assert.match(helpers, /url\.pathname === "\/api\/transport\/poll"/);

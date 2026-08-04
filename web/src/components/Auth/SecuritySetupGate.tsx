@@ -1,3 +1,13 @@
+// src/components/Auth/SecuritySetupGate.tsx
+//
+// Mandatory first-login security setup wizard. Arctic Signal design.
+// Steps: intro → passphrase → unlock → wipekey → recovery → confirm.
+//
+// Wipekey runs BEFORE recovery so the wipe key exists in IndexedDB by
+// the time createRecoveryPackage() gathers the payload — see
+// recoveryPackage.ts's gatherRecoveryPayload, which embeds whatever
+// wipe key it finds.
+
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "../../store/authStore";
@@ -12,22 +22,19 @@ import {
   bytesToBase64std,
 } from "../../lib/panicWipeKey";
 import { uploadWipePublicKey } from "../../api/auth";
+import { ApiError } from "../../api/client";
 import { useI18n } from "../../i18n";
+import { IceQWordmark } from "../Brand/IceQWordmark";
 import QRCode from "qrcode";
 
 const MIN_PASSPHRASE_LENGTH = 12;
 
-// Step order matters: "wipekey" runs BEFORE "recovery" so the wipe key
-// already exists in IndexedDB by the time createRecoveryPackage() gathers
-// the payload -- see recoveryPackage.ts's gatherRecoveryPayload, which
-// embeds whatever wipe key it finds. Generating the recovery package
-// before the wipe key existed (the original order) meant a recovered
-// device could never restore it.
 type SetupStep = "intro" | "passphrase" | "unlock" | "wipekey" | "recovery" | "confirm";
 
 interface SecuritySetupGateProps {
   onSetupComplete?: () => void;
 }
+
 
 export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): JSX.Element {
   const navigate = useNavigate();
@@ -47,37 +54,17 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
 
   const [savedConfirm, setSavedConfirm] = useState(false);
 
-  // Account password for reauthentication during initial wipe-key enrollment.
-  // Kept in component memory only; cleared immediately after the upload request.
-  // This is NOT the Security Passphrase — it is the login password used to
-  // authenticate to the auth-service.
   const [accountPassword, setAccountPassword] = useState("");
+  const [accountPasswordInvalid, setAccountPasswordInvalid] = useState(false);
+  const accountPasswordRef = useRef<HTMLInputElement>(null);
 
-  // Security Passphrase for vault unlock after a page reload. Never sent to
-  // the server — validated locally against the IndexedDB verification blob.
   const [unlockPassphrase, setUnlockPassphrase] = useState("");
-
-  // Whether a vault already exists in IndexedDB. Controls navigation guards:
-  // when true, the intro screen must not expose passphrase creation and the
-  // wipe-key Back button must return to unlock, not passphrase.
   const [hasExistingVault, setHasExistingVault] = useState(false);
 
   useEffect(() => {
     const ns = getActiveCryptoNamespace();
     void hasSecuritySetupCompleted(ns).then(async (done) => {
       if (done) { navigate("/app", { replace: true }); return; }
-      // A vault can already exist without setup being marked complete:
-      // RecoveryImportScreen creates one so a recovered wipe key (if the
-      // package had one) can be re-encrypted immediately. If the package
-      // had no wipe key, this device still needs to enable one -- but
-      // asking for a SECOND, different passphrase here would orphan the
-      // one just created. Skip straight to "wipekey".
-      //
-      // HOWEVER: the in-memory vaultKey does NOT survive page reloads.
-      // If the vault exists in IndexedDB but the in-memory key is null,
-      // the wipekey step will fail with "security vault is locked" because
-      // every wipe-key operation (load, create, encrypt, decrypt) requires
-      // the unwrapped vault key. Show the unlock form first.
       if (await hasSecurityPassphrase()) {
         setHasExistingVault(true);
         if (isVaultUnlocked()) {
@@ -89,17 +76,19 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
     });
   }, [navigate]);
 
-  // Clear sensitive fields whenever the step changes — belt-and-suspenders
-  // on top of the per-handler/per-button clearing. This catches navigation
-  // via browser back/forward that might remount the component on a different
-  // step without going through our explicit handlers.
   useEffect(() => {
     setPassphrase("");
     setPassphraseConfirm("");
     setUnlockPassphrase("");
+    setAccountPasswordInvalid(false);
   }, [step]);
 
-  // Render QR code after the canvas mounts, not during state update.
+  useEffect(() => {
+    if (step === "wipekey" && accountPasswordInvalid && !busy) {
+      accountPasswordRef.current?.focus();
+    }
+  }, [step, accountPasswordInvalid, busy]);
+
   useEffect(() => {
     if (!recoveryKeyB64 || !canvasRef.current) return;
     let cancelled = false;
@@ -109,7 +98,7 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
       if (!cancelled) setError(i18n.t("setup.recoveryFailed"));
     });
     return () => { cancelled = true; };
-  }, [recoveryKeyB64, i18n]);
+  }, [recoveryKeyB64, recoveryGenerated, i18n]);
 
   async function handleCreatePassphrase(): Promise<void> {
     setError("");
@@ -129,10 +118,6 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
     }
   }
 
-  // Vault unlock after a page reload. Validates the Security Passphrase
-  // locally against the IndexedDB verification blob — never calls the
-  // server. The passphrase is cleared from component state immediately
-  // after derivation, whether the attempt succeeds or fails.
   async function handleUnlockVault(): Promise<void> {
     setError("");
     setBusy(true);
@@ -169,7 +154,6 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
       const pkg = await createRecoveryPackage(uin, storedId.publicKey, key);
       setRecoveryPackage(pkg);
       setRecoveryGenerated(true);
-      // QR rendering is handled by the useEffect watching recoveryKeyB64 + canvasRef.
     } catch {
       setError(i18n.t("setup.recoveryFailed"));
     } finally {
@@ -177,18 +161,11 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
     }
   }
 
-  // Enables Panic Wipe: generates (or reuses, if a prior attempt's
-  // response was lost -- see loadOrCreateWipeKeyPair) an Ed25519 wipe key
-  // and enrolls its public half server-side. Runs BEFORE the recovery
-  // step so that when handleGenerateRecovery builds the recovery package,
-  // the wipe key already exists to embed -- see the SetupStep comment.
   async function handleEnableWipeKey(): Promise<void> {
     setError("");
+    setAccountPasswordInvalid(false);
     setBusy(true);
     try {
-      // Load-or-create implements the retry-safe enrollment pattern:
-      // if a prior attempt generated a key but the server response was lost,
-      // we reuse the same key instead of generating a new one.
       const { publicKeyBytes, encryptedPrivateBlob, isNew } = await loadOrCreateWipeKeyPair();
       if (isNew) {
         await storeEncryptedWipePrivateKey(encryptedPrivateBlob, publicKeyBytes);
@@ -198,54 +175,36 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
       try {
         await uploadWipePublicKey(pubB64, accountPassword || undefined);
       } catch (uploadErr) {
-        // The upload's own success/failure is not trusted on its own --
-        // ask the server what it actually has enrolled and act on that,
-        // not on the HTTP status code. A 409 (or, before the server-side
-        // compare-before-rotate fix, even a 401) can mean "this exact key
-        // already landed and the response was lost" just as easily as it
-        // can mean something genuinely failed.
         const reconciliation = await reconcileWipeKey(publicKeyBytes);
         if (reconciliation.status === "match") {
-          // Our key is exactly what's enrolled -- the earlier failure was
-          // cosmetic (lost response, duplicate submit). Proceed.
+          // Our key is exactly what's enrolled — proceed.
         } else if (reconciliation.status === "mismatch") {
-          // A different key is enrolled -- most likely this device lost a
-          // concurrent first-enrollment race. This local key is orphaned:
-          // keeping it would let every future retry resubmit it and hit
-          // the same mismatch. Rotating to make it current would require
-          // a signature from whichever key IS enrolled, which this device
-          // never had -- so this is a real failure, not something to
-          // paper over.
           await clearLocalWipeKey();
           throw new Error(i18n.t("setup.wipeKeyMismatch"));
         } else {
-          // server-has-no-key: the reconcile confirms this was a real
-          // failure, not a lost-response false negative. The local key is
-          // preserved so a retry reuses it instead of generating yet
-          // another one.
           throw uploadErr;
         }
       }
       setStep("recovery");
     } catch (e) {
-      setError((e as Error).message || i18n.t("setup.completeFailed"));
+      if (e instanceof ApiError && e.code === "INVALID_PASSWORD") {
+        setAccountPasswordInvalid(true);
+        setError(i18n.t("setup.accountPasswordIncorrect"));
+      } else {
+        setError((e as Error).message || i18n.t("setup.completeFailed"));
+      }
     } finally {
-      // Always clear sensitive material from component memory, even on failure.
       setAccountPassword("");
       setBusy(false);
     }
   }
 
-  // Final step: the wipe key and recovery package already exist. Just
-  // mark setup complete and route into the app.
   async function handleComplete(): Promise<void> {
     setError("");
     setBusy(true);
     try {
       const ns = getActiveCryptoNamespace();
       await setSecuritySetupCompleted(ns);
-      // Signal App that setup is complete so it can update routing state
-      // without waiting for the next IndexedDB poll.
       onSetupComplete?.();
       navigate("/app", { replace: true });
     } catch (e) {
@@ -257,205 +216,479 @@ export function SecuritySetupGate({ onSetupComplete }: SecuritySetupGateProps): 
     }
   }
 
-  return (
-    <div className="flex h-full items-center justify-center bg-bg p-4">
-      <div className="w-full max-w-lg rounded-lg border border-border bg-surface-2 p-6 shadow-lg" style={{ maxHeight: "calc(100vh - 2rem)", overflowY: "auto" }}>
-        {step === "intro" && (
-          <>
-            <h2 className="text-xl font-semibold text-text">{i18n.t("setup.title")}</h2>
-            <p className="mt-3 text-sm text-text-2">{i18n.t("setup.intro")}</p>
-            {!hasExistingVault && (
-              <div className="mt-4 space-y-3 text-sm text-text-2">
-                <div>
-                  <strong className="text-text">{i18n.t("setup.loginPasswordLabel")}</strong>{" "}
-                  {i18n.t("setup.loginPasswordDesc")}
-                </div>
-                <div>
-                  <strong className="text-text">{i18n.t("setup.passphraseLabel")}</strong>{" "}
-                  {i18n.t("setup.passphraseDesc")}
-                </div>
-                <div>
-                  <strong className="text-text">{i18n.t("setup.recoveryKeyLabel")}</strong>{" "}
-                  {i18n.t("setup.recoveryKeyDesc")}
-                </div>
-              </div>
-            )}
-            {hasExistingVault && (
-              <p className="mt-4 text-sm text-text-2">{i18n.t("setup.vaultAlreadyExists")}</p>
-            )}
-            <p className="mt-4 text-xs text-text-2">{i18n.t("setup.warning")}</p>
-            <div className="mt-6 space-y-3">
-              {!hasExistingVault && (
-                <button type="button" className="iceq-btn-primary w-full" onClick={() => setStep("passphrase")}>
-                  {i18n.t("setup.beginSetup")}
-                </button>
-              )}
-              <button
-                type="button"
-                className="iceq-btn-secondary w-full text-sm"
-                onClick={() => navigate("/recovery")}
+  // ── Step indicator ──────────────────────────────────────────────────
+  function renderStepIndicator(current: SetupStep): JSX.Element | null {
+    if (current === "unlock") return null; // unlock is a recovery path, not a normal step
+    const steps: { key: SetupStep; label: string }[] = [
+      { key: "intro", label: i18n.t("setup.title") },
+      { key: "passphrase", label: i18n.t("setup.passphraseLabel") },
+      { key: "wipekey", label: i18n.t("setup.wipeKeyTitle") },
+      { key: "recovery", label: i18n.t("setup.recoveryKeyLabel") },
+      { key: "confirm", label: i18n.t("setup.confirmTitle") },
+    ];
+    const currentIdx = steps.findIndex((s) => s.key === current);
+
+    return (
+      <nav className="iceq-steps">
+        {steps.map((s, idx) => {
+          const isCurrent = s.key === current;
+          const isComplete = idx < currentIdx;
+          return (
+            <div key={s.key} className="flex items-center gap-2">
+              <div
+                className="iceq-step"
+                aria-current={isCurrent ? "step" : undefined}
+                data-complete={isComplete ? "true" : undefined}
               >
-                {i18n.t("setup.recoveryAction")}
-              </button>
-              <p className="text-xs text-text-2 text-center">{i18n.t("setup.recoveryActionHelp")}</p>
-            </div>
-          </>
-        )}
-
-        {step === "passphrase" && (
-          <>
-            <h2 className="text-xl font-semibold text-text">{i18n.t("setup.createPassphraseTitle")}</h2>
-            <p className="mt-2 text-sm text-text-2">{i18n.t("setup.createPassphraseHelp")}</p>
-            <div className="mt-4 space-y-3">
-              <div>
-                <label htmlFor="setup-passphrase" className="mb-1 block text-xs text-text-2">{i18n.t("setup.passphraseInput")}</label>
-                <input id="setup-passphrase" type="password" autoComplete="new-password" className="iceq-input w-full"
-                  value={passphrase} onChange={(e) => setPassphrase(e.target.value)} disabled={busy} />
+                <span className="iceq-step-dot">
+                  {isComplete ? "✓" : idx + 1}
+                </span>
               </div>
-              <div>
-                <label htmlFor="setup-passphrase-confirm" className="mb-1 block text-xs text-text-2">{i18n.t("setup.passphraseConfirm")}</label>
-                <input id="setup-passphrase-confirm" type="password" autoComplete="new-password" className="iceq-input w-full"
-                  value={passphraseConfirm} onChange={(e) => setPassphraseConfirm(e.target.value)} disabled={busy} />
-              </div>
+              {idx < steps.length - 1 && (
+                <div
+                  className="iceq-step-connector"
+                  data-complete={isComplete ? "true" : undefined}
+                />
+              )}
             </div>
-            {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
-            <div className="mt-5 flex gap-2">
-              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => { setPassphrase(""); setPassphraseConfirm(""); setStep("intro"); }}>{i18n.t("setup.back")}</button>
-              <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !passphrase} onClick={handleCreatePassphrase}>
-                {busy ? i18n.t("setup.creating") : i18n.t("setup.continue")}
-              </button>
-            </div>
-          </>
-        )}
+          );
+        })}
+      </nav>
+    );
+  }
 
-        {step === "unlock" && (
-          <>
-            <h2 className="text-xl font-semibold text-text">{i18n.t("setup.unlockTitle")}</h2>
-            <p className="mt-2 text-sm text-text-2">{i18n.t("setup.unlockHelp")}</p>
-            <div className="mt-4 space-y-3">
-              <div>
-                <label htmlFor="setup-unlock-passphrase" className="mb-1 block text-xs font-semibold text-text">
+  return (
+    <div className="abyss-depth grain-overlay flex min-h-full items-start justify-center p-4 pt-8 sm:p-6 sm:pt-12">
+      <div className="w-full max-w-setup-card relative">
+        {/* ── Aurora glow behind card ────────────────────────────────── */}
+        <div
+          className="pointer-events-none absolute -inset-8 rounded-3xl opacity-40"
+          style={{
+            background:
+              "radial-gradient(ellipse 60% 50% at 50% 30%, rgba(139,108,255,0.08) 0%, transparent 70%), " +
+              "radial-gradient(ellipse 40% 35% at 50% 60%, rgba(89,216,255,0.04) 0%, transparent 70%)",
+          }}
+        />
+
+        {/* ── Brand header ──────────────────────────────────────────── */}
+        <div className="secure-channel mb-6 text-center relative" data-secure="true">
+          <IceQWordmark variant="stacked" size="sm" monochrome className="text-frozen mx-auto" />
+          <h1 className="mt-2 text-lg font-semibold text-frozen">{i18n.t("setup.title")}</h1>
+        </div>
+
+        {/* ── Step indicator ─────────────────────────────────────────── */}
+        {step !== "unlock" && renderStepIndicator(step)}
+
+        {/* ── Card ───────────────────────────────────────────────────── */}
+        <div className="iceq-panel relative" style={{ maxHeight: "calc(100vh - 12rem)", overflowY: "auto" }}>
+          {/* ================================================================
+              INTRO
+              ================================================================ */}
+          {step === "intro" && (
+            <>
+              <p className="text-sm text-mist">{i18n.t("setup.intro")}</p>
+
+              {!hasExistingVault && (
+                <div className="mt-4 space-y-3">
+                  <div className="iceq-setup-card">
+                    <div className="text-sm font-semibold text-frozen">
+                      {i18n.t("setup.loginPasswordLabel")}
+                    </div>
+                    <p className="mt-1 text-xs text-mist">
+                      {i18n.t("setup.loginPasswordDesc")}
+                    </p>
+                  </div>
+                  <div className="iceq-setup-card">
+                    <div className="text-sm font-semibold text-frozen">
+                      {i18n.t("setup.passphraseLabel")}
+                    </div>
+                    <p className="mt-1 text-xs text-mist">
+                      {i18n.t("setup.passphraseDesc")}
+                    </p>
+                  </div>
+                  <div className="iceq-setup-card">
+                    <div className="text-sm font-semibold text-frozen">
+                      {i18n.t("setup.recoveryKeyLabel")}
+                    </div>
+                    <p className="mt-1 text-xs text-mist">
+                      {i18n.t("setup.recoveryKeyDesc")}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {hasExistingVault && (
+                <div className="iceq-alert-info mt-4">
+                  {i18n.t("setup.vaultAlreadyExists")}
+                </div>
+              )}
+
+              <div className="iceq-alert-warning mt-4 text-xs">
+                {i18n.t("setup.warning")}
+              </div>
+
+              <div className="mt-5 space-y-3">
+                {!hasExistingVault && (
+                  <button
+                    type="button"
+                    className="iceq-btn-primary w-full"
+                    onClick={() => setStep("passphrase")}
+                  >
+                    {i18n.t("setup.beginSetup")}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="iceq-btn-secondary w-full"
+                  onClick={() => navigate("/recovery")}
+                >
+                  {i18n.t("setup.recoveryAction")}
+                </button>
+                <p className="text-center text-xs text-mist-dim">
+                  {i18n.t("setup.recoveryActionHelp")}
+                </p>
+              </div>
+            </>
+          )}
+
+          {/* ================================================================
+              PASSPHRASE
+              ================================================================ */}
+          {step === "passphrase" && (
+            <>
+              <h2 className="text-xl font-semibold text-frozen">
+                {i18n.t("setup.createPassphraseTitle")}
+              </h2>
+              <p className="mt-2 text-sm text-mist">
+                {i18n.t("setup.createPassphraseHelp")}
+              </p>
+
+              <div className="mt-4 space-y-3">
+                <div>
+                  <label htmlFor="setup-passphrase" className="text-label text-mist">
+                    {i18n.t("setup.passphraseInput")}
+                  </label>
+                  <input
+                    id="setup-passphrase"
+                    type="password"
+                    autoComplete="new-password"
+                    className="iceq-input mt-1.5"
+                    value={passphrase}
+                    onChange={(e) => setPassphrase(e.target.value)}
+                    disabled={busy}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="setup-passphrase-confirm" className="text-label text-mist">
+                    {i18n.t("setup.passphraseConfirm")}
+                  </label>
+                  <input
+                    id="setup-passphrase-confirm"
+                    type="password"
+                    autoComplete="new-password"
+                    className="iceq-input mt-1.5"
+                    value={passphraseConfirm}
+                    onChange={(e) => setPassphraseConfirm(e.target.value)}
+                    disabled={busy}
+                  />
+                </div>
+              </div>
+
+              {error && <div role="alert" className="iceq-alert-error mt-3">{error}</div>}
+
+              <div className="mt-5 flex gap-2">
+                <button
+                  type="button"
+                  className="iceq-btn-secondary flex-1"
+                  disabled={busy}
+                  onClick={() => { setPassphrase(""); setPassphraseConfirm(""); setStep("intro"); }}
+                >
+                  {i18n.t("setup.back")}
+                </button>
+                <button
+                  type="button"
+                  className="iceq-btn-primary flex-1"
+                  disabled={busy || !passphrase}
+                  onClick={handleCreatePassphrase}
+                >
+                  {busy ? i18n.t("setup.creating") : i18n.t("setup.continue")}
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* ================================================================
+              UNLOCK
+              ================================================================ */}
+          {step === "unlock" && (
+            <>
+              <h2 className="text-xl font-semibold text-frozen">
+                {i18n.t("setup.unlockTitle")}
+              </h2>
+              <p className="mt-2 text-sm text-mist">
+                {i18n.t("setup.unlockHelp")}
+              </p>
+
+              <div className="mt-4">
+                <label
+                  htmlFor="setup-unlock-passphrase"
+                  className="text-label text-frozen"
+                >
                   {i18n.t("setup.unlockPassphraseLabel")}
                 </label>
-                <p className="mb-1 text-xs text-text-2">{i18n.t("setup.unlockPassphraseHelp")}</p>
+                <p className="mt-1 text-xs text-mist">
+                  {i18n.t("setup.unlockPassphraseHelp")}
+                </p>
                 <input
                   id="setup-unlock-passphrase"
                   type="password"
                   autoComplete="new-password"
-                  className="iceq-input w-full"
+                  className="iceq-input mt-2"
                   value={unlockPassphrase}
                   onChange={(e) => setUnlockPassphrase(e.target.value)}
                   disabled={busy}
                   placeholder={i18n.t("setup.unlockPassphrasePlaceholder")}
                 />
               </div>
-            </div>
-            {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
-            <div className="mt-5 flex gap-2">
-              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => { setUnlockPassphrase(""); setStep("intro"); }}>{i18n.t("setup.back")}</button>
-              <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !unlockPassphrase} onClick={handleUnlockVault}>
-                {busy ? i18n.t("setup.unlocking") : i18n.t("setup.unlockAction")}
-              </button>
-            </div>
-          </>
-        )}
 
-        {step === "wipekey" && (
-          <>
-            <h2 className="text-xl font-semibold text-text">{i18n.t("setup.wipeKeyTitle")}</h2>
-            <p className="mt-2 text-sm text-text-2">{i18n.t("setup.wipeKeyHelp")}</p>
-            <div className="mt-4 space-y-3">
-              <div>
-                <label htmlFor="setup-account-password" className="mb-1 block text-xs font-semibold text-text">
+              {error && <div role="alert" className="iceq-alert-error mt-3">{error}</div>}
+
+              <div className="mt-5 flex gap-2">
+                <button
+                  type="button"
+                  className="iceq-btn-secondary flex-1"
+                  disabled={busy}
+                  onClick={() => { setUnlockPassphrase(""); setStep("intro"); }}
+                >
+                  {i18n.t("setup.back")}
+                </button>
+                <button
+                  type="button"
+                  className="iceq-btn-primary flex-1"
+                  disabled={busy || !unlockPassphrase}
+                  onClick={handleUnlockVault}
+                >
+                  {busy ? i18n.t("setup.unlocking") : i18n.t("setup.unlockAction")}
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* ================================================================
+              WIPEKEY
+              ================================================================ */}
+          {step === "wipekey" && (
+            <>
+              <h2 className="text-xl font-semibold text-frozen">
+                {i18n.t("setup.wipeKeyTitle")}
+              </h2>
+              <p className="mt-2 text-sm text-mist">
+                {i18n.t("setup.wipeKeyHelp")}
+              </p>
+
+              <div className="mt-4">
+                <label
+                  htmlFor="setup-account-password"
+                  className="text-label text-frozen"
+                >
                   {i18n.t("setup.accountPasswordLabel")}
                 </label>
-                <p className="mb-1 text-xs text-text-2">{i18n.t("setup.accountPasswordHelp")}</p>
+                <p className="mt-1 text-xs text-mist">
+                  {i18n.t("setup.accountPasswordHelp")}
+                </p>
                 <input
+                  ref={accountPasswordRef}
                   id="setup-account-password"
                   type="password"
                   autoComplete="current-password"
-                  className="iceq-input w-full"
+                  className="iceq-input mt-2"
                   value={accountPassword}
-                  onChange={(e) => setAccountPassword(e.target.value)}
+                  onChange={(e) => {
+                    setAccountPassword(e.target.value);
+                    if (accountPasswordInvalid) {
+                      setAccountPasswordInvalid(false);
+                      setError("");
+                    }
+                  }}
                   disabled={busy}
                   placeholder={i18n.t("setup.accountPasswordPlaceholder")}
+                  aria-invalid={accountPasswordInvalid}
+                  aria-describedby={accountPasswordInvalid ? "setup-account-password-error" : undefined}
                 />
               </div>
-            </div>
-            {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
-            <div className="mt-5 flex gap-2">
-              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep(hasExistingVault ? "unlock" : "passphrase")}>{i18n.t("setup.back")}</button>
-              <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !accountPassword} onClick={handleEnableWipeKey}>
-                {busy ? i18n.t("setup.wipeKeyEnabling") : i18n.t("setup.wipeKeyEnable")}
-              </button>
-            </div>
-          </>
-        )}
 
-        {step === "recovery" && (
-          <>
-            <h2 className="text-xl font-semibold text-text">{i18n.t("setup.recoveryTitle")}</h2>
-            <p className="mt-2 text-sm text-text-2">{i18n.t("setup.recoveryHelp")}</p>
-            {!recoveryGenerated ? (
-              <div className="mt-4">
-                {error && <div role="alert" className="mb-3 text-sm text-danger">{error}</div>}
-                <button type="button" className="iceq-btn-primary w-full" disabled={busy} onClick={handleGenerateRecovery}>
-                  {busy ? i18n.t("setup.generating") : i18n.t("setup.generateRecovery")}
+              {error && (
+                <div id="setup-account-password-error" role="alert" className="iceq-alert-error mt-3">
+                  {error}
+                </div>
+              )}
+
+              <div className="mt-5 flex gap-2">
+                <button
+                  type="button"
+                  className="iceq-btn-secondary flex-1"
+                  disabled={busy}
+                  onClick={() => setStep(hasExistingVault ? "unlock" : "passphrase")}
+                >
+                  {i18n.t("setup.back")}
+                </button>
+                <button
+                  type="button"
+                  className="iceq-btn-primary flex-1"
+                  disabled={busy || !accountPassword}
+                  onClick={handleEnableWipeKey}
+                >
+                  {busy ? i18n.t("setup.wipeKeyEnabling") : i18n.t("setup.wipeKeyEnable")}
                 </button>
               </div>
-            ) : (
-              <div className="mt-4 space-y-3">
-                <div>
-                  <label className="mb-1 block text-xs font-semibold text-text">{i18n.t("setup.recoveryKeyLabel2")}</label>
-                  <div className="break-all rounded border border-border bg-bg p-2 text-sm font-mono text-text select-all">
-                    {recoveryKeyB64}
-                  </div>
-                  <canvas ref={canvasRef} className="mt-2 border border-border rounded" />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-semibold text-text">{i18n.t("setup.downloadPackage")}</label>
-                  <button type="button" className="iceq-btn-secondary w-full text-xs" onClick={() => {
-                    const blob = new Blob([recoveryPackage], { type: "application/octet-stream" });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement("a");
-                    a.href = url; a.download = "iceq-recovery-v4.iceq"; a.click();
-                    URL.revokeObjectURL(url);
-                  }}>
-                    {i18n.t("setup.downloadPackage")}
+            </>
+          )}
+
+          {/* ================================================================
+              RECOVERY
+              ================================================================ */}
+          {step === "recovery" && (
+            <>
+              <h2 className="text-xl font-semibold text-frozen">
+                {i18n.t("setup.recoveryTitle")}
+              </h2>
+              <p className="mt-2 text-sm text-mist">
+                {i18n.t("setup.recoveryHelp")}
+              </p>
+
+              {!recoveryGenerated ? (
+                <div className="mt-4">
+                  {error && (
+                    <div role="alert" className="iceq-alert-error mb-3">{error}</div>
+                  )}
+                  <button
+                    type="button"
+                    className="iceq-btn-primary w-full"
+                    disabled={busy}
+                    onClick={handleGenerateRecovery}
+                  >
+                    {busy ? (
+                      <span className="flex items-center justify-center gap-2">
+                        <span className="iceq-spinner" style={{ width: 16, height: 16, borderTopColor: "#050713" }} />
+                        {i18n.t("setup.generating")}
+                      </span>
+                    ) : (
+                      i18n.t("setup.generateRecovery")
+                    )}
                   </button>
                 </div>
-              </div>
-            )}
-            {recoveryGenerated && (
-              <div className="mt-5 flex gap-2">
-                <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep("wipekey")}>{i18n.t("setup.back")}</button>
-                <button type="button" className="iceq-btn-primary flex-1" onClick={() => setStep("confirm")}>{i18n.t("setup.iHaveSaved")}</button>
-              </div>
-            )}
-          </>
-        )}
+              ) : (
+                <div className="mt-4 space-y-4">
+                  {/* Recovery Key */}
+                  <div>
+                    <label className="text-label text-frozen">
+                      {i18n.t("setup.recoveryKeyLabel2")}
+                    </label>
+                    <div className="mt-1.5 break-all rounded-lg border border-ice-border bg-deep-ice p-3 text-mono text-sm text-frozen select-all">
+                      {recoveryKeyB64}
+                    </div>
+                    <canvas
+                      ref={canvasRef}
+                      aria-label={i18n.t("setup.recoveryQrLabel")}
+                      role="img"
+                      className="mt-2 rounded-lg border border-ice-border"
+                      style={{ minHeight: 200, minWidth: 200 }}
+                    />
+                  </div>
 
-        {step === "confirm" && (
-          <>
-            <h2 className="text-xl font-semibold text-text">{i18n.t("setup.confirmTitle")}</h2>
-            <p className="mt-2 text-sm text-text-2">{i18n.t("setup.confirmHelp")}</p>
-            <div className="mt-4 space-y-3">
-              <div className="space-y-2 text-sm text-text-2">
-                <label className="flex items-start gap-2">
-                  <input type="checkbox" checked={savedConfirm} onChange={(e) => setSavedConfirm(e.target.checked)} className="mt-0.5" />
+                  {/* Download */}
+                  <div>
+                    <label className="text-label text-frozen">
+                      {i18n.t("setup.downloadPackage")}
+                    </label>
+                    <button
+                      type="button"
+                      className="iceq-btn-secondary mt-1.5 w-full"
+                      onClick={() => {
+                        const blob = new Blob([recoveryPackage], { type: "application/octet-stream" });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url; a.download = "iceq-recovery-v4.iceq"; a.click();
+                        URL.revokeObjectURL(url);
+                      }}
+                    >
+                      ↓ {i18n.t("setup.downloadPackage")}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {recoveryGenerated && (
+                <div className="mt-5 flex gap-2">
+                  <button
+                    type="button"
+                    className="iceq-btn-secondary flex-1"
+                    disabled={busy}
+                    onClick={() => setStep("wipekey")}
+                  >
+                    {i18n.t("setup.back")}
+                  </button>
+                  <button
+                    type="button"
+                    className="iceq-btn-primary flex-1"
+                    onClick={() => setStep("confirm")}
+                  >
+                    {i18n.t("setup.iHaveSaved")}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ================================================================
+              CONFIRM
+              ================================================================ */}
+          {step === "confirm" && (
+            <>
+              <h2 className="text-xl font-semibold text-frozen">
+                {i18n.t("setup.confirmTitle")}
+              </h2>
+              <p className="mt-2 text-sm text-mist">
+                {i18n.t("setup.confirmHelp")}
+              </p>
+
+              <div className="mt-4">
+                <label className="flex items-start gap-3 text-sm text-frozen cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={savedConfirm}
+                    onChange={(e) => setSavedConfirm(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 rounded-sm border-ice-border bg-deep-ice accent-electric"
+                  />
                   <span>{i18n.t("setup.confirmSaved")}</span>
                 </label>
               </div>
-            </div>
-            {error && <div role="alert" className="mt-3 text-sm text-danger">{error}</div>}
-            <div className="mt-5 flex gap-2">
-              <button type="button" className="iceq-btn-secondary flex-1" disabled={busy} onClick={() => setStep("recovery")}>{i18n.t("setup.back")}</button>
-              <button type="button" className="iceq-btn-primary flex-1" disabled={busy || !savedConfirm} onClick={handleComplete}>
-                {busy ? i18n.t("setup.completing") : i18n.t("setup.completeSetup")}
-              </button>
-            </div>
-          </>
-        )}
+
+              {error && (
+                <div role="alert" className="iceq-alert-error mt-3">{error}</div>
+              )}
+
+              <div className="mt-5 flex gap-2">
+                <button
+                  type="button"
+                  className="iceq-btn-secondary flex-1"
+                  disabled={busy}
+                  onClick={() => setStep("recovery")}
+                >
+                  {i18n.t("setup.back")}
+                </button>
+                <button
+                  type="button"
+                  className="iceq-btn-primary flex-1"
+                  disabled={busy || !savedConfirm}
+                  onClick={handleComplete}
+                >
+                  {busy ? i18n.t("setup.completing") : i18n.t("setup.completeSetup")}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

@@ -106,3 +106,49 @@ test("ack racing an in-flight revoke restores the grant and does not retry revok
   assert.deepEqual(grants, ["object", "object"]);
   await lifecycle.revokeAll(); assert.deepEqual(revokes, ["object"]);
 });
+
+test("default browser timers keep the Window receiver when a grant is prepared and acknowledged", async () => {
+  const originalSetTimeout = Object.getOwnPropertyDescriptor(globalThis, "setTimeout");
+  const originalClearTimeout = Object.getOwnPropertyDescriptor(globalThis, "clearTimeout");
+  assert.ok(originalSetTimeout);
+  assert.ok(originalClearTimeout);
+
+  const timerHandle = 777 as unknown as ReturnType<typeof setTimeout>;
+  let scheduled = false;
+  let cleared = false;
+  Object.defineProperty(globalThis, "setTimeout", {
+    configurable: true,
+    writable: true,
+    value: function strictBrowserSetTimeout(this: unknown, fn: () => void, ms: number) {
+      assert.equal(this, globalThis, "setTimeout must be invoked with the browser global as its receiver");
+      assert.equal(typeof fn, "function");
+      assert.equal(ms, 30_000);
+      scheduled = true;
+      return timerHandle;
+    },
+  });
+  Object.defineProperty(globalThis, "clearTimeout", {
+    configurable: true,
+    writable: true,
+    value: function strictBrowserClearTimeout(this: unknown, handle: ReturnType<typeof setTimeout>) {
+      assert.equal(this, globalThis, "clearTimeout must be invoked with the browser global as its receiver");
+      assert.equal(handle, timerHandle);
+      cleared = true;
+    },
+  });
+
+  try {
+    const lifecycle = new AttachmentGrantLifecycle({
+      grant: async () => {},
+      revoke: async () => {},
+      retryDelaysMs: [],
+    });
+    await lifecycle.prepare("m1", "object", 200);
+    lifecycle.ack("m1", "persisted");
+    assert.equal(scheduled, true);
+    assert.equal(cleared, true);
+  } finally {
+    Object.defineProperty(globalThis, "setTimeout", originalSetTimeout);
+    Object.defineProperty(globalThis, "clearTimeout", originalClearTimeout);
+  }
+});

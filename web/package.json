@@ -9,6 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "test": "node --import tsx --test tests/*.test.mjs tests/*.test.ts",
     "test:e2e": "playwright test",
+    "test:e2e:live": "playwright test --config=playwright.live.config.ts",
+    "test:e2e:live-messaging": "playwright test --config=playwright.live-messaging.config.ts",
     "test:e2e:sw": "playwright test --config=playwright.sw.config.ts",
     "test:e2e:install": "playwright install chromium webkit",
     "preview": "vite preview",

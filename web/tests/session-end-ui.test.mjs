@@ -28,11 +28,18 @@ test("security settings exposes authenticated panic wipe behind strong confirmat
   assert.match(source, /panic-wipe-confirm-title/);
   assert.match(source, /security\.panicWipeConfirm/);
   assert.match(source, /panicPinInput/);
+  assert.equal(
+    [...source.matchAll(/navigate\("\/login", \{ replace: true \}\)/g)].length,
+    2,
+    "both PIN and passphrase wipe success paths must immediately replace the app route with /login",
+  );
 });
 
 test("WebSocket 4403 delegates to the auth lifecycle without replaying the panic API", async () => {
   const source = await readFile(new URL("../src/hooks/useWebSocket.ts", import.meta.url), "utf8");
   assert.match(source, /handleServerWipe\(\)/);
+  assert.match(source, /case "account_wiped"/);
+  assert.match(source, /beginServerWipeLifecycle\(\)/);
   assert.doesNotMatch(source, /clearLocalState\(\)/);
   assert.doesNotMatch(source, /panicWipe\(\)/);
 });

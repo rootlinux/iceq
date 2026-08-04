@@ -15,7 +15,7 @@ import { tokenStore } from "../api/client";
 import * as authApi from "../api/auth";
 import type { UserPublic } from "../api/auth";
 import { attachmentGrantLifecycle } from "../lib/attachmentGrantLifecycle";
-import { clearAllIceQLocalData, ICEQ_CLEANUP_REQUIRED_MARKER_KEY, ICEQ_LOGGED_OUT_MARKER_KEY, registerMemoryReset, resetIceQMemory, type CleanupReason } from "../lib/localDataCleanup";
+import { clearAllIceQLocalData, ICEQ_CLEANUP_REQUIRED_MARKER_KEY, ICEQ_LOGGED_OUT_MARKER_KEY, reasonErasesCryptoIdentity, registerMemoryReset, resetIceQMemory, type CleanupReason } from "../lib/localDataCleanup";
 import { lockSecurityVault } from "../lib/securityVault";
 
 const ACCOUNT_UIN_KEY = "iceq_account_uin";
@@ -47,6 +47,7 @@ const EMPTY_AUTH = { uin: null, username: null, accessToken: null, refreshToken:
 const ATTACHMENT_REVOKE_GRACE_MS = 1_000;
 let authLifecycleGeneration = 0;
 let teardownFlight: Promise<void> | null = null;
+let teardownFlightReason: CleanupReason | null = null;
 let cleanupRequired: CleanupReason | null = null;
 let cleanupRetryFlight: Promise<void> | null = null;
 
@@ -115,22 +116,53 @@ function reportCleanupFailure(error: unknown): void {
 	}
 }
 
+function durableCleanupReason(): CleanupReason | null {
+	if (typeof localStorage === "undefined") return null;
+	const value = localStorage.getItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY);
+	if (value === null) return null;
+	if (value === "logout" || value === "auth-expired" || value === "account-change" || value === "panic-wipe") return value;
+	// Legacy builds stored only "1", losing whether the failed pass was
+	// destructive. Never risk clearing that marker with a non-destructive
+	// retry while private material may remain from a real panic wipe.
+	return "panic-wipe";
+}
+
 function hasDurableCleanupRequirement(): boolean {
-	return typeof localStorage !== "undefined" && localStorage.getItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY) === "1";
+	return durableCleanupReason() !== null;
+}
+
+function cleanupStrength(reason: CleanupReason): number {
+	return reasonErasesCryptoIdentity(reason) ? 2 : 1;
+}
+
+function strongestOutstandingCleanup(): CleanupReason | null {
+	const durable = durableCleanupReason();
+	if (cleanupRequired === null) return durable;
+	if (durable === null) return cleanupRequired;
+	return cleanupStrength(durable) > cleanupStrength(cleanupRequired) ? durable : cleanupRequired;
+}
+
+function strongestRequiredCleanup(requested: CleanupReason): CleanupReason {
+	const outstanding = strongestOutstandingCleanup();
+	return outstanding !== null && cleanupStrength(outstanding) > cleanupStrength(requested) ? outstanding : requested;
 }
 
 function markCleanupRequired(reason: CleanupReason, error: unknown): void {
-	cleanupRequired = reason;
-	if (typeof localStorage !== "undefined") localStorage.setItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY, "1");
+	const strongest = strongestRequiredCleanup(reason);
+	cleanupRequired = strongest;
+	if (typeof localStorage !== "undefined") localStorage.setItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY, strongest);
 	reportCleanupFailure(error);
 }
 
-function clearCleanupRequirement(_reason: CleanupReason): void {
+function clearCleanupRequirement(completedReason: CleanupReason): void {
+	const outstanding = strongestOutstandingCleanup();
+	if (outstanding !== null && cleanupStrength(outstanding) > cleanupStrength(completedReason)) return;
 	cleanupRequired = null;
 	if (typeof localStorage !== "undefined") localStorage.removeItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY);
 }
 
-async function runTrackedCleanup(reason: CleanupReason): Promise<void> {
+async function runTrackedCleanup(requestedReason: CleanupReason): Promise<void> {
+	const reason = strongestRequiredCleanup(requestedReason);
 	try {
 		await cleanSession(reason);
 		clearCleanupRequirement(reason);
@@ -146,7 +178,15 @@ async function waitForTeardown(): Promise<void> {
 }
 
 function startSessionTeardown(reason: CleanupReason, logoutServer: boolean, set: (state: Partial<AuthState>) => void): Promise<void> {
-	if (teardownFlight) return teardownFlight;
+	if (teardownFlight) {
+		if (reasonErasesCryptoIdentity(reason) && teardownFlightReason !== null && !reasonErasesCryptoIdentity(teardownFlightReason)) {
+			// A genuine server wipe outranks a benign logout/auth-expiry already
+			// in progress. Preserve single-flight ordering, but require a second,
+			// destructive cleanup pass before the wipe handler may resolve.
+			return trackTeardownFlight(teardownFlight.catch(() => undefined).then(() => runTrackedCleanup(reason)), reason);
+		}
+		return teardownFlight;
+	}
 	const accessToken = tokenStore.accessToken;
 	beginSessionTeardown();
 	tokenStore.clear();
@@ -154,7 +194,7 @@ function startSessionTeardown(reason: CleanupReason, logoutServer: boolean, set:
 	lockSecurityVault();
 	set(EMPTY_AUTH);
 	const ownerGeneration = authLifecycleGeneration;
-	teardownFlight = (async () => {
+	return trackTeardownFlight((async () => {
 		if (logoutServer) await observeLogoutBounded(accessToken);
 		try {
 			await runTrackedCleanup(reason);
@@ -166,8 +206,19 @@ function startSessionTeardown(reason: CleanupReason, logoutServer: boolean, set:
 				localStorage.setItem(ICEQ_LOGGED_OUT_MARKER_KEY, "1");
 			}
 		}
-	})().finally(() => { teardownFlight = null; });
-	return teardownFlight;
+	})(), reason);
+}
+
+function trackTeardownFlight(work: Promise<void>, reason: CleanupReason): Promise<void> {
+	const tracked = work.finally(() => {
+		if (teardownFlight === tracked) {
+			teardownFlight = null;
+			teardownFlightReason = null;
+		}
+	});
+	teardownFlight = tracked;
+	teardownFlightReason = reason;
+	return tracked;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
@@ -180,7 +231,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 
 	hydrate: () => {
 		if (hasDurableCleanupRequirement()) {
-			cleanupRequired = cleanupRequired ?? "logout";
+			cleanupRequired = strongestOutstandingCleanup() ?? "panic-wipe";
 			tokenStore.clear();
 			resetIceQMemory();
 			set({ ...EMPTY_AUTH, hydrated: true });
@@ -315,7 +366,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 	retryLocalCleanup: () => {
 		if (!cleanupRequired && !hasDurableCleanupRequirement()) return Promise.resolve();
 		if (cleanupRetryFlight) return cleanupRetryFlight;
-		const reason = cleanupRequired ?? "logout";
+		const reason = cleanupRequired ?? durableCleanupReason() ?? "panic-wipe";
 		cleanupRetryFlight = runTrackedCleanup(reason).finally(() => { cleanupRetryFlight = null; });
 		return cleanupRetryFlight;
 	},

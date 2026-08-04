@@ -45,7 +45,7 @@ type RestoredIdentity = IdentityKeyPair & { registrationId: number };
 interface GeneratedBundle extends PreKeyBundleUpload {}
 
 export interface SignalBootstrapDeps {
-  fetchBundle: (uin: number) => Promise<RemotePreKeyBundle>;
+  fetchBundle: (uin: number, signal?: AbortSignal) => Promise<RemotePreKeyBundle>;
   loadIdentity: (ns?: CryptoNamespace) => Promise<StoredIdentity | null>;
   migrateLegacyIdentity?: (
     ns: CryptoNamespace,
@@ -61,14 +61,15 @@ export interface SignalBootstrapDeps {
     oneTimeCount: number,
     registrationId: number,
     namespace?: CryptoNamespace,
+    signal?: AbortSignal,
   ) => Promise<GeneratedBundle>;
-  uploadBundle: (bundle: PreKeyBundleUpload) => Promise<void>;
-  getPrekeyCount: () => Promise<number>;
+  uploadBundle: (bundle: PreKeyBundleUpload, signal?: AbortSignal) => Promise<void>;
+  getPrekeyCount: (signal?: AbortSignal) => Promise<number>;
   loadNextPreKeyId: (ns?: CryptoNamespace) => Promise<number | null>;
   saveNextPreKeyId: (id: number, ns?: CryptoNamespace) => Promise<void>;
   reserveNextPreKeyIds?: (ns:CryptoNamespace,count:number,fallback:number)=>Promise<number>;
-  generateOneTimePreKeys: (startId: number, count: number, namespace?: CryptoNamespace) => Promise<OneTimePreKeyUpload[]>;
-  addPreKeys: (prekeys: OneTimePreKeyUpload[]) => Promise<{ accepted: number }>;
+  generateOneTimePreKeys: (startId: number, count: number, namespace?: CryptoNamespace, signal?: AbortSignal) => Promise<OneTimePreKeyUpload[]>;
+  addPreKeys: (prekeys: OneTimePreKeyUpload[], signal?: AbortSignal) => Promise<{ accepted: number }>;
 }
 
 const defaultDeps: SignalBootstrapDeps = {
@@ -78,27 +79,29 @@ const defaultDeps: SignalBootstrapDeps = {
   loadOrCreateDeviceId,
   deriveStoredPublic: deriveIdentityPublicKey,
   restoreIdentity: restoreOwnIdentity,
-  generatePreKeyBundle: (identity,start,count,registration,ns)=>generatePreKeyBundle(identity,start,count,registration,ns!),
+  generatePreKeyBundle: (identity,start,count,registration,ns,signal)=>generatePreKeyBundle(identity,start,count,registration,ns!,signal),
   uploadBundle,
   getPrekeyCount,
   loadNextPreKeyId: (ns) => loadNextPreKeyId(ns!),
   saveNextPreKeyId: (id, ns) => saveNextPreKeyId(ns!, id),
   reserveNextPreKeyIds,
-  generateOneTimePreKeys: (start,count,ns)=>generateOneTimePreKeys(start,count,ns!),
+  generateOneTimePreKeys: (start,count,ns,signal)=>generateOneTimePreKeys(start,count,ns!,signal),
   addPreKeys,
 };
 
 export async function ensureOwnBundle(
   uin: number,
   deps: SignalBootstrapDeps = defaultDeps,
+  signal?: AbortSignal,
 ): Promise<"ok" | "repaired"> {
-  if(deps===defaultDeps)await resumeAuthenticatedRegistration(uin);
+  if(deps===defaultDeps)await resumeAuthenticatedRegistration(uin, undefined, signal);
   const ns: CryptoNamespace = { uin, deviceId: await resolveDeviceId(deps) };
   setActiveCryptoNamespace(ns);
   let directory: RemotePreKeyBundle | null = null;
   try {
-    directory = await deps.fetchBundle(uin);
+    directory = await deps.fetchBundle(uin, signal);
   } catch (error) {
+    if ((error as { name?: string }).name === "AbortError") throw error;
     if (!(error instanceof ApiError) || error.status !== 404) {
       throw error;
     }
@@ -129,8 +132,9 @@ export async function ensureOwnBundle(
     DEFAULT_ONE_TIME_PREKEY_COUNT,
     identity.registrationId,
     ns,
+    signal,
   );
-  await deps.uploadBundle(bundle);
+  await deps.uploadBundle(bundle, signal);
   return "repaired";
 }
 
@@ -368,9 +372,10 @@ export interface SignalProvisioningResult {
 export async function ensureSignalProvisioning(
   uin: number,
   deps: SignalBootstrapDeps = defaultDeps,
+  signal?: AbortSignal,
 ): Promise<SignalProvisioningResult> {
-  const bundle = await ensureOwnBundle(uin, deps);
-  const count = await deps.getPrekeyCount();
+  const bundle = await ensureOwnBundle(uin, deps, signal);
+  const count = await deps.getPrekeyCount(signal);
   if (count >= PREKEY_LOW_WATERMARK) {
     return { bundle, replenished: false, prekeyCount: count };
   }
@@ -381,8 +386,8 @@ export async function ensureSignalProvisioning(
     ? await deps.reserveNextPreKeyIds(ns,topUpCount,LEGACY_NEXT_PREKEY_ID)
     : (await deps.loadNextPreKeyId(ns)) ?? LEGACY_NEXT_PREKEY_ID;
   if(!deps.reserveNextPreKeyIds)await deps.saveNextPreKeyId(startId + topUpCount, ns);
-  const prekeys = await deps.generateOneTimePreKeys(startId, topUpCount, ns);
-  const uploaded = await deps.addPreKeys(prekeys);
+  const prekeys = await deps.generateOneTimePreKeys(startId, topUpCount, ns, signal);
+  const uploaded = await deps.addPreKeys(prekeys, signal);
 
   return {
     bundle,

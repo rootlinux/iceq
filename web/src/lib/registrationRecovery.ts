@@ -92,12 +92,12 @@ export async function runRegistration(
 
 export interface ResumeDependencies {
   loadPending(): Promise<PendingRegistration | null>;
-  me(): Promise<{ uin: number; username: string }>;
-  fetchBundle(uin: number): Promise<{ identity_key: string }>;
-  cryptoBinding(): Promise<{ uin: number; identity_key: string }>;
+  me(signal?: AbortSignal): Promise<{ uin: number; username: string }>;
+  fetchBundle(uin: number, signal?: AbortSignal): Promise<{ identity_key: string }>;
+  cryptoBinding(signal?: AbortSignal): Promise<{ uin: number; identity_key: string }>;
   savePending(state: PendingRegistration): Promise<void>;
   loadOrCreateDeviceId(): Promise<string>;
-  uploadBundle(bundle: RegistrationBundle): Promise<void>;
+  uploadBundle(bundle: RegistrationBundle, signal?: AbortSignal): Promise<void>;
   commitCryptoNamespace(from: CryptoNamespace, to: CryptoNamespace): Promise<void>;
   clearPendingRegistration(): Promise<void>;
   setActiveCryptoNamespace(ns: CryptoNamespace): void;
@@ -107,12 +107,12 @@ export interface ResumeDependencies {
 export function createResumeDeps(): ResumeDependencies {
   return {
     loadPending: () => loadPendingRegistration<PendingRegistration>(),
-    me: () => me(),
-    fetchBundle: (uin) => fetchBundle(uin),
-    cryptoBinding: () => cryptoBinding(),
+    me: (signal) => me(signal),
+    fetchBundle: (uin, signal) => fetchBundle(uin, signal),
+    cryptoBinding: (signal) => cryptoBinding(signal),
     savePending: (s) => savePendingRegistration(s),
     loadOrCreateDeviceId: () => loadOrCreateDeviceId(),
-    uploadBundle: (b) => uploadBundle(b),
+    uploadBundle: (b, signal) => uploadBundle(b, signal),
     commitCryptoNamespace: (from, to) => commitCryptoNamespace(from, to),
     clearPendingRegistration: () => clearPendingRegistration(),
     setActiveCryptoNamespace: (ns) => { setActiveCryptoNamespace(ns); },
@@ -123,15 +123,20 @@ export function createResumeDeps(): ResumeDependencies {
 export async function resumeAuthenticatedRegistration(
   accountUin: number,
   deps?: ResumeDependencies,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   const d = deps ?? createResumeDeps();
+  throwIfAborted(signal);
   let pending = await d.loadPending();
+  throwIfAborted(signal);
   if (!pending) return false;
   if (pending.status === "prepared") throw new Error("prepared registration cannot attach to an authenticated account");
-  const account = await d.me();
+  const account = await d.me(signal);
+  throwIfAborted(signal);
   if (account.uin !== accountUin || account.username.trim() !== pending.username.trim()) throw new Error("authenticated account does not own pending registration");
   let directory: { identity_key: string } | null = null;
-  try { directory = await d.fetchBundle(accountUin); } catch (error) {
+  try { directory = await d.fetchBundle(accountUin, signal); } catch (error) {
+    if ((error as { name?: string }).name === "AbortError") throw error;
     if (!(error instanceof ApiError) || error.status !== 404) throw error;
   }
 
@@ -144,7 +149,8 @@ export async function resumeAuthenticatedRegistration(
   // own record of what public key belongs to this authenticated account.
   if (!directory) {
     try {
-      const binding = await d.cryptoBinding();
+      const binding = await d.cryptoBinding(signal);
+      throwIfAborted(signal);
       if (binding.uin !== accountUin) throw new Error("crypto-binding returned wrong account");
       if (!constantTimeEqual(binding.identity_key, pending.identityKey)) {
         throw new Error("pending registration identity does not match server-stored identity");
@@ -160,20 +166,34 @@ export async function resumeAuthenticatedRegistration(
   if (pending.accountUin !== undefined && pending.accountUin !== accountUin) throw new Error("pending registration belongs to another account");
   if (pending.status !== "registered") {
     pending = { ...pending, status: "registered", accountUin, deviceId: await d.loadOrCreateDeviceId() };
+    throwIfAborted(signal);
     await d.savePending(pending);
+    throwIfAborted(signal);
   }
   if (!pending.deviceId) {
     pending = { ...pending, deviceId: await d.loadOrCreateDeviceId() };
+    throwIfAborted(signal);
     await d.savePending(pending);
+    throwIfAborted(signal);
   }
-  await d.uploadBundle(pending.bundle);
+  await d.uploadBundle(pending.bundle, signal);
+  throwIfAborted(signal);
   const deviceId = pending.deviceId;
   if (!deviceId) throw new Error("pending registration device is missing");
   const target = { uin: accountUin, deviceId };
   await d.commitCryptoNamespace(pending.stagingNamespace, target);
+  throwIfAborted(signal);
   await d.clearPendingRegistration();
+  throwIfAborted(signal);
   d.setActiveCryptoNamespace(target);
   return true;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  throw error;
 }
 
 function constantTimeEqual(a:string,b:string):boolean{const aa=new TextEncoder().encode(a),bb=new TextEncoder().encode(b);let diff=aa.length^bb.length;const length=Math.max(aa.length,bb.length);for(let i=0;i<length;i++)diff|=(aa[i]??0)^(bb[i]??0);return diff===0;}

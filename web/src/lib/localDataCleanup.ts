@@ -17,6 +17,7 @@ export const ICEQ_LOGGED_OUT_MARKER_KEY = "iceq_logged_out";
 export const ICEQ_CLEANUP_REQUIRED_MARKER_KEY = "iceq_cleanup_required";
 const LEGACY_ICEQ_DATABASES = ["iceq-signal", "iceq-messages", "iceq-keys"] as const;
 let cleanupFlight: Promise<void> | null = null;
+let cleanupFlightReason: CleanupReason | null = null;
 const outstandingBlockedDatabases = new Set<string>();
 
 export function registerMemoryReset(reset: () => void): () => void {
@@ -80,11 +81,28 @@ async function deleteIceQDatabase(name: string): Promise<void> {
 }
 
 export function clearAllIceQLocalData(reason: CleanupReason): Promise<void> {
-  // A later reason joins the active cleanup. Every reason has the same durable
-  // deletion contract, so overlapping deleteDatabase requests add risk only.
-  if (cleanupFlight) return cleanupFlight;
-  cleanupFlight = performCleanup(reason).finally(() => { cleanupFlight = null; });
-  return cleanupFlight;
+  if (cleanupFlight) {
+    if (reasonErasesCryptoIdentity(reason) && cleanupFlightReason !== null && !reasonErasesCryptoIdentity(cleanupFlightReason)) {
+      // A server-confirmed wipe must never inherit a weaker logout/auth-expiry
+      // result. Wait for the current browser-resource operations to settle,
+      // then run the destructive pass even if the weaker pass failed.
+      return trackCleanupFlight(cleanupFlight.catch(() => undefined).then(() => performCleanup(reason)), reason);
+    }
+    return cleanupFlight;
+  }
+  return trackCleanupFlight(performCleanup(reason), reason);
+}
+
+function trackCleanupFlight(work: Promise<void>, reason: CleanupReason): Promise<void> {
+  const tracked = work.finally(() => {
+    if (cleanupFlight === tracked) {
+      cleanupFlight = null;
+      cleanupFlightReason = null;
+    }
+  });
+  cleanupFlight = tracked;
+  cleanupFlightReason = reason;
+  return tracked;
 }
 
 // Reasons that must destructively erase the local Signal identity and
@@ -102,6 +120,10 @@ export function clearAllIceQLocalData(reason: CleanupReason): Promise<void> {
 // account on the same device never leaves the previous account's keys
 // reachable from the new session.
 const REASONS_THAT_ERASE_CRYPTO_IDENTITY: ReadonlySet<CleanupReason> = new Set(["panic-wipe", "account-change"]);
+
+export function reasonErasesCryptoIdentity(reason: CleanupReason): boolean {
+  return REASONS_THAT_ERASE_CRYPTO_IDENTITY.has(reason);
+}
 
 async function performCleanup(reason: CleanupReason): Promise<void> {
   const failures: CleanupFailure[] = [];
@@ -126,17 +148,33 @@ async function performCleanup(reason: CleanupReason): Promise<void> {
       const script = registration.active?.scriptURL ?? registration.waiting?.scriptURL ?? registration.installing?.scriptURL;
       return script ? new URL(script).pathname === "/sw.js" : false;
     }).map(async (registration) => {
-      if (!await registration.unregister()) throw new Error("Service worker unregistration failed");
+      const script = registration.active?.scriptURL ?? registration.waiting?.scriptURL ?? registration.installing?.scriptURL;
+      if (await registration.unregister()) return;
+      // Another IceQ tab may have unregistered the same worker between the
+      // initial enumeration and this call. Treat that as successful only after
+      // verifying the target script is actually absent; a still-registered
+      // worker remains a mandatory cleanup failure.
+      const remaining = await navigator.serviceWorker.getRegistrations();
+      const stillRegistered = remaining.some((candidate) => {
+        const candidateScript = candidate.active?.scriptURL ?? candidate.waiting?.scriptURL ?? candidate.installing?.scriptURL;
+        return script !== undefined && candidateScript === script;
+      });
+      if (stillRegistered) throw new Error("Service worker unregistration failed");
     }));
   });
   await capture("cache-storage", async () => {
     if (typeof caches === "undefined") return;
     const names = await caches.keys();
     await Promise.all(names.filter((name) => name.startsWith(ICEQ_CACHE_PREFIX)).map(async (name) => {
-      if (!await caches.delete(name)) throw new Error(`Cache deletion failed: ${name}`);
+      if (await caches.delete(name)) return;
+      // CacheStorage.delete returns false both on a genuine failure and when a
+      // concurrent tab already removed the cache. Re-read the authoritative
+      // state so multi-tab panic wipe stays idempotent without weakening the
+      // fail-closed behavior for data that remains present.
+      if (await caches.has(name)) throw new Error(`Cache deletion failed: ${name}`);
     }));
   });
-  if (typeof indexedDB !== "undefined" && REASONS_THAT_ERASE_CRYPTO_IDENTITY.has(reason)) {
+  if (typeof indexedDB !== "undefined" && reasonErasesCryptoIdentity(reason)) {
     const databaseNames = await iceQDatabaseNames();
     for (const name of databaseNames) await capture("indexeddb", () => deleteIceQDatabase(name));
   }

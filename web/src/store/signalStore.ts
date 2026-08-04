@@ -26,7 +26,7 @@ interface SignalState {
 
   // Actions
   setReady: (ready: boolean) => void;
-  refreshPrekeyCount: () => Promise<void>;
+  refreshPrekeyCount: (signal?: AbortSignal) => Promise<void>;
   setError: (message: string | null) => void;
 }
 
@@ -37,8 +37,8 @@ export const useSignalStore = create<SignalState>((set) => ({
 
   setReady: (ready) => set({ ready }),
 
-  refreshPrekeyCount: async () => {
-    const count = await getPrekeyCount();
+  refreshPrekeyCount: async (signal) => {
+    const count = await getPrekeyCount(signal);
     set({ prekeyCount: count });
   },
 

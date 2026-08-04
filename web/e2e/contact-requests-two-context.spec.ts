@@ -72,9 +72,10 @@ async function revealSidebarOnMobile(page: Page, projectName: string): Promise<v
     // dismissed won't show it again, so this must not block on it.
     await page.getByRole("button", { name: "Got it" }).click({ timeout: 2000 }).catch(() => {});
   }
-  if (projectName.endsWith("android") || projectName.endsWith("ios")) {
-    await page.getByRole("button", { name: "Toggle menu" }).click();
-  }
+  // Drawer is always closed — open it first
+  await page.getByRole("button", { name: "Toggle menu" }).click();
+  // Switch to Contacts tab
+  await page.getByRole("tab", { name: "Contacts" }).click();
 }
 
 test("a contact request and its acceptance propagate live across two independently authenticated contexts", async ({ browser }, testInfo) => {

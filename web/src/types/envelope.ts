@@ -33,6 +33,10 @@ export type EnvelopeType =
   | "auth"
   | "auth_ok"
   | "auth_fail"
+  // Terminal server control. Sent after durable Panic Wipe verification and
+  // before the 4403 close so browsers that collapse custom close codes to
+  // 1006 still destroy local account state.
+  | "account_wiped"
   // Chat. `message` is 1:1, `group_msg` is a group conversation.
   // Both carry an opaque `ciphertext` blob that the server
   // stores without inspection.

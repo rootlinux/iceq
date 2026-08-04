@@ -94,6 +94,50 @@ test("concurrent cleanup callers share one IndexedDB deletion flight", async () 
   await Promise.all([first, second]);
 });
 
+test("panic wipe escalates an active logout cleanup and still deletes IndexedDB", async (t) => {
+  const originalIndexedDB = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, "caches");
+  t.after(() => {
+    if (originalIndexedDB) Object.defineProperty(globalThis, "indexedDB", originalIndexedDB); else delete (globalThis as { indexedDB?: unknown }).indexedDB;
+    if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator); else delete (globalThis as { navigator?: unknown }).navigator;
+    if (originalCaches) Object.defineProperty(globalThis, "caches", originalCaches); else delete (globalThis as { caches?: unknown }).caches;
+  });
+
+  let finishLogout!: () => void;
+  let databaseDeletes = 0;
+  let unregisterCalls = 0;
+  const registration = {
+    active: { scriptURL: "https://iceq.test/sw.js" }, waiting: null, installing: null,
+    unregister: () => {
+      unregisterCalls += 1;
+      if (unregisterCalls > 1) return Promise.resolve(true);
+      return new Promise<boolean>((resolve) => { finishLogout = () => resolve(true); });
+    },
+  };
+  Object.defineProperties(globalThis, {
+    navigator: { configurable: true, value: { serviceWorker: { async getRegistrations() { return [registration]; } } } },
+    caches: { configurable: true, value: undefined },
+    indexedDB: { configurable: true, value: {
+      async databases() { return [{ name: ICEQ_INDEXEDDB_NAME }]; },
+      deleteDatabase() {
+        databaseDeletes += 1;
+        const request: Record<string, (() => void) | null> = { onsuccess: null, onerror: null, onblocked: null };
+        queueMicrotask(() => request.onsuccess?.());
+        return request;
+      },
+    } },
+  });
+
+  const logout = clearAllIceQLocalData("logout");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const panic = clearAllIceQLocalData("panic-wipe");
+  finishLogout();
+  await Promise.all([logout, panic]);
+
+  assert.equal(databaseDeletes, 1, "destructive cleanup must run after the weaker logout flight");
+});
+
 test("a blocked delete that later succeeds remains one request", async () => {
   let deletes = 0;
   Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: {
@@ -102,6 +146,62 @@ test("a blocked delete that later succeeds remains one request", async () => {
   } });
   await Promise.all([clearAllIceQLocalData("panic-wipe"), clearAllIceQLocalData("account-change")]);
   assert.equal(deletes, 1);
+});
+
+test("concurrent cleanup treats browser resources already removed by another tab as success", async (t) => {
+  const originalIndexedDB = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, "caches");
+  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  t.after(() => {
+    if (originalIndexedDB) Object.defineProperty(globalThis, "indexedDB", originalIndexedDB); else delete (globalThis as { indexedDB?: unknown }).indexedDB;
+    if (originalCaches) Object.defineProperty(globalThis, "caches", originalCaches); else delete (globalThis as { caches?: unknown }).caches;
+    if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator); else delete (globalThis as { navigator?: unknown }).navigator;
+  });
+  const worker = {
+    active: { scriptURL: "https://iceq.test/sw.js" }, waiting: null, installing: null,
+    async unregister() { return false; },
+  };
+  let registrationReads = 0;
+  Object.defineProperties(globalThis, {
+    indexedDB: { configurable: true, value: undefined },
+    caches: { configurable: true, value: {
+      async keys() { return ["iceq-static-v3"]; },
+      async delete() { return false; },
+      async has() { return false; },
+    } },
+    navigator: { configurable: true, value: { serviceWorker: { async getRegistrations() {
+      registrationReads += 1;
+      return registrationReads === 1 ? [worker] : [];
+    } } } },
+  });
+
+  await clearAllIceQLocalData("panic-wipe");
+  assert.equal(registrationReads, 2);
+});
+
+test("cleanup still fails closed when a cache remains after deletion reports false", async (t) => {
+  const originalIndexedDB = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, "caches");
+  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  t.after(() => {
+    if (originalIndexedDB) Object.defineProperty(globalThis, "indexedDB", originalIndexedDB); else delete (globalThis as { indexedDB?: unknown }).indexedDB;
+    if (originalCaches) Object.defineProperty(globalThis, "caches", originalCaches); else delete (globalThis as { caches?: unknown }).caches;
+    if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator); else delete (globalThis as { navigator?: unknown }).navigator;
+  });
+  Object.defineProperties(globalThis, {
+    indexedDB: { configurable: true, value: undefined },
+    caches: { configurable: true, value: {
+      async keys() { return ["iceq-static-v3"]; },
+      async delete() { return false; },
+      async has() { return true; },
+    } },
+    navigator: { configurable: true, value: { serviceWorker: { async getRegistrations() { return []; } } } },
+  });
+
+  await assert.rejects(
+    clearAllIceQLocalData("panic-wipe"),
+    (error: unknown) => error instanceof LocalCleanupError && error.failures.some((failure) => failure.area === "cache-storage"),
+  );
 });
 
 test("auth-expired and logout clear session state but preserve the local Signal identity", async () => {

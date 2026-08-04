@@ -226,8 +226,8 @@ test("logout attempts server revocation before clearing every local account stat
   await assert.rejects(useAuthStore.getState().panicWipe());
   assert.equal(panicCalls, 1);
   assert.equal(cleanupEvents, 1);
-  assert.equal(values.get("iceq_cleanup_required"), "1");
-  assert.deepEqual(JSON.parse(JSON.stringify({ marker: values.get("iceq_cleanup_required") })), { marker: "1" });
+  assert.equal(values.get("iceq_cleanup_required"), "panic-wipe");
+  assert.deepEqual(JSON.parse(JSON.stringify({ marker: values.get("iceq_cleanup_required") })), { marker: "panic-wipe" });
   await assert.rejects(useAuthStore.getState().login("must-wait", "password"), /cleanup must be retried/);
   await assert.rejects(useAuthStore.getState().register({ username: "must-wait", password: "password", identityKey: "public" }), /cleanup must be retried/);
   await assert.rejects(useAuthStore.getState().setSession({ uin: 30, username: "must-wait" }, "blocked", ""), /cleanup must be retried/);
@@ -275,7 +275,7 @@ test("logout attempts server revocation before clearing every local account stat
       return request;
     } } });
     await assert.rejects(establish());
-    assert.equal(values.get("iceq_cleanup_required"), "1");
+    assert.equal(values.get("iceq_cleanup_required"), "account-change");
     assert.equal(useAuthStore.getState().isAuthenticated, false);
     Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
     await useAuthStore.getState().retryLocalCleanup();
@@ -305,7 +305,7 @@ test("logout attempts server revocation before clearing every local account stat
   useAuthStore.setState({ uin: null, username: null, accessToken: null, isAuthenticated: false, hydrated: false });
   useAuthStore.getState().hydrate();
   await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(values.get("iceq_cleanup_required"), "1");
+  assert.equal(values.get("iceq_cleanup_required"), "account-change");
   assert.equal(useAuthStore.getState().isAuthenticated, false);
   Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
   await useAuthStore.getState().retryLocalCleanup();

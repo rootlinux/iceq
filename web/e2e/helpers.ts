@@ -35,6 +35,10 @@ export interface SyntheticNetwork {
   externalFailures: string[];
 }
 
+export interface SyntheticAPIOptions {
+  rejectedWipeEnrollmentPassword?: string;
+}
+
 declare global {
   interface Window {
     __iceqE2ENetwork: BrowserNetworkEvidence;
@@ -63,6 +67,7 @@ function isProductionTraffic(request: Request): boolean {
 export async function installSyntheticAPI(
   page: Page,
   users: SyntheticUser[] = [SYNTHETIC_USER],
+  options: SyntheticAPIOptions = {},
 ): Promise<SyntheticNetwork> {
   const network: SyntheticNetwork = { requestBodies: [], externalRequests: [], externalFailures: [] };
   page.on("request", (request) => {
@@ -76,7 +81,7 @@ export async function installSyntheticAPI(
     if (isProductionTraffic(request)) network.externalFailures.push(`${request.method()} ${request.url()}`);
   });
 
-  await page.addInitScript((syntheticUsers) => {
+  await page.addInitScript(({ syntheticUsers, syntheticOptions }) => {
     const evidence: BrowserNetworkEvidence = { apiAttempts: [], websocketAttempts: [], unhandled: [] };
     const pollQueue: unknown[] = [];
     const pollWaiters: Array<(response: Response) => void> = [];
@@ -133,9 +138,15 @@ export async function installSyntheticAPI(
       }
       if (url.pathname === "/api/auth/logout") return respondJSON({});
       if (url.pathname === "/api/auth/panic-wipe-public-key" && request.method === "PUT") {
-        const input = JSON.parse(body || "{}") as { public_key?: string };
+        const input = JSON.parse(body || "{}") as { public_key?: string; password?: string };
+        if (input.password === syntheticOptions.rejectedWipeEnrollmentPassword) {
+          return respondJSON({ error: "incorrect password", code: "INVALID_PASSWORD" }, 401);
+        }
         wipePublicKeyB64 = input.public_key ?? null;
         return respondJSON({});
+      }
+      if (url.pathname === "/api/auth/panic-wipe-public-key" && request.method === "GET") {
+        return respondJSON({ public_key: wipePublicKeyB64 });
       }
       if (url.pathname === "/api/auth/panic-wipe-challenge" && request.method === "POST") {
         const bytes = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
@@ -275,7 +286,7 @@ export async function installSyntheticAPI(
     }
 
     Object.defineProperty(window, "WebSocket", { configurable: true, writable: true, value: SyntheticWebSocket });
-  }, users);
+  }, { syntheticUsers: users, syntheticOptions: options });
 
   return network;
 }

@@ -1,7 +1,6 @@
-// iOS Safari install hint — shown once after first login on
-// iOS devices that haven't installed the PWA.
-// iOS Safari doesn't support beforeinstallprompt, so we show
-// manual instructions instead.
+// src/components/PWA/IOSInstallHint.tsx
+//
+// iOS Safari install hint (bottom sheet) — Arctic Signal design.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "../../i18n";
@@ -22,11 +21,7 @@ export function isIOSSafariInstallHintEligible(navigatorLike: InstallHintNavigat
   const isIOSDevice =
     /iPad|iPhone|iPod/.test(userAgent) ||
     (platform === "MacIntel" && maxTouchPoints > 1);
-
-  if (!isIOSDevice) {
-    return false;
-  }
-
+  if (!isIOSDevice) return false;
   return /Safari/i.test(userAgent) && !/(CriOS|FxiOS|EdgiOS|OPiOS|OPT\/)/i.test(userAgent);
 }
 
@@ -39,7 +34,6 @@ function isStandalone(): boolean {
 }
 
 interface IOSInstallHintProps {
-  /** Pass true once the user has successfully logged in */
   visible: boolean;
 }
 
@@ -53,15 +47,11 @@ export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | 
     localStorage.setItem(HINT_KEY, "1");
     setShow(false);
   }, []);
+
   const dialogRef = useDialogFocus(show, handleGotIt, returnFocusRef, dismissButtonRef);
 
   useEffect(() => {
-    if (
-      visible &&
-      isIOS() &&
-      !isStandalone() &&
-      !localStorage.getItem(HINT_KEY)
-    ) {
+    if (visible && isIOS() && !isStandalone() && !localStorage.getItem(HINT_KEY)) {
       returnFocusRef.current = document.activeElement as HTMLElement | null;
       setShow(true);
     }
@@ -74,58 +64,29 @@ export function IOSInstallHint({ visible }: IOSInstallHintProps): JSX.Element | 
       role="dialog"
       aria-modal="true"
       aria-labelledby="ios-install-hint-title"
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 10000,
-        background: "rgba(0,0,0,0.7)",
-        display: "flex",
-        alignItems: "flex-end",
-        justifyContent: "center",
-      }}
+      className="fixed inset-0 z-[10000] flex items-end justify-center"
+      style={{ background: "rgba(8, 13, 24, 0.75)", backdropFilter: "blur(4px)" }}
       onClick={handleGotIt}
     >
       <div
         ref={dialogRef}
-        style={{
-          background: "#141414",
-          borderRadius: "16px 16px 0 0",
-          padding: "24px 20px 36px",
-          maxWidth: 480,
-          width: "100%",
-          borderTop: "1px solid #2a2a2a",
-        }}
+        className="w-full max-w-modal-sm rounded-t-2xl border-t border-ice-border bg-cobalt px-5 pb-9 pt-6"
         onClick={(e) => e.stopPropagation()}
       >
         <h2
           id="ios-install-hint-title"
-          style={{
-            margin: "0 0 12px",
-            fontSize: 18,
-            fontWeight: 700,
-            color: "#e5e5e5",
-          }}
+          className="text-lg font-semibold text-frozen"
         >
           {i18n.t("pwa.installIceq")}
         </h2>
-        <p style={{ margin: "0 0 20px", fontSize: 14, color: "#999", lineHeight: 1.5 }}>
+        <p className="mt-3 text-sm leading-relaxed text-mist">
           {i18n.t("pwa.iosHelp")}
         </p>
         <button
           ref={dismissButtonRef}
           type="button"
+          className="iceq-btn-primary mt-5 w-full"
           onClick={handleGotIt}
-          style={{
-            width: "100%",
-            background: "#00b4d8",
-            color: "#0a0a0a",
-            border: "none",
-            borderRadius: 10,
-            padding: "12px",
-            fontWeight: 700,
-            fontSize: 15,
-            cursor: "pointer",
-          }}
         >
           {i18n.t("pwa.gotIt")}
         </button>

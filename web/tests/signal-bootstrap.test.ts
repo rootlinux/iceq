@@ -3,6 +3,16 @@ import assert from "node:assert/strict";
 
 import { ApiError } from "../src/api/client.js";
 import { ensureOwnBundle, ensureSignalProvisioning } from "../src/lib/signalBootstrap.js";
+import { generateOneTimePreKeys } from "../src/lib/signal.ts";
+
+test("prekey generation fails before touching browser crypto when already aborted", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    generateOneTimePreKeys(1, 1, { uin: 42, deviceId: "abort_test_device" }, controller.signal),
+    (error: unknown) => (error as { name?: string }).name === "AbortError",
+  );
+});
 
 test("ensureOwnBundle does nothing when the remote bundle already exists", async () => {
   let uploaded = false;

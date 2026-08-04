@@ -37,20 +37,21 @@ export interface PreKeyBundleUpload {
   registration_id: number;
 }
 
-export async function uploadBundle(bundle: PreKeyBundleUpload): Promise<void> {
-  await fetchWithAuth("/api/keys/bundle", { method: "POST", body: bundle });
+export async function uploadBundle(bundle: PreKeyBundleUpload, signal?: AbortSignal): Promise<void> {
+  await fetchWithAuth("/api/keys/bundle", { method: "POST", body: bundle, signal });
 }
 
-export async function addPreKeys(prekeys: OneTimePreKeyUpload[]): Promise<{ accepted: number }> {
+export async function addPreKeys(prekeys: OneTimePreKeyUpload[], signal?: AbortSignal): Promise<{ accepted: number }> {
   await fetchWithAuth("/api/keys/prekeys", {
     method: "POST",
     body: { prekeys },
+    signal,
   });
   return { accepted: prekeys.length };
 }
 
-export async function getPrekeyCount(): Promise<number> {
-  const resp = await fetchJSON<{ count: number }>("/api/keys/prekeys/count", { method: "GET" });
+export async function getPrekeyCount(signal?: AbortSignal): Promise<number> {
+  const resp = await fetchJSON<{ count: number }>("/api/keys/prekeys/count", { method: "GET", signal });
   return resp.count;
 }
 
@@ -61,8 +62,9 @@ export interface RemotePreKeyBundle {
   registration_id: number;
 }
 
-export async function fetchBundle(uin: number): Promise<RemotePreKeyBundle> {
+export async function fetchBundle(uin: number, signal?: AbortSignal): Promise<RemotePreKeyBundle> {
   return fetchJSON<RemotePreKeyBundle>(`/api/keys/bundle/${encodeURIComponent(String(uin))}`, {
     method: "GET",
+    signal,
   });
 }

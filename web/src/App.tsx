@@ -34,7 +34,7 @@ export default function App(): JSX.Element {
   const hydrated = useAuthStore((s) => s.hydrated);
   const navigate = useNavigate();
   const i18n = useI18n();
-  const [cleanupFailed, setCleanupFailed] = useState(() => localStorage.getItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY) === "1");
+  const [cleanupFailed, setCleanupFailed] = useState(() => localStorage.getItem(ICEQ_CLEANUP_REQUIRED_MARKER_KEY) !== null);
   const [setupStatus, setSetupStatus] = useState<{ uin: number; complete: boolean } | null>(null);
 
   // Check security setup completion when authenticated
@@ -93,8 +93,9 @@ export default function App(): JSX.Element {
   // login form for one render before re-routing to /app.
   if (!hydrated) {
     return (
-      <div className="flex h-full items-center justify-center bg-bg text-text-2">
-        {i18n.t("app.loading")}
+      <div className="abyss-depth flex h-full items-center justify-center">
+        <span className="iceq-spinner mr-3" />
+        <span className="text-mist">{i18n.t("app.loading")}</span>
       </div>
     );
   }
@@ -108,20 +109,36 @@ export default function App(): JSX.Element {
 
   return (
     <>
-    {cleanupFailed && <div role="alert" className="fixed inset-x-0 top-0 z-50 bg-danger p-3 text-white">
-      <span>{i18n.t("cleanup.failed")}</span>{" "}
-      <button type="button" onClick={() => void useAuthStore.getState().retryLocalCleanup().then(() => setCleanupFailed(false)).catch(() => setCleanupFailed(true))}>{i18n.t("cleanup.retry")}</button>
-    </div>}
+    {cleanupFailed && (
+      <div role="alert" className="iceq-banner iceq-banner--cleanup flex items-center justify-center gap-3">
+        <span>{i18n.t("cleanup.failed")}</span>
+        <button
+          type="button"
+          className="iceq-btn-secondary text-xs"
+          onClick={() => void useAuthStore.getState().retryLocalCleanup().then(() => setCleanupFailed(false)).catch(() => setCleanupFailed(true))}
+        >
+          {i18n.t("cleanup.retry")}
+        </button>
+      </div>
+    )}
     {checkingSetup ? (
-      <div className="flex h-full items-center justify-center bg-bg text-text-2">
-        {i18n.t("app.loading")}
+      <div className="abyss-depth flex h-full items-center justify-center">
+        <span className="iceq-spinner mr-3" />
+        <span className="text-mist">{i18n.t("app.loading")}</span>
       </div>
     ) : (
     <Routes>
       <Route path="/login" element={isAuthed ? <Navigate to="/app" replace /> : <LoginForm />} />
       <Route path="/register" element={isAuthed ? <Navigate to="/app" replace /> : <RegisterForm />} />
       <Route path="/setup" element={showSetup ? <SecuritySetupGate onSetupComplete={() => uin !== null && setSetupStatus({ uin, complete: true })} /> : <Navigate to="/app" replace />} />
-      <Route path="/recovery" element={isAuthed ? <RecoveryImportScreen /> : <Navigate to="/login" replace />} />
+      <Route
+        path="/recovery"
+        element={isAuthed ? (
+          <RecoveryImportScreen
+            onRecoveryComplete={() => uin !== null && setSetupStatus({ uin, complete: true })}
+          />
+        ) : <Navigate to="/login" replace />}
+      />
       <Route
         path="/app/*"
         element={showSetup ? <Navigate to="/setup" replace /> : (isAuthed ? <MainLayout><ChatShell /></MainLayout> : <Navigate to="/login" replace />)}

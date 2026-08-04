@@ -124,8 +124,8 @@ export async function setPanicPin(currentPassword: string, pin: string): Promise
   });
 }
 
-export async function me(): Promise<UserPublic> {
-  return fetchJSON<UserPublic>("/api/auth/me", { method: "GET" });
+export async function me(signal?: AbortSignal): Promise<UserPublic> {
+  return fetchJSON<UserPublic>("/api/auth/me", { method: "GET", signal });
 }
 
 export interface CryptoBinding {
@@ -136,6 +136,6 @@ export interface CryptoBinding {
 /** Returns the authenticated user's public identity key for
  *  ambiguous registration recovery. Self-only — never accepts
  *  a target UIN and never exposes private material. */
-export async function cryptoBinding(): Promise<CryptoBinding> {
-  return fetchJSON<CryptoBinding>("/api/auth/crypto-binding", { method: "GET" });
+export async function cryptoBinding(signal?: AbortSignal): Promise<CryptoBinding> {
+  return fetchJSON<CryptoBinding>("/api/auth/crypto-binding", { method: "GET", signal });
 }

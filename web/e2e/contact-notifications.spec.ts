@@ -8,9 +8,10 @@ test("contact request and acceptance notifications update the sidebar without a 
   if (testInfo.project.name === "webkit-ios") {
     await page.getByRole("button", { name: "Got it" }).click();
   }
-  if (testInfo.project.name.endsWith("android") || testInfo.project.name.endsWith("ios")) {
-    await page.getByRole("button", { name: "Toggle menu" }).click();
-  }
+  // Drawer is always closed — open it first
+  await page.getByRole("button", { name: "Toggle menu" }).click();
+  // Switch to Contacts tab
+  await page.getByRole("tab", { name: "Contacts" }).click();
   await expect(page.getByText("No contacts yet", { exact: false })).toBeVisible();
 
   await page.evaluate(() => {

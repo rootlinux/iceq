@@ -153,6 +153,7 @@ export function useWebSocket(): UseWebSocketResult {
   const pingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pongTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closedByUsRef = useRef(false);
+  const wipeLifecycleStartedRef = useRef(false);
   const authInflightRef = useRef(false);
   const seenEnvelopeIDsRef = useRef<Set<string>>(new Set());
   const seenEnvelopeOrderRef = useRef<string[]>([]);
@@ -262,14 +263,7 @@ export function useWebSocket(): UseWebSocketResult {
           // to /login.
           // Wait for the shared cleanup coordinator before
           // notifying the router.
-          useAuthStore.getState().handleServerWipe().then(() => {
-            window.dispatchEvent(new CustomEvent("iceq:wiped"));
-            setConnected(false);
-          }).catch((error) => {
-            console.error("[IceQ cleanup] server wipe local cleanup failed", error);
-            window.dispatchEvent(new CustomEvent("iceq:wiped"));
-            setConnected(false);
-          });
+          beginServerWipeLifecycle();
           return;
         case "unauthorized":
           // 4401 — the WS path may be the first place we
@@ -341,6 +335,10 @@ export function useWebSocket(): UseWebSocketResult {
         // 4401 close will follow shortly; this branch
         // exists so we can surface the reason in dev.
         if (__DEV__) console.warn("[ws] auth_fail:", p.reason);
+        return;
+      }
+      case "account_wiped": {
+        beginServerWipeLifecycle();
         return;
       }
       case "ping": {
@@ -507,6 +505,20 @@ export function useWebSocket(): UseWebSocketResult {
   }
 
   dispatchRef.current = dispatch;
+
+  function beginServerWipeLifecycle(): void {
+    if (wipeLifecycleStartedRef.current) return;
+    wipeLifecycleStartedRef.current = true;
+    closedByUsRef.current = true;
+    cleanupTimers();
+    setConnected(false);
+    void useAuthStore.getState().handleServerWipe().then(() => {
+      window.dispatchEvent(new CustomEvent("iceq:wiped"));
+    }).catch((error) => {
+      console.error("[IceQ cleanup] server wipe local cleanup failed", error);
+      window.dispatchEvent(new CustomEvent("iceq:wiped"));
+    });
+  }
 
   const consumeExternal = useCallback(async (env: Envelope): Promise<boolean> => {
 	// Poll JSON is untrusted network input too. Re-serialize it through the

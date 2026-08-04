@@ -14,6 +14,14 @@ test("addPreKeys accepts the backend 204 No Content contract", async () => {
 });
 
 test("getPrekeyCount reads the server-side unused prekey count", async () => {
-  assert.match(keysSource, /export async function getPrekeyCount\(\): Promise<number>/);
-  assert.match(keysSource, /fetchJSON<\{\s*count:\s*number\s*\}>\("\/api\/keys\/prekeys\/count",\s*\{\s*method:\s*"GET"\s*\}\)/s);
+  assert.match(keysSource, /export async function getPrekeyCount\(signal\?: AbortSignal\): Promise<number>/);
+  assert.match(keysSource, /fetchJSON<\{\s*count:\s*number\s*\}>\("\/api\/keys\/prekeys\/count",\s*\{\s*method:\s*"GET",\s*signal\s*\}\)/s);
+});
+
+test("authenticated layout aborts the complete Signal provisioning chain on teardown", () => {
+  const layoutSource = readFileSync(join(__dirname, "../src/components/Layout/MainLayout.tsx"), "utf8");
+  const storeSource = readFileSync(join(__dirname, "../src/store/signalStore.ts"), "utf8");
+  assert.match(layoutSource, /refreshPrekeyCount\(controller\.signal\)/);
+  assert.match(storeSource, /refreshPrekeyCount:\s*\(signal\?:\s*AbortSignal\)\s*=>\s*Promise<void>/);
+  assert.match(storeSource, /getPrekeyCount\(signal\)/);
 });

@@ -39,8 +39,8 @@ export class AttachmentGrantLifecycle {
   private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(private readonly deps: GrantLifecycleDeps) {
-    this.setTimer = deps.setTimer ?? setTimeout;
-    this.clearTimer = deps.clearTimer ?? clearTimeout;
+    this.setTimer = deps.setTimer ?? ((fn, ms) => globalThis.setTimeout(fn, ms));
+    this.clearTimer = deps.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
     this.timeoutMs = deps.timeoutMs ?? 30_000;
     this.retryDelaysMs = deps.retryDelaysMs ?? [250, 1_000, 3_000];
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));

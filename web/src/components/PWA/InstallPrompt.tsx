@@ -1,6 +1,6 @@
-// Android Chrome "Add to Home Screen" install banner.
-// Uses the beforeinstallprompt API — only fires on Android Chrome
-// when PWA criteria are met and the app isn't already installed.
+// src/components/PWA/InstallPrompt.tsx
+//
+// Android Chrome "Add to Home Screen" banner — Arctic Signal design.
 
 import { useEffect, useState } from "react";
 import { useI18n } from "../../i18n";
@@ -28,66 +28,32 @@ export function InstallPrompt(): JSX.Element | null {
 
   if (!deferredPrompt) return null;
 
-  const handleInstall = (): void => {
-    void handleInstallPrompt(() => installPromptLifecycle.prompt());
-  };
-
-  const handleDismiss = (): void => {
-    installPromptLifecycle.dismiss();
-  };
-
   return (
-    <div
-      style={{
-        position: "fixed",
-        bottom: 0,
-        left: 0,
-        right: 0,
-        zIndex: 9999,
-        background: "#141414",
-        borderTop: "1px solid #2a2a2a",
-        display: "flex",
-        alignItems: "center",
-        padding: "10px 16px",
-        gap: "12px",
-      }}
-    >
+    <div className="fixed inset-x-0 bottom-0 z-[9999] flex items-center gap-3 border-t border-ice-border bg-cobalt px-4 py-2.5">
       <img
         src="/icons/icon-192.png"
         alt="IceQ"
-        style={{ width: 24, height: 24, borderRadius: 4, flexShrink: 0 }}
+        className="h-6 w-6 shrink-0 rounded-sm"
       />
-      <span style={{ flex: 1, fontSize: 14, color: "#e5e5e5" }}>
+      <span className="flex-1 text-sm text-frozen">
         {i18n.t("pwa.addHome")}
       </span>
       <button
-        onClick={handleInstall}
-        style={{
-          background: "#00b4d8",
-          color: "#0a0a0a",
-          border: "none",
-          borderRadius: 6,
-          padding: "6px 14px",
-          fontWeight: 600,
-          fontSize: 13,
-          cursor: "pointer",
-        }}
+        type="button"
+        className="iceq-btn-primary text-xs"
+        onClick={() => { void installPromptLifecycle.prompt(); }}
       >
         {i18n.t("pwa.install")}
       </button>
       <button
-        onClick={handleDismiss}
+        type="button"
+        className="iceq-btn-icon"
         aria-label={i18n.t("pwa.dismiss")}
-        style={{
-          background: "none",
-          border: "none",
-          color: "#888",
-          fontSize: 18,
-          cursor: "pointer",
-          padding: "0 4px",
-        }}
+        onClick={() => installPromptLifecycle.dismiss()}
       >
-        ×
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+          <line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>
+        </svg>
       </button>
     </div>
   );

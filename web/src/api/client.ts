@@ -100,6 +100,29 @@ export async function refreshSession(): Promise<boolean> {
   return ok;
 }
 
+type UnauthorizedDisposition = "refreshable" | "terminal" | "endpoint-specific";
+
+async function classifyUnauthorized(resp: Response): Promise<UnauthorizedDisposition> {
+  try {
+    const payload = await resp.clone().json() as { code?: unknown };
+    if (typeof payload.code !== "string") return "refreshable";
+    // Refresh only conditions that a valid refresh cookie can actually
+    // recover. Revoked, malformed, or wrong-type access tokens are terminal:
+    // minting a replacement for them would undermine server-side revocation.
+    if (payload.code === "AUTH_MISSING_BEARER" || payload.code === "TOKEN_EXPIRED") {
+      return "refreshable";
+    }
+    if (payload.code === "TOKEN_REVOKED" || payload.code === "TOKEN_INVALID" || payload.code === "TOKEN_WRONG_TYPE") {
+      return "terminal";
+    }
+    return "endpoint-specific";
+  } catch {
+    // Preserve compatibility with an older or non-JSON auth boundary: a
+    // bare 401 may still mean that the access token expired.
+    return "refreshable";
+  }
+}
+
 // ----------------------------------------------------------------------------
 // fetchWithAuth — the public wrapper. `retried` is the internal
 // flag that prevents an infinite refresh loop: the second leg
@@ -152,12 +175,23 @@ export async function fetchWithAuth(path: string, opts: FetchOptions = {}, retri
     throw new ApiNetworkError((e as Error).message);
   }
 
-  if (resp.status === 401 && !opts.noAuth && !opts.skipRefresh && !retried) {
-    const ok = await refreshSession();
-    if (ok) {
-      return fetchWithAuth(path, opts, true);
+  if (resp.status === 401 && !opts.noAuth) {
+    const disposition = await classifyUnauthorized(resp);
+    if (disposition === "terminal") {
+      clearStoredTokensAndNotify();
+    } else if (disposition === "refreshable") {
+      if (!opts.skipRefresh && !retried) {
+        const ok = await refreshSession();
+        if (ok) {
+          return fetchWithAuth(path, opts, true);
+        }
+        throw new ApiAuthError("unauthorized", 401);
+      }
+      // A fresh retry that is still unauthorized cannot be recovered by
+      // refreshing again. End the local session instead of looping or leaving
+      // a dead bearer token in place.
+      clearStoredTokensAndNotify();
     }
-    throw new ApiAuthError("unauthorized", 401);
   }
 
   if (!resp.ok) {

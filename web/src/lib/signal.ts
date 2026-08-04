@@ -314,8 +314,11 @@ export async function generatePreKeyBundle(
   oneTimePreKeyCount: number,
   registrationId: number,
   namespace: CryptoNamespace,
+  signal?: AbortSignal,
 ): Promise<PreKeyBundleUpload> {
+  throwIfAborted(signal);
   const { runtime } = await ensureBoot();
+  throwIfAborted(signal);
   const store = getSignalStore(namespace);
 
   // The KeyHelper API takes a KeyPairType, not our wrapped
@@ -327,7 +330,9 @@ export async function generatePreKeyBundle(
 
   // 1. Signed prekey (long-lived, signed by identity privkey).
   const signed = await runtime.KeyHelper.generateSignedPreKey(identityForHelper, signedPreKeyId);
+  throwIfAborted(signal);
   await store.storeSignedPreKey(signed.keyId, signed.keyPair);
+  throwIfAborted(signal);
 
   // 2. One-time prekeys. Each is independent; we save each to
   //    the prekey store keyed by its id. The id range starts
@@ -336,7 +341,9 @@ export async function generatePreKeyBundle(
   for (let i = 0; i < oneTimePreKeyCount; i++) {
     const id = signedPreKeyId + 1 + i;
     const otp = await runtime.KeyHelper.generatePreKey(id);
+    throwIfAborted(signal);
     await store.storePreKey(otp.keyId, otp.keyPair);
+    throwIfAborted(signal);
     oneTime.push({
       id: otp.keyId,
       public_key: encodePreKeyPublicKeyForWire(new Uint8Array(otp.keyPair.pubKey)),
@@ -355,14 +362,18 @@ export async function generatePreKeyBundle(
   };
 }
 
-export async function generateOneTimePreKeys(startId: number, count: number, namespace: CryptoNamespace): Promise<OneTimePreKeyUpload[]> {
+export async function generateOneTimePreKeys(startId: number, count: number, namespace: CryptoNamespace, signal?: AbortSignal): Promise<OneTimePreKeyUpload[]> {
+  throwIfAborted(signal);
   const { runtime } = await ensureBoot();
+  throwIfAborted(signal);
   const store = getSignalStore(namespace);
   const prekeys: OneTimePreKeyUpload[] = [];
 
   for (let i = 0; i < count; i++) {
     const otp = await runtime.KeyHelper.generatePreKey(startId + i);
+    throwIfAborted(signal);
     await store.storePreKey(otp.keyId, otp.keyPair);
+    throwIfAborted(signal);
     prekeys.push({
       id: otp.keyId,
       public_key: encodePreKeyPublicKeyForWire(new Uint8Array(otp.keyPair.pubKey)),
@@ -370,6 +381,13 @@ export async function generateOneTimePreKeys(startId: number, count: number, nam
   }
 
   return prekeys;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  throw error;
 }
 
 // ============================================================================

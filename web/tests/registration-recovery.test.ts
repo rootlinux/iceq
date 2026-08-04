@@ -283,3 +283,28 @@ test("repeated resume is idempotent", async () => {
     assert.equal(m2.commits, 0, "second resume must not re-commit");
   }
 });
+
+test("aborting registration recovery after upload prevents namespace commit and activation", async () => {
+  const m: ResumeMock = {
+    pendingState: makePending({ status: "registered", accountUin: 42, deviceId: "resume_testdev" }),
+    accountUin: 42, accountUsername: "alice",
+    directoryIdentity: "test-identity-key-001", directoryError: null,
+    bindingUin: 42, bindingIdentity: "test-identity-key-001", bindingError: null,
+    uploads: 0, commits: 0, saves: [], cleared: false, activeNamespace: null,
+  };
+  const controller = new AbortController();
+  const deps = makeResumeDeps(m);
+  deps.uploadBundle = async () => {
+    m.uploads++;
+    controller.abort();
+  };
+
+  await assert.rejects(
+    resumeAuthenticatedRegistration(42, deps, controller.signal),
+    (error: unknown) => (error as { name?: string }).name === "AbortError",
+  );
+  assert.equal(m.uploads, 1);
+  assert.equal(m.commits, 0, "an aborted recovery must not commit staged crypto");
+  assert.equal(m.cleared, false, "pending recovery state must remain retryable");
+  assert.equal(m.activeNamespace, null, "an aborted recovery must not activate the namespace");
+});

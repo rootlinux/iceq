@@ -69,11 +69,11 @@ async function completeSecuritySetup(page: Page, user: SyntheticUser = SYNTHETIC
 }
 
 async function openSettings(page: Page, testInfo: TestInfo): Promise<void> {
-  const mobile = testInfo.project.name.endsWith("android") || testInfo.project.name.endsWith("ios");
   if (testInfo.project.name === "webkit-ios") {
     await page.getByRole("button", { name: "Got it" }).click();
   }
-  if (mobile) await page.getByRole("button", { name: "Toggle menu" }).click();
+  // Drawer is always closed by default — open it first
+  await page.getByRole("button", { name: "Toggle menu" }).click();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
 }
@@ -111,6 +111,50 @@ test("first login remains gated until security setup is durably completed", asyn
   await page.reload();
   await expect(page).toHaveURL(/\/app(?:\/|$)/);
   await expect(page.getByText(SYNTHETIC_USER.username, { exact: false })).toBeVisible();
+  await assertHermeticNetwork(page, network);
+});
+
+test("wrong account password stays on wipe enrollment and explains the error without refreshing the session", async ({ page }) => {
+  const network = await installSyntheticAPI(page, [SYNTHETIC_USER], {
+    rejectedWipeEnrollmentPassword: "wrong-account-password",
+  });
+  await startUnconfiguredSession(page);
+
+  await page.getByRole("button", { name: "Begin Setup" }).click();
+  await page.locator("#setup-passphrase").fill(SECURITY_PASSPHRASE);
+  await page.locator("#setup-passphrase-confirm").fill(SECURITY_PASSPHRASE);
+  await page.getByRole("button", { name: "Continue" }).click();
+
+  const refreshAttemptsBefore = await page.evaluate(() => window.__iceqE2ENetwork.apiAttempts.filter((entry) => (
+    entry.path === "/api/auth/refresh"
+  )).length);
+
+  await page.locator("#setup-account-password").fill("wrong-account-password");
+  await page.getByRole("button", { name: "Enable Panic Wipe" }).click();
+
+  await expect(page.getByRole("heading", { name: "Enable Panic Wipe" })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("Incorrect account password");
+  await expect(page.locator("#setup-account-password")).toHaveValue("");
+  await expect(page.locator("#setup-account-password")).toBeFocused();
+  await expect(page.locator("#setup-account-password")).toHaveAttribute("aria-invalid", "true");
+
+  const failedEnrollment = await page.evaluate(() => {
+    const attempts = window.__iceqE2ENetwork.apiAttempts.filter((entry) => (
+      entry.path === "/api/auth/panic-wipe-public-key" && entry.method === "PUT"
+    ));
+    return attempts.map((entry) => JSON.parse(entry.body) as { password?: string });
+  });
+  expect(failedEnrollment).toHaveLength(1);
+  expect(failedEnrollment[0]?.password).toBe("wrong-account-password");
+
+  const refreshAttempts = await page.evaluate(() => window.__iceqE2ENetwork.apiAttempts.filter((entry) => (
+    entry.path === "/api/auth/refresh"
+  )).length);
+  expect(refreshAttempts).toBe(refreshAttemptsBefore);
+
+  await page.locator("#setup-account-password").fill(ACCOUNT_PASSWORD);
+  await page.getByRole("button", { name: "Enable Panic Wipe" }).click();
+  await expect(page.getByRole("button", { name: "Generate Recovery Key & Package" })).toBeVisible();
   await assertHermeticNetwork(page, network);
 });
 
