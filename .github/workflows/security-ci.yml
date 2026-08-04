@@ -175,6 +175,7 @@ jobs:
         env:
           ICEQ_ACCEPTANCE: "1"
           ICEQ_ACCEPTANCE_PG_URL: "postgres://postgres:postgres@localhost:5434/iceq?sslmode=disable"
+          ICEQ_TEST_PG_URL: "postgres://postgres:postgres@localhost:5434/iceq?sslmode=disable"
           ICEQ_ACCEPTANCE_REDIS_ADDR: "localhost:6380"
           ICEQ_ACCEPTANCE_REDIS_PASSWORD: "iceq-acceptance-redis"
           ICEQ_ACCEPTANCE_SCYLLA_HOSTS: "localhost:9043"
@@ -185,7 +186,7 @@ jobs:
           ICEQ_ACCEPTANCE_MINIO_SECRET_KEY: "minioadmin"
         run: |
           set -o pipefail
-          go test -count=1 -race -tags=integration -run TestAcceptanceFullStack -v ./auth-service/handlers/ 2>&1 | tee acceptance-output.txt
+          go test -count=1 -race -tags=integration -v ./auth-service/handlers/ 2>&1 | tee acceptance-output.txt
       - name: Print failure output
         if: failure()
         working-directory: backend

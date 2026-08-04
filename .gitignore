@@ -6,6 +6,8 @@ web/dist/
 web/.tmp-test-build/
 web/test-results/
 web/playwright-report/
+test-results/
+playwright-report/
 node_modules/
 dist/
 
@@ -23,6 +25,7 @@ backend/cmd_smoke_msgsvc/smoke
 
 # OS/editor noise
 .DS_Store
+.obsidian/
 
 # Local isolated development worktrees
 .worktrees/
