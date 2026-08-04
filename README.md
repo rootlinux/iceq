@@ -1,6 +1,118 @@
+<div align="center">
+
+<img src="docs/screenshots/01-login.jpg" alt="IceQ sign-in screen" width="720">
+
 # IceQ
 
-IceQ is a privacy-first encrypted messenger. Direct messages use Signal Protocol primitives and groups use client-side Sender Keys; servers relay ciphertext but still control availability, routing, membership metadata, and the web code delivered to browsers. The implementation has not yet received an independent cryptographic audit.
+**A privacy-first, end-to-end encrypted messenger built on the Signal Protocol.**
+
+[![Go](https://img.shields.io/badge/backend-Go%201.25-00ADD8?logo=go&logoColor=white)](backend/go.mod)
+[![TypeScript](https://img.shields.io/badge/frontend-React%20%2B%20TypeScript-3178C6?logo=typescript&logoColor=white)](web/package.json)
+[![Signal Protocol](https://img.shields.io/badge/crypto-Signal%20Protocol%20%2B%20Sender%20Keys-4CE1A1)](#e2ee-design)
+[![Tests](https://img.shields.io/badge/tests-Go%20%2B%20unit%20%2B%20e2e-59D8FF)](#development)
+[![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+
+</div>
+
+IceQ is a self-hostable encrypted messenger. Direct messages use Signal Protocol primitives (X3DH + Double Ratchet) and groups use client-side Sender Keys — the server only ever receives ciphertext. It ships as a set of independent Go microservices behind Caddy, a React/TypeScript PWA frontend, and an opt-in Tor hidden-service profile, with a panic-wipe feature that durably erases an account across every storage layer on demand.
+
+The server remains trusted for key-bundle distribution, membership, routing, availability, metadata handling, and delivery of the web application itself — see [E2EE Design](#e2ee-design) and the [threat model](docs/threat-model.md) for exactly what is and isn't covered. **The implementation has not yet received an independent cryptographic audit** — see [Security Status](docs/security-status.md) before any production use.
+
+### Contents
+
+[Key Features](#key-features) · [Screenshots](#screenshots) · [Architecture](#architecture) · [Tech Stack](#tech-stack) · [Quick Start](#quick-start) · [Services](#services) · [E2EE Design](#e2ee-design) · [Privacy Guarantees](#privacy-guarantees) · [Security Features](#security-features) · [Development](#development) · [Known Limitations](#known-limitations)
+
+## Key Features
+
+- 🔐 **True end-to-end encryption** — direct messages use Signal Protocol (X3DH key agreement + Double Ratchet); the server stores and relays ciphertext only, never plaintext
+- 👥 **Encrypted group chat** — client-side Sender Keys scoped to a membership epoch, with epoch rotation on membership change and replay protection
+- 🔑 **Out-of-band identity verification** — a 12-group safety-number fingerprint plus a scannable Safety QR code so both sides can confirm they share the same identity keys
+- 🧨 **Panic Wipe** — a passphrase- or PIN-authenticated, challenge-signed request that starts durable asynchronous deletion of the account across Postgres, ScyllaDB, Redis, NATS, and MinIO
+- 🗝️ **Local-only recovery vault** — a browser-generated recovery key + encrypted recovery package restores your encryption identity on a new device; IceQ never stores or can reset either
+- 📎 **Encrypted file attachments** — files are AES-256-GCM encrypted client-side before upload; the server mints pre-signed MinIO URLs and never sees plaintext bytes
+- ⏳ **Disappearing messages** — optional per-conversation TTL, server-enforced ciphertext expiry, up to one week
+- 📡 **Live presence & delivery state** — WebSocket hub with NATS fan-out for presence, typing indicators, and delivery/read receipts, each individually toggleable for privacy
+- 📱 **Installable PWA** — offline-capable, installable on desktop and iOS/Android home screens, with responsive layouts down to 320px
+- 🧅 **Optional Tor hidden service** — an opt-in Compose profile serves the same app over a v3 `.onion` address (deferred until clearnet acceptance — see [Known Limitations](#known-limitations))
+- 🇬🇧🇹🇷 **Localized UI** — fully typed EN/TR translation catalogs with parity enforced by tests
+- 🛡️ **Defense-in-depth backend** — per-route rate limiting, short-lived JWTs with Redis-blocklisted revocation, Argon2id password hashing, read-only containers, `no-new-privileges`, and per-container resource limits
+
+## Screenshots
+
+<table>
+<tr>
+<td width="50%">
+
+**Sign in**
+<img src="docs/screenshots/01-login.jpg" alt="Sign in screen">
+
+</td>
+<td width="50%">
+
+**Security setup — passphrase**
+<img src="docs/screenshots/03-security-setup-passphrase.jpg" alt="Security setup: local passphrase step">
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**Panic Wipe enrollment**
+<img src="docs/screenshots/04-panic-wipe-enroll.jpg" alt="Panic Wipe enrollment step">
+
+</td>
+<td width="50%">
+
+**Recovery key & package**
+<img src="docs/screenshots/05-recovery-package.jpg" alt="Recovery key and package generation">
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**App shell**
+<img src="docs/screenshots/06-app-shell.jpg" alt="Main application shell with sidebar">
+
+</td>
+<td width="50%">
+
+**Encrypted groups**
+<img src="docs/screenshots/07-groups.jpg" alt="Groups panel">
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**Encrypted conversation**
+<img src="docs/screenshots/09-conversation.jpg" alt="An encrypted direct-message conversation">
+
+</td>
+<td width="50%">
+
+**Safety number verification**
+<img src="docs/screenshots/10-safety-number.jpg" alt="Safety number and QR verification modal">
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**Privacy & security settings**
+<img src="docs/screenshots/11-settings.jpg" alt="Privacy signals and safety QR in settings">
+
+</td>
+<td width="50%">
+
+**Mobile (390×844)**
+<img src="docs/screenshots/12-mobile-login.jpg" alt="Mobile sign-in screen" width="260">
+
+</td>
+</tr>
+</table>
+
+All screenshots are from a real run of the app against the local rehearsal stack — nothing staged or mocked.
 
 ## Architecture
 
@@ -34,6 +146,19 @@ service     service        (pre-signed
 
 Infrastructure: PostgreSQL · ScyllaDB · Redis · NATS · MinIO · optional Tor
 ```
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 18, TypeScript, Vite, Zustand, Tailwind CSS |
+| Cryptography (client) | `@privacyresearch/libsignal-protocol-typescript` (X3DH + Double Ratchet), client-side Sender Keys, AES-256-GCM for attachments |
+| Backend | Go 1.25, one binary per bounded service (`auth-service`, `key-service`, `ws-gateway`, `message-service`, `presence-service`, `file-service`) |
+| Datastores | PostgreSQL (users/contacts/groups), ScyllaDB (message ciphertext), Redis (presence, blocklist, rate limits), MinIO (S3-compatible file objects) |
+| Messaging bus | NATS JetStream — inter-service fan-out and durable delivery |
+| Edge | Caddy — TLS termination, CSP/HSTS headers, rate limiting; optional Tor via `goldy/tor-hidden-service` |
+| Testing | Go `testing` + `-race`, Node's built-in test runner, Playwright (Chromium + WebKit, desktop + mobile emulation) |
+| Delivery | Docker Compose, GitHub Actions (`security-ci.yml`) |
 
 ## Quick Start
 
