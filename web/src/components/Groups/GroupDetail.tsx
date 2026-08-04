@@ -1,3 +1,8 @@
+// src/components/Groups/GroupDetail.tsx
+//
+// Group member detail panel — Arctic Signal design.
+// Right rail on desktop, hidden on mobile.
+
 import { useEffect, useMemo, useState } from "react";
 import type { GroupWire } from "../../api/groups";
 import { useAuthStore } from "../../store/authStore";
@@ -43,9 +48,7 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
       setUin("");
     } catch (err) {
       setLocalError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    } finally { setBusy(false); }
   }
 
   async function onRemove(memberUin: number): Promise<void> {
@@ -55,42 +58,40 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
       await kickMember(group.group_id, memberUin);
     } catch (err) {
       setLocalError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    } finally { setBusy(false); }
   }
 
   return (
-    <aside className="hidden w-72 shrink-0 border-l border-border bg-bg/50 md:flex md:min-h-0 md:flex-col">
-      <div className="border-b border-border p-4">
-        <div className="text-sm font-semibold text-text">{i18n.t("groups.members")}</div>
-        <div className="mt-1 text-xs text-text-2">
+    <aside className="hidden w-72 shrink-0 border-l border-ice-border bg-cobalt/50 md:flex md:min-h-0 md:flex-col">
+      <div className="border-b border-ice-border p-4">
+        <div className="text-sm font-semibold text-frozen">{i18n.t("groups.members")}</div>
+        <div className="mt-1 text-xs text-mist">
           {i18n.t(members.length === 1 ? "groups.memberCount" : "groups.memberCountPlural", { count: members.length })}
         </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <ul role="list" className="divide-y divide-border">
+        <ul role="list" className="divide-y divide-ice-border">
           {members.map((member) => (
-            <li key={member.uin} className="flex items-center gap-3 p-3">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-border text-xs font-medium text-text">
+            <li key={member.uin} className="flex items-center gap-3 px-3 py-2.5">
+              <div className="iceq-avatar iceq-avatar--sm">
                 {member.username.slice(0, 1).toUpperCase()}
               </div>
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <span className="truncate text-sm font-medium text-text">{member.username}</span>
+                  <span className="truncate text-sm font-medium text-frozen">{member.username}</span>
                   {member.uin === group.owner_uin && (
-                    <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-semibold uppercase leading-none text-bg">
+                    <span className="iceq-badge iceq-badge--aurora">
                       {i18n.t("groups.admin")}
                     </span>
                   )}
                 </div>
-                <div className="text-xs text-text-2">#{member.uin}</div>
+                <div className="text-mono text-[11px] text-mist-dim">#{member.uin}</div>
               </div>
               {canManageMembers && member.uin !== selfUin && (
                 <button
                   type="button"
-                  className="iceq-btn-secondary text-xs"
+                  className="iceq-btn-ghost text-xs"
                   onClick={() => void onRemove(member.uin)}
                   disabled={busy}
                 >
@@ -103,14 +104,14 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
       </div>
 
       {canManageMembers && (
-        <form className="border-t border-border p-3" onSubmit={(e) => void onAdd(e)}>
-          <label htmlFor="group-member-uin" className="text-xs font-medium text-text-2">
+        <form className="border-t border-ice-border p-3" onSubmit={(e) => void onAdd(e)}>
+          <label htmlFor="group-member-uin" className="text-xs font-medium text-mist">
             {i18n.t("groups.addByUin")}
           </label>
           <div className="mt-2 flex gap-2">
             <input
               id="group-member-uin"
-              className="iceq-input"
+              className="iceq-input text-xs"
               inputMode="numeric"
               value={uin}
               onChange={(e) => setUin(e.target.value)}
@@ -118,13 +119,13 @@ export function GroupDetail({ group }: GroupDetailProps): JSX.Element {
             />
             <button
               type="submit"
-              className="iceq-btn-primary"
+              className="iceq-btn-primary text-xs"
               disabled={busy || uin.trim().length === 0}
             >
               {i18n.t("groups.add")}
             </button>
           </div>
-          {localError && <div className="mt-2 text-xs text-presence-dnd">{localError}</div>}
+          {localError && <div role="alert" className="mt-2 text-xs text-destructive">{localError}</div>}
         </form>
       )}
     </aside>

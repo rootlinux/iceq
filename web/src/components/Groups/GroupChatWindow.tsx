@@ -1,3 +1,8 @@
+// src/components/Groups/GroupChatWindow.tsx
+//
+// Group chat window — Arctic Signal design.
+// Message pane + member detail rail on desktop.
+
 import { useEffect, useState } from "react";
 import { historyGroup } from "../../api/messages";
 import { getGroupMembersWithEpoch, getSenderKeyDistributions } from "../../api/groups";
@@ -18,6 +23,7 @@ import { getActiveCryptoNamespace } from "../../lib/indexeddb";
 interface GroupChatWindowProps {
   group: GroupWire;
 }
+
 const inFlightHistoryLoads = new Map<string, Promise<Message[]>>();
 
 function loadEncryptedGroupHistory(groupId: string, selfUin: number, conversationId: string, securityWarning: string): Promise<Message[]> {
@@ -81,21 +87,21 @@ export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
         if (!cancelled) setLoading(false);
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [conversationId, group.group_id, selfUin, setMessages]);
+
+  const avatarInitial = group.name.slice(0, 1).toUpperCase();
 
   return (
     <div className="flex h-full min-h-0">
       <section className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-12 items-center gap-3 border-b border-border px-4">
-          <div className="flex h-7 w-7 items-center justify-center rounded-full bg-border text-xs font-medium">
-            {group.name.slice(0, 1).toUpperCase()}
+        <header className="secure-channel flex h-12 shrink-0 items-center gap-3 border-b border-ice-border px-4" data-connected="true">
+          <div className="iceq-avatar iceq-avatar--md">
+            {avatarInitial}
           </div>
           <div className="min-w-0">
-            <div className="truncate text-sm font-medium text-text">{group.name}</div>
-            <div className="text-xs text-text-2">
+            <div className="truncate text-sm font-semibold text-frozen">{group.name}</div>
+            <div className="text-xs text-mist">
               {i18n.t(group.member_count === 1 ? "groups.memberCount" : "groups.memberCountPlural", { count: group.member_count })}
             </div>
           </div>
@@ -103,10 +109,15 @@ export function GroupChatWindow({ group }: GroupChatWindowProps): JSX.Element {
 
         <div className="min-h-0 flex flex-1 flex-col">
           {loading ? (
-            <div className="h-full overflow-y-auto p-4 text-sm text-text-2">{i18n.t("chat.loadingHistory")}</div>
+            <div className="flex h-full items-center justify-center gap-2 text-sm text-mist">
+              <span className="iceq-spinner" />
+              {i18n.t("chat.loadingHistory")}
+            </div>
           ) : error ? (
-            <div role="alert" className="h-full overflow-y-auto p-4 text-sm">
-              {i18n.t("chat.groupHistoryError")} {error}
+            <div role="alert" className="flex h-full items-center justify-center p-4">
+              <div className="iceq-alert-error">
+                {i18n.t("chat.groupHistoryError")} {error}
+              </div>
             </div>
           ) : (
             <MessageList conversationId={`group:${group.group_id}`} />

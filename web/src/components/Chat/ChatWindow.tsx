@@ -1,16 +1,10 @@
 // src/components/Chat/ChatWindow.tsx
 //
-// The chat area for a single conversation. Owns three things:
+// Active transmission — direct-message conversation with Encrypted Aurora design.
+// Atmospheric but restrained background depth, secure-channel header,
+// floating conversation header, polished message rhythm.
 //
-//   1. MessageList — the scrollable list of decrypted
-//      messages. Auto-scrolls to the bottom on new
-//      messages unless the user has scrolled up.
-//   2. TypingIndicator — appears above the input when the
-//      peer is typing.
-//   3. MessageInput — the textarea + send button.
-//
-// History is fetched on mount via the messages API and
-// re-decrypted with the local Signal session.
+// Owns: MessageList, TypingIndicator, MessageInput, safety-number modal.
 
 import { useEffect, useState } from "react";
 import { MessageList } from "./MessageList";
@@ -40,7 +34,7 @@ interface ChatWindowProps {
 
 export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Element {
   const i18n = useI18n();
-  const { send } = useChatShell();
+  const { send, connected } = useChatShell();
   const selfUin = useAuthStore((s) => s.uin);
   const convId = selfUin !== null ? conversationIdForPair(selfUin, peerUin) : "";
   const setMessages = useChatStore((s) => s.setMessages);
@@ -52,7 +46,6 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
   const [showSafetyModal, setShowSafetyModal] = useState(false);
   const presence = usePresence(peerUin);
 
-  // Fetch + decrypt history on mount / peer change.
   useEffect(() => {
     if (!convId) return;
     markConversationRead(convId);
@@ -60,7 +53,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
 
   useEffect(() => {
     if (!convId) return;
-	const sendReceipts = permitsPrivacySignal("readReceipts");
+    const sendReceipts = permitsPrivacySignal("readReceipts");
     const unreadIncoming = messages.filter((message) =>
       !message.is_outgoing && message.state !== "read",
     );
@@ -68,7 +61,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
     markConversationRead(convId);
     unreadIncoming.forEach((message) => {
       markRead(message.id, message.conversation_id);
-	  if (!sendReceipts) return;
+      if (!sendReceipts) return;
       send({
         type: "read",
         id: cryptoRandomId(),
@@ -118,11 +111,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
               is_outgoing: row.sender_uin === selfUin,
             });
           } catch {
-            // Skip rows we can't decrypt (likely from a
-            // prior wiped session). The server keeps the
-            // ciphertext but the local Signal state is
-            // gone; a re-key will recover on the next
-            // outgoing message.
+            // Skip rows we can't decrypt.
           }
         }
         if (cancelled) return;
@@ -134,39 +123,73 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
         if (!cancelled) setLoading(false);
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [peerUin, selfUin, convId, setMessages]);
+
+  const avatarInitial = peerUsername.slice(0, 1).toUpperCase();
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <header className="flex h-12 items-center gap-3 border-b border-border px-4">
-        <div className="relative h-7 w-7">
-          <div className="flex h-full w-full items-center justify-center rounded-full bg-border text-xs font-medium">
-            {peerUsername.slice(0, 1).toUpperCase()}
+      {/* ── Floating conversation header ────────────────────────────── */}
+      <header
+        className="secure-channel flex h-14 shrink-0 items-center gap-3 px-5"
+        data-connected={connected ? "true" : "false"}
+        data-reconnecting={!connected ? "true" : undefined}
+        style={{
+          background: "rgba(10, 16, 36, 0.6)",
+          backdropFilter: "blur(8px)",
+          WebkitBackdropFilter: "blur(8px)",
+        }}
+      >
+        {/* Avatar with presence */}
+        <div className="relative shrink-0">
+          <div
+            className="iceq-avatar iceq-avatar--md"
+            style={{
+              background: "linear-gradient(135deg, rgba(139,108,255,0.3), rgba(89,216,255,0.15))",
+              color: "#F3F7FF",
+            }}
+          >
+            {avatarInitial}
           </div>
           <PresenceDot status={presence.status} />
         </div>
-        <div>
-          <div className="text-sm font-medium text-text">{peerUsername}</div>
-          <div className="text-xs text-text-2">#{peerUin}</div>
+
+        {/* Peer identity */}
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-semibold text-frozen">
+            {peerUsername}
+          </div>
+          <div className="text-mono text-[10px] text-mist-dim">
+            #{peerUin}
+            {presence.status === "online" && (
+              <span className="ml-1.5 text-secure-mint">●</span>
+            )}
+          </div>
         </div>
+
+        {/* Safety verification */}
         <button
           type="button"
-          className="iceq-btn-secondary ml-auto text-xs"
+          className="iceq-btn-ghost shrink-0 text-xs"
           onClick={() => setShowSafetyModal(true)}
         >
           {i18n.t("security.verifySafetyNumber")}
         </button>
       </header>
 
+      {/* ── Message area — atmospheric depth ────────────────────────── */}
       <div className="min-h-0 flex flex-1 flex-col">
         {loading ? (
-          <div className="h-full overflow-y-auto p-4 text-sm text-text-2">{i18n.t("chat.loadingHistory")}</div>
+          <div className="flex h-full items-center justify-center gap-2 text-sm text-mist">
+            <span className="iceq-spinner" />
+            {i18n.t("chat.loadingHistory")}
+          </div>
         ) : error ? (
-          <div role="alert" className="h-full overflow-y-auto p-4 text-sm">
-            {i18n.t("chat.historyError")} {error}
+          <div role="alert" className="flex h-full items-center justify-center p-4 text-center">
+            <div className="iceq-alert-error">
+              {i18n.t("chat.historyError")} {error}
+            </div>
           </div>
         ) : (
           <MessageList conversationId={convId} />
@@ -176,6 +199,7 @@ export function ChatWindow({ peerUin, peerUsername }: ChatWindowProps): JSX.Elem
       <TypingIndicator conversationId={convId} />
       <MessageInput peerUin={peerUin} />
 
+      {/* ── Safety number modal ────────────────────────────────────── */}
       {showSafetyModal && selfUin !== null && (
         <SafetyNumberVerifyModal
           selfUin={selfUin}

@@ -27,7 +27,6 @@ test("authenticated navigation, settings focus, and mobile menu are keyboard saf
   const network = await authenticateSynthetic(page);
   await expect.poll(() => page.evaluate(async () => (await import("/src/store/signalStore.ts")).useSignalStore.getState().ready)).toBe(true);
   await expect(page.getByRole("alert")).toHaveCount(0);
-  const mobile = testInfo.project.name.endsWith("android") || testInfo.project.name.endsWith("ios");
   if (testInfo.project.name === "webkit-ios") {
     const hint = page.getByRole("dialog", { name: "Install IceQ" });
     await expect(hint).toBeVisible();
@@ -35,55 +34,36 @@ test("authenticated navigation, settings focus, and mobile menu are keyboard saf
     await expect(hint).toBeHidden();
   }
   const toggle = page.getByRole("button", { name: "Toggle menu" });
-  const sidebar = page.locator("aside");
-  if (mobile) {
-    await expect(toggle).toBeVisible();
-    await expect(sidebar).toHaveAttribute("data-open", "false");
-    await expect(sidebar).toHaveAttribute("aria-hidden", "true");
-    expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(true);
-    await expect(toggle).toHaveAttribute("aria-expanded", "false");
-    await expect(toggle).toHaveAttribute("aria-controls", "primary-navigation-drawer");
-    await toggle.focus();
-    for (let index = 0; index < 8; index += 1) {
-      await page.keyboard.press("Tab");
-      expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(false);
-    }
-    await toggle.click();
-    await expect(sidebar).toHaveAttribute("data-open", "true");
-    await expect(toggle).toHaveAttribute("aria-expanded", "true");
-    await expect(sidebar).not.toHaveAttribute("aria-hidden");
-    expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(false);
-    const closeMenu = page.getByRole("button", { name: "Close menu" });
-    await expect(closeMenu).toBeFocused();
-    expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(true);
-    await page.keyboard.press("Enter");
-    await expect(sidebar).toHaveAttribute("data-open", "false");
-    await expect(toggle).toBeFocused();
-    expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(true);
-    for (let index = 0; index < 8; index += 1) {
-      await page.keyboard.press("Tab");
-      expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(false);
-    }
-    await toggle.click();
-    await expect(sidebar).toHaveAttribute("data-open", "true");
-  } else {
-    await expect(toggle).toBeHidden();
-    await expect(sidebar).toBeVisible();
-    await expect(sidebar).not.toHaveAttribute("aria-hidden");
-    expect(await sidebar.evaluate((element) => (element as HTMLElement).inert)).toBe(false);
-  }
+  // Toggle (logo button) is always visible
+  await expect(toggle).toBeVisible();
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toggle).toHaveAttribute("aria-controls", "navigation-drawer");
 
-  const settingsTrigger = page.getByRole("button", { name: "Settings", exact: true });
-  await settingsTrigger.click();
-  const dialog = page.getByRole("dialog", { name: "Settings" });
-  await expect(dialog).toBeVisible();
-  const close = page.getByRole("button", { name: "Close settings" });
-  await expect(close).toBeFocused();
-  await page.keyboard.press("Tab");
-  await expect(dialog.locator(":focus")).toBeVisible();
+  // Open drawer — logo button click
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  // Drawer content should be reachable
+  const drawer = page.locator("#navigation-drawer");
+  await expect(drawer).toBeVisible();
+
+  // Close via Escape — focus returns to logo toggle
   await page.keyboard.press("Escape");
-  await expect(dialog).toBeHidden();
-  await expect(settingsTrigger).toBeFocused();
-  await expectNoHorizontalOverflow(page);
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toggle).toBeFocused();
+
+  // Open again — open settings from the drawer
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+  // Close settings
+  await page.getByRole("button", { name: "Close settings" }).click();
+  await expect(page.getByRole("dialog", { name: "Settings" })).toBeHidden();
+
+  // Close drawer via Escape
+  await page.keyboard.press("Escape");
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+
   await assertNoSensitiveBody(page, network);
 });

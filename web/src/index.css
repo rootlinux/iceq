@@ -1,11 +1,30 @@
-/* src/index.css — Tailwind base + custom utilities. */
+/* src/index.css — IceQ Encrypted Aurora design system.
+   ---------------------------------------------------------------------------
+   Cinematic but disciplined communication interface inspired by:
+     light moving under polar ice · encrypted radio transmission
+     optical instruments · deep ocean darkness · aurora refraction
+
+   Layers:
+     1. Global resets & typography
+     2. Atmosphere & depth utilities
+     3. Cipher Ring signature component
+     4. Secure channel line motif
+     5. Component primitives (@layer components)
+     6. Auth composition utilities
+     7. Messenger shell utilities
+     8. Message materials
+     9. Attachment cards
+    10. Animation keyframes & reduced motion
+   ------------------------------------------------------------------------- */
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* ----------------------------------------------------------------------------
-   Global resets. The dark theme is locked in.
-   ---------------------------------------------------------------------------- */
+/* =========================================================================
+   1. GLOBAL RESETS & BASE
+   ========================================================================= */
+
 html,
 body,
 #root {
@@ -14,40 +33,87 @@ body,
 }
 
 body {
-  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Inter, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: #0a0a0a;
-  color: #e5e5e5;
+  background: #050713;
+  color: #F3F7FF;
 }
 
+/* ── Typography scale ───────────────────────────────────────────────── */
+.text-hero {
+  font-family: ui-rounded, "SF Pro Rounded", "SF Pro Display", Inter, system-ui, -apple-system, sans-serif;
+  font-size: clamp(2.25rem, 1.4rem + 4.5vw, 4rem);
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+}
+
+.text-display {
+  font-family: ui-rounded, "SF Pro Rounded", "SF Pro Display", Inter, system-ui, -apple-system, sans-serif;
+  font-size: clamp(1.5rem, 1rem + 2.5vw, 2.25rem);
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+}
+
+.text-label {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.text-mono {
+  font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", Consolas, ui-monospace, monospace;
+  font-size: 0.75rem;
+  letter-spacing: 0.03em;
+}
+
+/* ── Focus ring — global default ───────────────────────────────────── */
 :focus-visible {
-  outline: 3px solid #67e8f9;
-  outline-offset: 2px;
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(89, 216, 255, 0.40);
+  border-radius: 2px;
 }
 
-button, [role="button"], input, select, textarea, a {
+/* ── Touch target minimum ──────────────────────────────────────────── */
+button,
+[role="button"],
+input,
+select,
+textarea,
+a {
   min-height: 44px;
 }
 
+/* ── Message state text (screen-reader-visible label) ──────────────── */
 .message-state-text {
   margin-inline-start: 0.25rem;
   font-weight: 600;
 }
 
+/* ── No-script notice ──────────────────────────────────────────────── */
 .noscript-notice {
   max-width: 48rem;
   margin: 2rem auto;
   padding: 1.5rem;
-  color: #f5f5f5;
-  background: #171717;
-  border: 1px solid #525252;
+  color: #F3F7FF;
+  background: #101B3D;
+  border: 1px solid #1A2A50;
+  border-radius: 10px;
 }
 
-.noscript-notice a { color: #67e8f9; text-decoration: underline; }
+.noscript-notice a {
+  color: #59D8FF;
+  text-decoration: underline;
+}
 
+/* ── Reduced motion ────────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  *,
+  *::before,
+  *::after {
     scroll-behavior: auto !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
@@ -55,73 +121,869 @@ button, [role="button"], input, select, textarea, a {
   }
 }
 
-/* ----------------------------------------------------------------------------
-   Scrollbar styling. The webkit-only styles are fine — Chromium,
-   Safari, and Edge use them; Firefox falls back to its default
-   which is acceptable in dark UI.
-   ---------------------------------------------------------------------------- */
+/* =========================================================================
+   2. ATMOSPHERE & DEPTH UTILITIES
+   ========================================================================= */
+
+/* Aurora illumination — soft radial glow behind focal elements.
+   Applied as a pseudo-element so it sits behind content. */
+.aurora-glow {
+  position: relative;
+}
+.aurora-glow::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(ellipse 60% 50% at 35% 40%, rgba(139, 108, 255, 0.10) 0%, transparent 70%),
+    radial-gradient(ellipse 40% 35% at 60% 55%, rgba(89, 216, 255, 0.06) 0%, transparent 70%);
+}
+.aurora-glow > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* Abyss depth layer — subtle gradient behind the main surface.
+   Used on the page background to create spatial depth. */
+.abyss-depth {
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 0%, rgba(16, 27, 61, 0.5) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 30% 100%, rgba(5, 7, 19, 0.9) 0%, transparent 60%),
+    #050713;
+}
+
+/* Grain texture overlay — fine noise via SVG data URI.
+   Very subtle; adds material quality without distraction. */
+.grain-overlay {
+  position: relative;
+}
+.grain-overlay::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
+}
+
+/* Refraction edge — subtle inner border glow on elevated surfaces */
+.refraction-edge {
+  border: 1px solid rgba(89, 216, 255, 0.08);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.02),
+    0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+/* =========================================================================
+   3. SCROLLBAR — dark, subtle
+   ========================================================================= */
+
 *::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 4px;
+  height: 4px;
 }
 *::-webkit-scrollbar-track {
   background: transparent;
 }
 *::-webkit-scrollbar-thumb {
-  background: #2a2a2a;
-  border-radius: 4px;
+  background: #1A2A50;
+  border-radius: 2px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background: #3a3a3a;
+  background: #223566;
 }
 
-/* ----------------------------------------------------------------------------
-   Component primitives. Anything in the @layer components block
-   becomes a Tailwind class; utilities can be composed on top.
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #1A2A50 transparent;
+}
 
-   We define a small set of "iceq-*" primitives for things that
-   appear in more than one place (settings panel, modal) so we
-   don't have to repeat the same Tailwind soup.
-   ---------------------------------------------------------------------------- */
+/* =========================================================================
+   4. CIPHER RING — Signature IceQ mark
+   ========================================================================= */
+
+/* Cipher Ring container */
+.cipher-ring {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* The ring itself — SVG rendered inline via the CipherRing component.
+   These classes control the container and contextual sizing. */
+.cipher-ring--auth {
+  width: clamp(160px, 20vw, 220px);
+  height: clamp(160px, 20vw, 220px);
+}
+
+.cipher-ring--rail {
+  width: 32px;
+  height: 32px;
+}
+
+.cipher-ring--empty {
+  width: 80px;
+  height: 80px;
+}
+
+/* Ring state: disconnected (default) */
+.cipher-ring[data-state="disconnected"] .cipher-ring-track {
+  stroke: #1A2A50;
+}
+.cipher-ring[data-state="disconnected"] .cipher-ring-pulse {
+  opacity: 0;
+}
+
+/* Ring state: connecting */
+.cipher-ring[data-state="connecting"] .cipher-ring-track {
+  stroke: #223566;
+}
+.cipher-ring[data-state="connecting"] .cipher-ring-pulse {
+  animation: cipher-pulse 1.5s ease-in-out infinite;
+}
+
+/* Ring state: secure / connected */
+.cipher-ring[data-state="secure"] .cipher-ring-track {
+  stroke: #59D8FF;
+  filter: drop-shadow(0 0 4px rgba(89, 216, 255, 0.3));
+}
+.cipher-ring[data-state="secure"] .cipher-ring-pulse {
+  animation: cipher-pulse 3s ease-in-out infinite;
+}
+
+/* Ring state: warning (reconnecting) */
+.cipher-ring[data-state="warning"] .cipher-ring-track {
+  stroke: #FFBC5C;
+  filter: drop-shadow(0 0 4px rgba(255, 188, 92, 0.3));
+}
+.cipher-ring[data-state="warning"] .cipher-ring-pulse {
+  animation: cipher-pulse 1s ease-in-out infinite;
+}
+
+/* ── Cipher Ring animations ────────────────────────────────────────── */
+@keyframes cipher-pulse {
+  0%, 100% { opacity: 0.2; r: 2.5; }
+  50% { opacity: 1; r: 3.5; }
+}
+
+@keyframes cipher-rotate-slow {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.cipher-ring-rotate {
+  animation: cipher-rotate-slow 20s linear infinite;
+  transform-origin: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cipher-ring-rotate {
+    animation: none;
+  }
+  .cipher-ring[data-state="secure"] .cipher-ring-pulse,
+  .cipher-ring[data-state="connecting"] .cipher-ring-pulse,
+  .cipher-ring[data-state="warning"] .cipher-ring-pulse {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
+/* =========================================================================
+   5. SECURE CHANNEL LINE MOTIF
+   ========================================================================= */
+
+/* Horizontal — across conversation headers, auth sections */
+.secure-channel {
+  position: relative;
+}
+.secure-channel::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(89, 216, 255, 0.05) 15%,
+    rgba(89, 216, 255, 0.25) 50%,
+    rgba(89, 216, 255, 0.05) 85%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+.secure-channel[data-connected="true"]::after {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(89, 216, 255, 0.08) 15%,
+    rgba(89, 216, 255, 0.40) 50%,
+    rgba(89, 216, 255, 0.08) 85%,
+    transparent 100%
+  );
+}
+.secure-channel[data-secure="true"]::after {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(139, 108, 255, 0.06) 15%,
+    rgba(139, 108, 255, 0.30) 50%,
+    rgba(139, 108, 255, 0.06) 85%,
+    transparent 100%
+  );
+}
+.secure-channel[data-reconnecting="true"]::after {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 188, 92, 0.06) 15%,
+    rgba(255, 188, 92, 0.30) 50%,
+    rgba(255, 188, 92, 0.06) 85%,
+    transparent 100%
+  );
+  animation: channel-glow 2s ease-in-out infinite;
+}
+
+@keyframes channel-glow {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+}
+
+/* Vertical — for identity rail */
+.secure-channel-vertical {
+  position: relative;
+}
+.secure-channel-vertical::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 1px;
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    rgba(89, 216, 255, 0.05) 20%,
+    rgba(89, 216, 255, 0.20) 50%,
+    rgba(89, 216, 255, 0.05) 80%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+/* Backward compat: old signal-line classes mapped to new secure-channel */
+.signal-line {
+  position: relative;
+}
+.signal-line::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(89, 216, 255, 0.05) 20%,
+    rgba(89, 216, 255, 0.25) 50%,
+    rgba(89, 216, 255, 0.05) 80%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+.signal-line[data-connected="true"]::before {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(89, 216, 255, 0.08) 20%,
+    rgba(89, 216, 255, 0.40) 50%,
+    rgba(89, 216, 255, 0.08) 80%,
+    transparent 100%
+  );
+}
+.signal-line[data-secure="true"]::before {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(139, 108, 255, 0.06) 20%,
+    rgba(139, 108, 255, 0.30) 50%,
+    rgba(139, 108, 255, 0.06) 80%,
+    transparent 100%
+  );
+}
+.signal-line[data-pulse="true"]::before {
+  animation: channel-glow 4s ease-in-out infinite;
+}
+
+.signal-line-vertical {
+  position: relative;
+}
+.signal-line-vertical::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    rgba(89, 216, 255, 0.05) 20%,
+    rgba(89, 216, 255, 0.20) 50%,
+    rgba(89, 216, 255, 0.05) 80%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+/* =========================================================================
+   6. COMPONENT PRIMITIVES (@layer components)
+   ========================================================================= */
+
 @layer components {
+  /* ─── Buttons ─────────────────────────────────────────────────────── */
+
+  /* Primary — Electric Ice, high-emphasis actions */
   .iceq-btn-primary {
-    @apply inline-flex items-center justify-center rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-bg hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition;
+    @apply inline-flex items-center justify-center rounded-lg px-4 py-2.5 text-sm font-semibold;
+    background: #59D8FF;
+    color: #050713;
+    transition: background 150ms ease, box-shadow 150ms ease, opacity 150ms ease, transform 100ms ease;
   }
+  .iceq-btn-primary:hover:not(:disabled) {
+    background: #7DE4FF;
+    box-shadow: 0 0 20px rgba(89, 216, 255, 0.25);
+  }
+  .iceq-btn-primary:active:not(:disabled) {
+    background: #3DC8F0;
+    transform: scale(0.985);
+  }
+  .iceq-btn-primary:focus-visible {
+    box-shadow: 0 0 0 2px rgba(89, 216, 255, 0.35);
+  }
+  .iceq-btn-primary:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  /* Secondary — Cobalt surface, medium emphasis */
   .iceq-btn-secondary {
-    @apply inline-flex items-center justify-center rounded-md border border-border bg-surface-2 px-3 py-1.5 text-sm font-medium text-text hover:bg-border disabled:opacity-40 disabled:cursor-not-allowed transition;
+    @apply inline-flex items-center justify-center rounded-lg px-4 py-2.5 text-sm font-medium;
+    background: #101B3D;
+    color: #F3F7FF;
+    border: 1px solid #1A2A50;
+    transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
   }
+  .iceq-btn-secondary:hover:not(:disabled) {
+    background: #16224A;
+    border-color: #223566;
+  }
+  .iceq-btn-secondary:active:not(:disabled) {
+    background: #1C2A58;
+    border-color: #2A3D6E;
+  }
+  .iceq-btn-secondary:focus-visible {
+    box-shadow: 0 0 0 2px rgba(89, 216, 255, 0.30);
+    border-color: #59D8FF;
+  }
+  .iceq-btn-secondary:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  /* Ghost — transparent, minimal emphasis */
+  .iceq-btn-ghost {
+    @apply inline-flex items-center justify-center rounded-lg px-3 py-2 text-sm font-medium;
+    background: transparent;
+    color: #9EADCB;
+    transition: background 150ms ease, color 150ms ease;
+  }
+  .iceq-btn-ghost:hover:not(:disabled) {
+    background: rgba(89, 216, 255, 0.06);
+    color: #F3F7FF;
+  }
+  .iceq-btn-ghost:active:not(:disabled) {
+    background: rgba(89, 216, 255, 0.10);
+  }
+  .iceq-btn-ghost:focus-visible {
+    box-shadow: 0 0 0 2px rgba(89, 216, 255, 0.30);
+  }
+  .iceq-btn-ghost:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  /* Destructive */
   .iceq-btn-destructive {
-    @apply inline-flex items-center justify-center rounded-md bg-presence-dnd px-3 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition;
+    @apply inline-flex items-center justify-center rounded-lg px-4 py-2.5 text-sm font-semibold;
+    background: #FF657A;
+    color: #050713;
+    transition: background 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
   }
+  .iceq-btn-destructive:hover:not(:disabled) {
+    background: #FF8092;
+    box-shadow: 0 0 20px rgba(255, 101, 122, 0.25);
+  }
+  .iceq-btn-destructive:active:not(:disabled) {
+    background: #E8556A;
+  }
+  .iceq-btn-destructive:focus-visible {
+    box-shadow: 0 0 0 2px rgba(255, 101, 122, 0.35);
+  }
+  .iceq-btn-destructive:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  /* Icon button */
+  .iceq-btn-icon {
+    @apply inline-flex items-center justify-center rounded-lg p-2;
+    background: transparent;
+    color: #9EADCB;
+    min-width: 44px;
+    min-height: 44px;
+    transition: background 150ms ease, color 150ms ease;
+  }
+  .iceq-btn-icon:hover:not(:disabled) {
+    background: rgba(89, 216, 255, 0.06);
+    color: #F3F7FF;
+  }
+  .iceq-btn-icon:active:not(:disabled) {
+    background: rgba(89, 216, 255, 0.10);
+  }
+  .iceq-btn-icon:focus-visible {
+    box-shadow: 0 0 0 2px rgba(89, 216, 255, 0.30);
+  }
+  .iceq-btn-icon:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  /* ─── Form inputs ─────────────────────────────────────────────────── */
+
   .iceq-input {
-    @apply w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text placeholder:text-text-2 focus:border-accent focus:outline-none;
+    @apply w-full rounded-lg px-3.5 py-2.5 text-sm;
+    background: rgba(10, 16, 36, 0.6);
+    color: #F3F7FF;
+    border: 1px solid rgba(26, 42, 80, 0.6);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: border-color 150ms ease, box-shadow 150ms ease, background 150ms ease;
   }
+  .iceq-input::placeholder {
+    color: #6B7DA0;
+  }
+  .iceq-input:hover:not(:disabled) {
+    border-color: #223566;
+    background: rgba(10, 16, 36, 0.8);
+  }
+  .iceq-input:focus {
+    border-color: #59D8FF;
+    box-shadow: 0 0 0 3px rgba(89, 216, 255, 0.10), 0 0 10px rgba(89, 216, 255, 0.06);
+    outline: none;
+    background: rgba(10, 16, 36, 0.9);
+  }
+  .iceq-input:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .iceq-input[aria-invalid="true"],
+  .iceq-input.iceq-input--error {
+    border-color: #FF657A;
+  }
+  .iceq-input[aria-invalid="true"]:focus,
+  .iceq-input.iceq-input--error:focus {
+    box-shadow: 0 0 0 3px rgba(255, 101, 122, 0.12);
+  }
+
+  /* Select */
+  .iceq-select {
+    @apply iceq-input appearance-none cursor-pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239EADCB' d='M6 7.7L2.3 4l-.7.7L6 9.1 10.4 4.7l-.7-.7z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    padding-right: 2rem;
+  }
+
+  /* ─── Cards & panels ──────────────────────────────────────────────── */
+
   .iceq-card {
-    @apply rounded-lg border border-border bg-surface-2 p-4;
+    @apply rounded-xl p-4;
+    background: rgba(16, 27, 61, 0.5);
+    border: 1px solid rgba(26, 42, 80, 0.4);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
   }
+  .iceq-card--interactive {
+    @apply iceq-card cursor-pointer;
+    transition: background 150ms ease, border-color 150ms ease, transform 100ms ease;
+  }
+  .iceq-card--interactive:hover {
+    background: rgba(22, 34, 74, 0.6);
+    border-color: rgba(34, 53, 102, 0.5);
+  }
+  .iceq-card--interactive:active {
+    transform: scale(0.995);
+  }
+
+  .iceq-panel {
+    @apply rounded-2xl p-6;
+    background: rgba(16, 27, 61, 0.55);
+    border: 1px solid rgba(26, 42, 80, 0.5);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  }
+
+  /* ─── Modals & dialogs ────────────────────────────────────────────── */
+
+  .iceq-modal-backdrop {
+    @apply fixed inset-0 z-50 flex items-center justify-center p-4;
+    background: rgba(5, 7, 19, 0.8);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+
+  .iceq-modal {
+    @apply w-full overflow-y-auto rounded-2xl p-6;
+    max-width: 480px;
+    max-height: calc(100vh - 2rem);
+    background: rgba(16, 27, 61, 0.9);
+    border: 1px solid rgba(26, 42, 80, 0.6);
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+
+  .iceq-modal-buttons {
+    @apply mt-5 flex justify-end gap-2;
+  }
+
+  /* ─── Settings layout ─────────────────────────────────────────────── */
+
   .iceq-settings-panel {
-    @apply space-y-4 p-4;
+    @apply space-y-5 p-1;
+  }
+  .iceq-settings-section {
+    @apply space-y-3 rounded-xl p-4;
+    background: rgba(10, 16, 36, 0.5);
+    border: 1px solid rgba(26, 42, 80, 0.4);
   }
   .iceq-settings-row {
     @apply flex items-center justify-between gap-4;
   }
-  .iceq-settings-status {
-    @apply text-sm text-text-2;
-  }
+  .iceq-settings-status { @apply text-sm; color: #9EADCB; }
   .iceq-settings-error {
-    @apply rounded-md border border-presence-dnd bg-surface p-3 text-sm;
+    @apply rounded-lg p-3 text-sm;
+    background: rgba(10, 16, 36, 0.5);
+    border: 1px solid rgba(255, 101, 122, 0.3);
+    color: #FF657A;
   }
+  .iceq-settings-success {
+    @apply rounded-lg p-3 text-sm;
+    background: rgba(10, 16, 36, 0.5);
+    border: 1px solid rgba(76, 225, 161, 0.3);
+    color: #4CE1A1;
+  }
+
+  /* ─── Toggle switch ───────────────────────────────────────────────── */
+
   .iceq-toggle {
-    @apply inline-flex items-center gap-2 text-sm;
+    @apply inline-flex items-center gap-3 text-sm cursor-pointer;
+    color: #F3F7FF;
   }
-  .iceq-modal-backdrop {
-    @apply fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4;
+  .iceq-toggle input[type="checkbox"] { @apply sr-only; }
+  .iceq-toggle-track {
+    width: 36px; height: 20px; border-radius: 10px;
+    background: #1A2A50; position: relative;
+    transition: background 150ms ease; flex-shrink: 0;
   }
-  .iceq-modal {
-    @apply w-full max-w-md overflow-y-auto rounded-lg border border-border bg-surface-2 p-5 shadow-2xl;
-    max-height: calc(100vh - 2rem);
+  .iceq-toggle-track::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #9EADCB;
+    transition: transform 150ms ease, background 150ms ease;
   }
-  .iceq-modal-buttons {
-    @apply mt-4 flex justify-end gap-2;
+  .iceq-toggle input:checked + .iceq-toggle-track {
+    background: rgba(89, 216, 255, 0.25);
+  }
+  .iceq-toggle input:checked + .iceq-toggle-track::after {
+    transform: translateX(16px); background: #59D8FF;
+  }
+  .iceq-toggle input:focus-visible + .iceq-toggle-track {
+    box-shadow: 0 0 0 2px rgba(89, 216, 255, 0.30);
+  }
+
+  /* ─── Badges ──────────────────────────────────────────────────────── */
+
+  .iceq-badge {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold;
+  }
+  .iceq-badge--signal {
+    background: rgba(89, 216, 255, 0.12); color: #59D8FF;
+  }
+  .iceq-badge--aurora {
+    background: rgba(139, 108, 255, 0.12); color: #8B6CFF;
+  }
+  .iceq-badge--secure {
+    background: rgba(76, 225, 161, 0.12); color: #4CE1A1;
+  }
+  .iceq-badge--warning {
+    background: rgba(255, 188, 92, 0.12); color: #FFBC5C;
+  }
+  .iceq-badge--destructive {
+    background: rgba(255, 101, 122, 0.12); color: #FF657A;
+  }
+  .iceq-badge--count {
+    @apply inline-flex min-w-5 items-center justify-center rounded-full px-1.5 py-0.5 text-[10px] font-bold leading-none;
+    background: #59D8FF; color: #050713;
+  }
+
+  /* ─── Tabs ────────────────────────────────────────────────────────── */
+
+  .iceq-tabs {
+    @apply flex gap-1 rounded-xl p-1;
+    background: rgba(10, 16, 36, 0.5);
+    border: 1px solid rgba(26, 42, 80, 0.4);
+  }
+  .iceq-tab {
+    @apply flex-1 rounded-lg px-3 py-2 text-sm font-medium text-center transition-colors;
+    color: #9EADCB;
+  }
+  .iceq-tab:hover { color: #F3F7FF; background: rgba(89, 216, 255, 0.04); }
+  .iceq-tab[aria-selected="true"], .iceq-tab--active {
+    background: rgba(16, 27, 61, 0.7); color: #59D8FF;
+  }
+  .iceq-tab:focus-visible { box-shadow: 0 0 0 2px rgba(89, 216, 255, 0.30); }
+
+  /* ─── Banners ─────────────────────────────────────────────────────── */
+
+  .iceq-banner {
+    @apply flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium;
+    width: 100%; flex-shrink: 0;
+  }
+  .iceq-banner--offline { background: #FFBC5C; color: #050713; }
+  .iceq-banner--error {
+    background: rgba(255, 101, 122, 0.10);
+    color: #FF657A;
+    border-bottom: 1px solid rgba(255, 101, 122, 0.15);
+  }
+  .iceq-banner--cleanup {
+    @apply fixed inset-x-0 top-0 z-50 p-3 text-sm;
+    background: #FF657A; color: #050713;
+  }
+
+  /* ─── Inline alerts ───────────────────────────────────────────────── */
+
+  .iceq-alert-error {
+    @apply rounded-lg p-3 text-sm;
+    background: rgba(255, 101, 122, 0.06);
+    border: 1px solid rgba(255, 101, 122, 0.20);
+    color: #FF657A;
+  }
+  .iceq-alert-success {
+    @apply rounded-lg p-3 text-sm;
+    background: rgba(76, 225, 161, 0.06);
+    border: 1px solid rgba(76, 225, 161, 0.20);
+    color: #4CE1A1;
+  }
+  .iceq-alert-warning {
+    @apply rounded-lg p-3 text-sm;
+    background: rgba(255, 188, 92, 0.06);
+    border: 1px solid rgba(255, 188, 92, 0.20);
+    color: #FFBC5C;
+  }
+  .iceq-alert-info {
+    @apply rounded-lg p-3 text-sm;
+    background: rgba(89, 216, 255, 0.04);
+    border: 1px solid rgba(89, 216, 255, 0.10);
+    color: #59D8FF;
+  }
+
+  /* ─── Loading / skeleton ──────────────────────────────────────────── */
+
+  .iceq-skeleton {
+    @apply rounded-lg animate-pulse;
+    background: rgba(26, 42, 80, 0.5);
+  }
+  .iceq-skeleton--text { height: 14px; width: 100%; }
+  .iceq-skeleton--heading { height: 20px; width: 60%; }
+  .iceq-skeleton--avatar { width: 36px; height: 36px; border-radius: 50%; }
+  .iceq-skeleton--card { height: 64px; }
+
+  @keyframes iceq-spin { to { transform: rotate(360deg); } }
+  .iceq-spinner {
+    width: 20px; height: 20px;
+    border: 2px solid rgba(26, 42, 80, 0.5);
+    border-top-color: #59D8FF;
+    border-radius: 50%;
+    animation: iceq-spin 600ms linear infinite;
+  }
+
+  /* ─── Empty states ────────────────────────────────────────────────── */
+
+  .iceq-empty {
+    @apply flex flex-col items-center justify-center p-8 text-center;
+  }
+  .iceq-empty-icon {
+    @apply mb-4 flex h-14 w-14 items-center justify-center rounded-full;
+    background: rgba(89, 216, 255, 0.06);
+    color: #59D8FF;
+  }
+  .iceq-empty-title {
+    @apply mb-1 text-base font-semibold;
+    color: #F3F7FF;
+  }
+  .iceq-empty-text {
+    @apply text-sm; color: #9EADCB;
+  }
+
+  /* ─── Toast ───────────────────────────────────────────────────────── */
+
+  .iceq-toast {
+    @apply fixed bottom-4 right-4 z-50 rounded-xl px-4 py-3 text-sm font-medium shadow-lg;
+    animation: iceq-toast-in 200ms ease-out;
+  }
+  @keyframes iceq-toast-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .iceq-toast--success {
+    background: rgba(16, 27, 61, 0.9); color: #4CE1A1;
+    border: 1px solid rgba(76, 225, 161, 0.25);
+  }
+  .iceq-toast--error {
+    background: rgba(16, 27, 61, 0.9); color: #FF657A;
+    border: 1px solid rgba(255, 101, 122, 0.25);
+  }
+
+  /* ─── Tooltips ────────────────────────────────────────────────────── */
+
+  .iceq-tooltip {
+    @apply absolute z-40 rounded-lg px-2.5 py-1.5 text-xs font-medium shadow-lg pointer-events-none;
+    background: rgba(16, 27, 61, 0.95); color: #F3F7FF;
+    border: 1px solid rgba(26, 42, 80, 0.6);
+    white-space: nowrap;
+  }
+
+  /* ─── Step indicator ──────────────────────────────────────────────── */
+
+  .iceq-steps { @apply flex items-center gap-2 mb-6; }
+  .iceq-step { @apply flex items-center gap-2 text-sm font-medium; color: #6B7DA0; }
+  .iceq-step[aria-current="step"] { color: #59D8FF; }
+  .iceq-step[data-complete="true"] { color: #4CE1A1; }
+  .iceq-step-dot {
+    @apply flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold;
+    background: rgba(26, 42, 80, 0.5); color: #9EADCB;
+  }
+  .iceq-step[aria-current="step"] .iceq-step-dot { background: #59D8FF; color: #050713; }
+  .iceq-step[data-complete="true"] .iceq-step-dot { background: #4CE1A1; color: #050713; }
+  .iceq-step-connector { @apply h-px flex-1; background: rgba(26, 42, 80, 0.5); }
+  .iceq-step-connector[data-complete="true"] { background: #4CE1A1; }
+
+  /* ─── Divider ─────────────────────────────────────────────────────── */
+
+  .iceq-divider {
+    @apply w-full; height: 1px;
+    background: rgba(26, 42, 80, 0.4);
+  }
+
+  /* ─── Section header ──────────────────────────────────────────────── */
+
+  .iceq-section-header {
+    @apply px-3 pt-3 pb-2 text-xs font-semibold uppercase tracking-wider;
+    color: #6B7DA0;
+  }
+
+  /* ─── Avatar ──────────────────────────────────────────────────────── */
+
+  .iceq-avatar {
+    @apply flex items-center justify-center font-semibold shrink-0 select-none;
+    background: rgba(26, 42, 80, 0.5);
+    color: #9EADCB;
+    border-radius: 50%;
+  }
+  .iceq-avatar--sm { width: 28px; height: 28px; font-size: 11px; }
+  .iceq-avatar--md { width: 38px; height: 38px; font-size: 13px; }
+  .iceq-avatar--lg { width: 48px; height: 48px; font-size: 16px; }
+
+  /* ─── Conversation row ────────────────────────────────────────────── */
+
+  .iceq-conversation-row {
+    @apply flex w-full items-center gap-3 px-3 py-2.5 text-left rounded-lg mx-1.5 my-0.5;
+    transition: background 150ms ease, transform 100ms ease;
+  }
+  .iceq-conversation-row:hover {
+    background: rgba(22, 34, 74, 0.4);
+  }
+  .iceq-conversation-row:active {
+    transform: scale(0.995);
+  }
+  .iceq-conversation-row:focus-visible {
+    box-shadow: 0 0 0 2px rgba(89, 216, 255, 0.30);
+    outline: none;
+  }
+  .iceq-conversation-row[aria-current="true"] {
+    background: rgba(89, 216, 255, 0.06);
+    border: 1px solid rgba(89, 216, 255, 0.10);
+  }
+
+  /* ─── File input — styled like a secondary button ─────────────────── */
+
+  .iceq-file-input {
+    @apply iceq-input cursor-pointer;
+    color: #9EADCB;
+  }
+  .iceq-file-input::file-selector-button {
+    @apply mr-3 rounded-md border-0 px-3 py-1.5 text-xs font-semibold cursor-pointer;
+    background: #16224A;
+    color: #F3F7FF;
+    transition: background 150ms ease;
+  }
+  .iceq-file-input::file-selector-button:hover {
+    background: #1C2A58;
+  }
+
+  /* ─── Setup card — for security setup intro steps ─────────────────── */
+
+  .iceq-setup-card {
+    @apply rounded-xl p-4;
+    background: rgba(16, 27, 61, 0.4);
+    border: 1px solid rgba(26, 42, 80, 0.3);
+    transition: border-color 150ms ease, background 150ms ease;
+  }
+  .iceq-setup-card:hover {
+    border-color: rgba(139, 108, 255, 0.15);
+    background: rgba(16, 27, 61, 0.55);
+  }
+
+  /* ─── Security indicator — for verified/encrypted states ──────────── */
+
+  .iceq-secure-indicator {
+    @apply inline-flex items-center gap-1.5 rounded-md px-2 py-0.5;
+    background: rgba(76, 225, 161, 0.08);
+    border: 1px solid rgba(76, 225, 161, 0.15);
+  }
+  .iceq-secure-indicator span {
+    @apply text-[10px] font-semibold uppercase tracking-wider;
+    color: #4CE1A1;
+  }
+
+  /* ─── Page shell — shared page-layout pattern ─────────────────────── */
+
+  .iceq-page-shell {
+    @apply flex min-h-full items-start justify-center p-4 pt-8 sm:p-6 sm:pt-12;
+  }
+  .iceq-page-card {
+    @apply w-full;
   }
 }

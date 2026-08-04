@@ -1,9 +1,15 @@
+// src/components/Settings/SafetyQr.tsx
+//
+// Safety QR code component — Arctic Signal design.
+// QR generation, accessible payload, scan/compare.
+
 import { useEffect, useState } from "react";
 import QRCode from "qrcode";
 import jsQR from "jsqr";
 import { useI18n } from "../../i18n";
 
 export interface SafetyQrPayload { version: 1; fingerprint: string }
+
 const MAX_QR_UPLOAD_BYTES = 2_000_000;
 const MAX_QR_DIMENSION = 4096;
 const MAX_QR_PIXELS = 4_194_304;
@@ -104,7 +110,9 @@ export function SafetyQr({ fingerprint }: { fingerprint: string }): JSX.Element 
   const i18n = useI18n();
   const [comparison, setComparison] = useState<"idle" | "match" | "mismatch" | "invalid">("idle");
   const [svg, setSvg] = useState("");
+
   const payload = createSafetyQrPayload(fingerprint);
+
   useEffect(() => {
     let active = true;
     void renderSafetyQrSvg(payload).then((value) => { if (active) setSvg(value); });
@@ -124,7 +132,8 @@ export function SafetyQr({ fingerprint }: { fingerprint: string }): JSX.Element 
       bitmap = await decodeValidatedQrBitmap(file);
       const ratio = Math.min(1, MAX_QR_CANVAS_DIMENSION / Math.max(bitmap.width, bitmap.height));
       const canvas = document.createElement("canvas");
-      canvas.width = Math.max(1, Math.round(bitmap.width * ratio)); canvas.height = Math.max(1, Math.round(bitmap.height * ratio));
+      canvas.width = Math.max(1, Math.round(bitmap.width * ratio));
+      canvas.height = Math.max(1, Math.round(bitmap.height * ratio));
       const context = canvas.getContext("2d", { willReadFrequently: true });
       if (!context) throw new Error("Image decoding is unavailable");
       context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
@@ -132,19 +141,74 @@ export function SafetyQr({ fingerprint }: { fingerprint: string }): JSX.Element 
       compare(decodeSafetyQrPixels(pixels.data, pixels.width, pixels.height));
     } catch { setComparison("invalid"); } finally { bitmap?.close(); }
   };
+
   return (
-    <div className="iceq-settings-status">
-      <strong>{i18n.t("safety.title")}</strong>
-      {svg && <img aria-label={i18n.t("safety.yourQr")} src={`data:image/svg+xml,${encodeURIComponent(svg)}`} />}
-      <details><summary>{i18n.t("safety.accessiblePayload")}</summary><textarea readOnly aria-label={i18n.t("safety.yourPayload")} value={payload} rows={3} /></details>
-      <label>{i18n.t("safety.scanImage")}<input aria-label={i18n.t("safety.contactImage")} type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void decodeImage(file); }} /></label>
-      <label>
-        {i18n.t("safety.comparePayload")}
-        <textarea aria-label={i18n.t("safety.contactPayload")} rows={3} onChange={(event) => {
-          compare(event.target.value);
-        }} />
-      </label>
-      {comparison !== "idle" && <div role="status">{comparison === "match" ? i18n.t("safety.match") : comparison === "mismatch" ? i18n.t("safety.mismatch") : i18n.t("safety.invalid")}</div>}
+    <div className="space-y-3">
+      <h4 className="text-sm font-semibold text-frozen">{i18n.t("safety.title")}</h4>
+
+      {svg && (
+        <img
+          aria-label={i18n.t("safety.yourQr")}
+          src={`data:image/svg+xml,${encodeURIComponent(svg)}`}
+          alt="Safety QR"
+          className="rounded-md border border-ice-border"
+        />
+      )}
+
+      <details className="text-xs">
+        <summary className="cursor-pointer text-mist hover:text-frozen transition-colors">
+          {i18n.t("safety.accessiblePayload")}
+        </summary>
+        <textarea
+          readOnly
+          aria-label={i18n.t("safety.yourPayload")}
+          className="iceq-input mt-1.5 text-mono text-xs"
+          value={payload}
+          rows={2}
+        />
+      </details>
+
+      <div>
+        <label className="text-xs text-mist">
+          {i18n.t("safety.scanImage")}
+          <input
+            aria-label={i18n.t("safety.contactImage")}
+            type="file"
+            accept="image/*"
+            className="iceq-input mt-1 text-xs"
+            onChange={(event) => {
+              const file = event.currentTarget.files?.[0];
+              if (file) void decodeImage(file);
+            }}
+          />
+        </label>
+      </div>
+
+      <div>
+        <label className="text-xs text-mist">
+          {i18n.t("safety.comparePayload")}
+          <textarea
+            aria-label={i18n.t("safety.contactPayload")}
+            className="iceq-input mt-1 text-mono text-xs"
+            rows={2}
+            onChange={(event) => compare(event.target.value)}
+          />
+        </label>
+      </div>
+
+      {comparison !== "idle" && (
+        <div role="status" className={
+          comparison === "match" ? "iceq-alert-success text-xs" :
+          comparison === "mismatch" ? "iceq-alert-error text-xs" :
+          "iceq-alert-warning text-xs"
+        }>
+          {comparison === "match"
+            ? i18n.t("safety.match")
+            : comparison === "mismatch"
+              ? i18n.t("safety.mismatch")
+              : i18n.t("safety.invalid")}
+        </div>
+      )}
     </div>
   );
 }

@@ -1,3 +1,7 @@
+// src/components/Settings/PanicPinSettings.tsx
+//
+// Panic PIN settings — Arctic Signal design.
+
 import { useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError } from "../../api/client";
@@ -38,64 +42,55 @@ export function PanicPinSettings(): JSX.Element {
       setPin("");
     } catch (err) {
       setError(getPanicPinErrorMessage(err, i18n.t));
-    } finally {
-      setBusy(false);
-    }
+    } finally { setBusy(false); }
   }
 
   return (
-    <div className="iceq-settings-row">
-      <div className="iceq-settings-status">
-        <strong>{i18n.t("security.panicPinTitle")}</strong>
-        <p>{i18n.t("security.panicPinHelp")}</p>
-        <form onSubmit={(e) => void onSubmit(e)} className="space-y-2">
-          <div>
-            <label htmlFor="panic-pin-current-password" className="mb-1 block text-xs text-text-2">
-              {i18n.t("security.panicPinCurrentPassword")}
-            </label>
-            <input
-              id="panic-pin-current-password"
-              type="password"
-              autoComplete="current-password"
-              className="iceq-input"
-              value={currentPassword}
-              onChange={(event) => setCurrentPassword(event.target.value)}
-              disabled={busy}
-              required
-            />
-          </div>
-          <div>
-            <label htmlFor="panic-pin-new" className="mb-1 block text-xs text-text-2">
-              {i18n.t("security.panicPinNewPin")}
-            </label>
-            <input
-              id="panic-pin-new"
-              type="password"
-              inputMode="numeric"
-              autoComplete="off"
-              maxLength={4}
-              pattern="[0-9]{4}"
-              className="iceq-input"
-              value={pin}
-              onChange={(event) => setPin(event.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
-              disabled={busy}
-            />
-          </div>
-          {error && (
-            <div role="alert" className="rounded-md border border-presence-dnd bg-surface p-2 text-sm">
-              {error}
-            </div>
-          )}
-          {success && (
-            <div role="status" className="rounded-md border border-presence-online bg-surface p-2 text-sm">
-              {success}
-            </div>
-          )}
-          <button type="submit" className="iceq-btn-secondary" disabled={busy || currentPassword === ""}>
-            {i18n.t("security.panicPinSave")}
-          </button>
-        </form>
-      </div>
+    <div className="iceq-settings-section">
+      <h3 className="text-sm font-semibold text-frozen">{i18n.t("security.panicPinTitle")}</h3>
+      <p className="text-xs text-mist">{i18n.t("security.panicPinHelp")}</p>
+
+      <form onSubmit={(e) => void onSubmit(e)} className="space-y-3">
+        <div>
+          <label htmlFor="panic-pin-current-password" className="text-label text-mist">
+            {i18n.t("security.panicPinCurrentPassword")}
+          </label>
+          <input
+            id="panic-pin-current-password"
+            type="password"
+            autoComplete="current-password"
+            className="iceq-input mt-1"
+            value={currentPassword}
+            onChange={(event) => setCurrentPassword(event.target.value)}
+            disabled={busy}
+            required
+          />
+        </div>
+        <div>
+          <label htmlFor="panic-pin-new" className="text-label text-mist">
+            {i18n.t("security.panicPinNewPin")}
+          </label>
+          <input
+            id="panic-pin-new"
+            type="password"
+            inputMode="numeric"
+            autoComplete="off"
+            maxLength={4}
+            pattern="[0-9]{4}"
+            className="iceq-input mt-1"
+            value={pin}
+            onChange={(event) => setPin(event.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+            disabled={busy}
+          />
+        </div>
+
+        {error && <div role="alert" className="iceq-alert-error text-xs">{error}</div>}
+        {success && <div role="status" className="iceq-alert-success text-xs">{success}</div>}
+
+        <button type="submit" className="iceq-btn-secondary" disabled={busy || currentPassword === ""}>
+          {i18n.t("security.panicPinSave")}
+        </button>
+      </form>
     </div>
   );
 }

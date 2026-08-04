@@ -1,20 +1,7 @@
 // src/components/Contacts/ContactList.tsx
 //
-// The list of contacts. Step 10 reorganizes the list into
-// three buckets by status:
-//
-//   1. Incoming requests (status=pending, direction=incoming)
-//      surfaced at the TOP with a single-click Accept button.
-//   2. Outgoing requests (status=pending, direction=outgoing)
-//      shown as sent requests and never rendered with Accept.
-//   3. Accepted contacts — the regular chat list, sorted
-//      by presence (online first, then by username).
-//   4. Blocked — hidden by default behind a "Show blocked"
-//      toggle so a user with a long block list still sees
-//      their real contacts at the top.
-//
-// The "+ Add contact" button sits at the very top of the
-// list (above the buckets).
+// Contact list — Arctic Signal design.
+// Buckets: incoming requests, outgoing requests, accepted, blocked.
 
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -45,35 +32,18 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
   const [busyUin, setBusyUin] = useState<number | null>(null);
   const [privacyGeneration, setPrivacyGeneration] = useState(0);
 
-  // Re-run the presence snapshot fetch below when the user flips the
-  // "presence" privacy toggle on -- otherwise turning it on mid-session
-  // would only take effect the next time the accepted-contacts list
-  // itself changes.
   useEffect(() => {
     const onPrivacyChanged = (): void => setPrivacyGeneration((g) => g + 1);
     window.addEventListener("iceq:privacy-changed", onPrivacyChanged);
     return () => window.removeEventListener("iceq:privacy-changed", onPrivacyChanged);
   }, []);
 
-  // Re-fetch the wire data on mount. The contact list is
-  // the source of truth for the sidebar so a fresh load
-  // on every chat-shell mount is the right default. If
-  // the request fails (no token, server down) we fall
-  // back to whatever's already in the store — better a
-  // stale list than a spinner forever.
   useEffect(() => {
     loadContacts().catch(() => {
-      // Statuses remain at {} (or stale). The list still
-      // renders; status badges just won't show.
+      // Stale list is better than a spinner.
     });
   }, [loadContacts]);
 
-  // Partition the in-memory contacts by status. The
-  // status is stored in the parallel `statuses` map
-  // because the `Contact` type does not carry it. UINs
-  // not in the map default to "accepted" (the dominant
-  // bucket) so the list still renders cleanly while the
-  // status fetch is in flight.
   const { incoming, outgoing, accepted, blocked } = useMemo(() => {
     const incoming: Contact[] = [];
     const outgoing: Contact[] = [];
@@ -87,10 +57,6 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
       else if (status === "blocked") blocked.push(c);
       else accepted.push(c);
     }
-    // Stable sort: pending first by uin ASC, then
-    // accepted by username ASC. The "presence first"
-    // ordering lives inside ContactItem where the
-    // presence map is consulted.
     incoming.sort((a, b) => a.uin - b.uin);
     outgoing.sort((a, b) => a.uin - b.uin);
     accepted.sort((a, b) => a.username.localeCompare(b.username));
@@ -98,12 +64,6 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
     return { incoming, outgoing, accepted, blocked };
   }, [contacts, statuses, directions]);
 
-  // Snapshot fetch: the real-time "presence" WS case only delivers
-  // transitions that happen after this client is connected, so a
-  // contact who was already online beforehand is otherwise stuck at
-  // the store's "offline" fallback until their next status change.
-  // Mirrors the "presence" privacy toggle that already gates the
-  // real-time subscription (see useWebSocket.ts) for consistency.
   const acceptedUinsKey = accepted.map((c) => c.uin).join(",");
   useEffect(() => {
     if (!permitsPrivacySignal("presence") || acceptedUinsKey === "") return;
@@ -118,48 +78,24 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
         }
       })
       .catch(() => {
-        // Best-effort: the real-time subscription still covers future
-        // transitions even if this initial snapshot fetch fails.
+        // Best-effort: real-time subscription covers future transitions.
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [acceptedUinsKey, privacyGeneration]);
 
   async function onAccept(uin: number): Promise<void> {
     setBusyUin(uin);
-    try {
-      await acceptContact(uin);
-    } catch {
-      // Error is already in the contact store's
-      // `error` field; components that care can read
-      // it. Inline-error UI for the list is out of
-      // scope for Step 10.
-    } finally {
-      setBusyUin(null);
-    }
+    try { await acceptContact(uin); } catch {} finally { setBusyUin(null); }
   }
 
   async function onBlock(uin: number): Promise<void> {
     setBusyUin(uin);
-    try {
-      await blockContact(uin);
-    } catch {
-      // Same as above.
-    } finally {
-      setBusyUin(null);
-    }
+    try { await blockContact(uin); } catch {} finally { setBusyUin(null); }
   }
 
   async function onRemove(uin: number): Promise<void> {
     setBusyUin(uin);
-    try {
-      await removeContactAsync(uin);
-    } catch {
-      // Same as above.
-    } finally {
-      setBusyUin(null);
-    }
+    try { await removeContactAsync(uin); } catch {} finally { setBusyUin(null); }
   }
 
   const isEmpty = incoming.length === 0 && outgoing.length === 0 && accepted.length === 0 && blocked.length === 0;
@@ -169,32 +105,28 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
       <AddContact />
 
       {isEmpty && (
-        <div className="p-4 text-sm text-text-2">
-          {i18n.t("contacts.empty")}
+        <div className="iceq-empty py-6">
+          <p className="iceq-empty-text px-4">{i18n.t("contacts.empty")}</p>
         </div>
       )}
 
+      {/* ── Incoming requests ─────────────────────────────────────── */}
       {incoming.length > 0 && (
         <section aria-label={i18n.t("contacts.incoming")}>
-          <h2 className="px-3 pt-3 text-xs font-semibold uppercase tracking-wide text-text-2">
+          <h2 className="iceq-section-header">
             {i18n.t("contacts.requests")} · {incoming.length}
           </h2>
-          <ul role="list" className="divide-y divide-border">
+          <ul role="list" className="divide-y divide-ice-border">
             {incoming.map((c) => (
-              <li key={c.uin} className="flex items-center gap-3 p-3">
-                <div className="flex min-w-0 flex-1 items-center gap-3">
-                  <span
-                    aria-hidden="true"
-                    className="inline-block h-2.5 w-2.5 rounded-full bg-text-2/50"
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-medium text-text">
-                      {c.nickname ?? c.username}
-                    </div>
-                    <div className="flex items-center gap-2 text-xs text-text-2">
-                      <span>{i18n.t("contacts.pending")}</span>
-                      <span>#{c.uin}</span>
-                    </div>
+              <li key={c.uin} className="flex items-center gap-2 px-3 py-2.5">
+                <span aria-hidden="true" className="inline-block h-2 w-2 shrink-0 rounded-full bg-warning" />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium text-frozen">
+                    {c.nickname ?? c.username}
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs text-mist">
+                    <span className="iceq-badge iceq-badge--warning">{i18n.t("contacts.pending")}</span>
+                    <span className="text-mono text-[11px] text-mist-dim">#{c.uin}</span>
                   </div>
                 </div>
                 <button
@@ -207,7 +139,7 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
                 </button>
                 <button
                   type="button"
-                  className="iceq-btn-secondary text-xs"
+                  className="iceq-btn-ghost text-xs"
                   onClick={() => void onBlock(c.uin)}
                   disabled={busyUin === c.uin}
                   aria-label={i18n.t("contacts.block")}
@@ -220,27 +152,23 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
         </section>
       )}
 
+      {/* ── Outgoing requests ─────────────────────────────────────── */}
       {outgoing.length > 0 && (
         <section aria-label={i18n.t("contacts.outgoing")}>
-          <h2 className="px-3 pt-3 text-xs font-semibold uppercase tracking-wide text-text-2">
+          <h2 className="iceq-section-header">
             {i18n.t("contacts.sentRequests")} · {outgoing.length}
           </h2>
-          <ul role="list" className="divide-y divide-border">
+          <ul role="list" className="divide-y divide-ice-border">
             {outgoing.map((c) => (
-              <li key={c.uin} className="flex items-center gap-3 p-3">
-                <div className="flex min-w-0 flex-1 items-center gap-3">
-                  <span
-                    aria-hidden="true"
-                    className="inline-block h-2.5 w-2.5 rounded-full bg-text-2/50"
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-medium text-text">
-                      {c.nickname ?? c.username}
-                    </div>
-                    <div className="flex items-center gap-2 text-xs text-text-2">
-                      <span>{i18n.t("contacts.waiting")}</span>
-                      <span>#{c.uin}</span>
-                    </div>
+              <li key={c.uin} className="flex items-center gap-3 px-3 py-2.5">
+                <span aria-hidden="true" className="inline-block h-2 w-2 shrink-0 rounded-full bg-offline" />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium text-frozen">
+                    {c.nickname ?? c.username}
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs text-mist">
+                    <span>{i18n.t("contacts.waiting")}</span>
+                    <span className="text-mono text-[11px] text-mist-dim">#{c.uin}</span>
                   </div>
                 </div>
               </li>
@@ -249,12 +177,11 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
         </section>
       )}
 
+      {/* ── Accepted contacts ─────────────────────────────────────── */}
       {accepted.length > 0 && (
         <section aria-label={i18n.t("contacts.title")}>
-          <h2 className="px-3 pt-3 text-xs font-semibold uppercase tracking-wide text-text-2">
-            {i18n.t("contacts.title")}
-          </h2>
-          <ul role="list" className="divide-y divide-border">
+          <h2 className="iceq-section-header">{i18n.t("contacts.title")}</h2>
+          <ul role="list" className="divide-y divide-ice-border">
             {accepted.map((c) => (
               <li key={c.uin}>
                 <ContactItem contact={c} onClick={onContactSelected} />
@@ -264,29 +191,32 @@ export function ContactList({ onContactSelected }: ContactListProps): JSX.Elemen
         </section>
       )}
 
+      {/* ── Blocked contacts ──────────────────────────────────────── */}
       {blocked.length > 0 && (
         <section aria-label={i18n.t("contacts.blockedTitle")} className="mt-2">
           <button
             type="button"
-            className="px-3 pt-3 text-xs font-semibold uppercase tracking-wide text-text-2 hover:text-text"
+            className="iceq-section-header flex w-full items-center gap-1 hover:text-frozen transition-colors"
             onClick={() => setShowBlocked((s) => !s)}
             aria-expanded={showBlocked}
           >
-            {i18n.t("contacts.blocked")} · {blocked.length} {showBlocked ? "▾" : "▸"}
+            {i18n.t("contacts.blocked")} · {blocked.length}
+            <span className="text-[10px]">{showBlocked ? "▾" : "▸"}</span>
           </button>
           {showBlocked && (
-            <ul role="list" className="divide-y divide-border">
+            <ul role="list" className="divide-y divide-ice-border">
               {blocked.map((c) => (
-                <li key={c.uin} className="flex items-center gap-2 p-3">
-                  <div className="flex-1">
-                    <div className="text-sm font-medium text-text line-through opacity-60">
+                <li key={c.uin} className="flex items-center gap-2 px-3 py-2.5">
+                  <span className="inline-block h-2 w-2 shrink-0 rounded-full bg-destructive opacity-40" />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm text-mist line-through opacity-50">
                       #{c.uin}
                     </div>
-                    <div className="text-xs text-text-2">{i18n.t("contacts.blocked")}</div>
+                    <div className="text-[11px] text-mist-dim">{i18n.t("contacts.blocked")}</div>
                   </div>
                   <button
                     type="button"
-                    className="iceq-btn-secondary text-xs"
+                    className="iceq-btn-ghost text-xs"
                     onClick={() => void onRemove(c.uin)}
                     disabled={busyUin === c.uin}
                   >

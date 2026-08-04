@@ -1,9 +1,6 @@
 // src/components/Chat/TypingIndicator.tsx
 //
-// "Alice is typing…" line. The chat-store keeps a
-// per-conversation Set<uin> of currently-typing peers; we
-// render the union of their usernames. Self-typing is
-// filtered out so the user doesn't see their own indicator.
+// "Alice is typing…" indicator — Arctic Signal design.
 
 import { useChatStore } from "../../store/chatStore";
 import { useContactStore } from "../../store/contactStore";
@@ -19,16 +16,27 @@ export function TypingIndicator({ conversationId }: TypingIndicatorProps): JSX.E
   const selfUin = useAuthStore((s) => s.uin);
   const typing = useChatStore((s) => s.typing[conversationId]);
   const contacts = useContactStore((s) => s.contacts);
+
   if (!typing || typing.size === 0) return null;
+
   const others = Array.from(typing).filter((u) => u !== selfUin);
   if (others.length === 0) return null;
+
   const names = others.map((u) => {
     const c = contacts.find((c) => c.uin === u);
     return c?.nickname ?? c?.username ?? `#${u}`;
   });
+
   return (
-    <div className="px-4 py-1 text-xs italic text-text-2">
-      {names.join(", ")} {others.length === 1 ? i18n.t("chat.typingOne") : i18n.t("chat.typingMany")}
+    <div className="flex items-center gap-2 px-4 py-1.5 text-xs text-mist">
+      <span className="flex gap-0.5">
+        <span className="inline-block h-1 w-1 animate-pulse rounded-full bg-signal" style={{ animationDelay: "0ms" }} />
+        <span className="inline-block h-1 w-1 animate-pulse rounded-full bg-signal" style={{ animationDelay: "150ms" }} />
+        <span className="inline-block h-1 w-1 animate-pulse rounded-full bg-signal" style={{ animationDelay: "300ms" }} />
+      </span>
+      <span>
+        {names.join(", ")} {others.length === 1 ? i18n.t("chat.typingOne") : i18n.t("chat.typingMany")}
+      </span>
     </div>
   );
 }

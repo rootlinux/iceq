@@ -1,3 +1,7 @@
+// src/components/Groups/GroupList.tsx
+//
+// Group list in the sidebar — Arctic Signal design.
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useGroupStore } from "../../store/groupStore";
 import { useChatStore } from "../../store/chatStore";
@@ -23,7 +27,7 @@ export function GroupList(): JSX.Element {
 
   useEffect(() => {
     loadGroups().catch(() => {
-      // The store already captures the error state.
+      // Store already captures the error state.
     });
   }, [loadGroups]);
 
@@ -42,13 +46,11 @@ export function GroupList(): JSX.Element {
       setOpen(false);
     } catch (err) {
       setLocalError((err as Error).message);
-    } finally {
-      setCreating(false);
-    }
+    } finally { setCreating(false); }
   }
 
   return (
-    <section aria-label={i18n.t("groups.title")} className="border-t border-border">
+    <section aria-label={i18n.t("groups.title")} className="border-t border-ice-border">
       <div className="p-3">
         <button
           type="button"
@@ -56,36 +58,40 @@ export function GroupList(): JSX.Element {
           className="iceq-btn-secondary w-full"
           onClick={() => setOpen(true)}
         >
-          + {i18n.t("groups.create")}
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="mr-2">
+            <line x1="8" y1="2" x2="8" y2="14"/><line x1="2" y1="8" x2="14" y2="8"/>
+          </svg>
+          {i18n.t("groups.create")}
         </button>
       </div>
 
-      <h2 className="px-3 pb-2 text-xs font-semibold uppercase tracking-wide text-text-2">
-        {i18n.t("groups.title")}
-      </h2>
+      <h2 className="iceq-section-header">{i18n.t("groups.title")}</h2>
 
       {loading && groups.length === 0 && (
-        <div className="px-3 pb-3 text-sm text-text-2">{i18n.t("groups.loading")}</div>
+        <div className="px-3 pb-3 text-sm text-mist">{i18n.t("groups.loading")}</div>
       )}
 
       {!loading && groups.length === 0 && (
-        <div className="px-3 pb-3 text-sm text-text-2">
-          {i18n.t("groups.empty")}
-        </div>
+        <div className="px-3 pb-3 text-sm text-mist">{i18n.t("groups.empty")}</div>
       )}
 
       {groups.length > 0 && (
-        <ul role="list" className="divide-y divide-border">
+        <ul role="list" className="divide-y divide-ice-border">
           {groups.map((group) => (
             <li key={group.group_id}>
               <button
                 type="button"
-                className="w-full px-3 py-2 text-left hover:bg-surface focus:bg-surface focus:outline-none"
+                className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-cobalt-hover/30 focus:bg-cobalt-hover/30 focus:outline-none transition-colors"
                 onClick={() => setActiveGroupConversation(group)}
               >
-                <div className="truncate text-sm font-medium text-text">{group.name}</div>
-                <div className="truncate text-xs text-text-2">
-                  {i18n.t(group.member_count === 1 ? "groups.memberCount" : "groups.memberCountPlural", { count: group.member_count })}
+                <div className="iceq-avatar iceq-avatar--sm">
+                  {group.name.slice(0, 1).toUpperCase()}
+                </div>
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium text-frozen">{group.name}</div>
+                  <div className="text-xs text-mist">
+                    {i18n.t(group.member_count === 1 ? "groups.memberCount" : "groups.memberCountPlural", { count: group.member_count })}
+                  </div>
                 </div>
               </button>
             </li>
@@ -94,9 +100,10 @@ export function GroupList(): JSX.Element {
       )}
 
       {(error || localError) && (
-        <div className="px-3 py-3 text-sm text-presence-dnd">{localError ?? error}</div>
+        <div role="alert" className="px-3 py-3 text-xs text-destructive">{localError ?? error}</div>
       )}
 
+      {/* ── Create group modal ────────────────────────────────────── */}
       {open && (
         <div
           className="iceq-modal-backdrop"
@@ -105,40 +112,36 @@ export function GroupList(): JSX.Element {
           aria-labelledby="create-group-title"
           onClick={closeDialog}
         >
-          <div
-            className="iceq-modal"
-            ref={dialogRef}
-            onClick={(e) => e.stopPropagation()}
-          >
+          <div className="iceq-modal" ref={dialogRef} onClick={(e) => e.stopPropagation()}>
             <div className="mb-4 flex items-start justify-between gap-4">
               <div>
-                <h2 id="create-group-title" className="text-lg font-semibold text-text">
+                <h2 id="create-group-title" className="text-lg font-semibold text-frozen">
                   {i18n.t("groups.create")}
                 </h2>
-                <p className="mt-1 text-sm text-text-2">
-                  {i18n.t("groups.createHelp")}
-                </p>
+                <p className="mt-1 text-sm text-mist">{i18n.t("groups.createHelp")}</p>
               </div>
               <button
                 type="button"
-                className="iceq-btn-secondary"
+                className="iceq-btn-icon"
                 aria-label={i18n.t("groups.closeCreate")}
                 onClick={closeDialog}
               >
-                ✕
+                <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                  <line x1="4" y1="4" x2="14" y2="14"/><line x1="14" y1="4" x2="4" y2="14"/>
+                </svg>
               </button>
             </div>
 
             <form className="space-y-3" onSubmit={(e) => void onCreate(e)}>
-              <div className="space-y-1">
-                <label htmlFor="group-name" className="text-sm text-text-2">
+              <div>
+                <label htmlFor="group-name" className="text-label text-mist">
                   {i18n.t("groups.name")}
                 </label>
                 <input
                   id="group-name"
                   ref={inputRef}
                   type="text"
-                  className="iceq-input"
+                  className="iceq-input mt-1.5"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   minLength={3}
@@ -148,24 +151,13 @@ export function GroupList(): JSX.Element {
                 />
               </div>
               {localError && (
-                <div className="rounded-md border border-presence-dnd bg-surface p-3 text-sm">
-                  {localError}
-                </div>
+                <div className="iceq-alert-error">{localError}</div>
               )}
               <div className="iceq-modal-buttons">
-                <button
-                  type="button"
-                  className="iceq-btn-secondary"
-                  onClick={closeDialog}
-                  disabled={creating}
-                >
+                <button type="button" className="iceq-btn-secondary" onClick={closeDialog} disabled={creating}>
                   {i18n.t("common.cancel")}
                 </button>
-                <button
-                  type="submit"
-                  className="iceq-btn-primary"
-                  disabled={creating}
-                >
+                <button type="submit" className="iceq-btn-primary" disabled={creating}>
                   {creating ? i18n.t("groups.creating") : i18n.t("groups.create")}
                 </button>
               </div>

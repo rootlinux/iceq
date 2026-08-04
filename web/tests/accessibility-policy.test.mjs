@@ -22,25 +22,22 @@ test("all dialog surfaces use managed dialog focus", () => {
 });
 
 test("closed mobile sidebar is translated offscreen and cannot cover the menu trigger", () => {
-  const sidebar = read("src/components/Layout/Sidebar.tsx");
   const layout = read("src/components/Layout/MainLayout.tsx");
-  assert.match(sidebar, /open \? "translate-x-0" : "-translate-x-full"/);
-  assert.match(sidebar, /md:translate-x-0/);
-  assert.match(sidebar, /setAttribute\("inert", ""\)/);
-  assert.match(sidebar, /removeAttribute\("inert"\)/);
-  assert.match(sidebar, /aria-hidden=/);
-  assert.match(layout, /sidebarToggleRef/);
-  assert.match(layout, /sidebarToggleRef\.current\?\.focus\(\)/);
+  assert.match(layout, /transform:\s*drawerOpen\s*\?\s*"translateX\(0\)"\s*:\s*`translateX\(-100%\)`/);
+  assert.match(layout, /setAttribute\("inert", ""\)/);
+  assert.match(layout, /removeAttribute\("inert"\)/);
+  assert.match(layout, /aria-hidden=\{!drawerOpen\}/);
+  assert.match(layout, /logoToggleRef/);
+  assert.match(layout, /logoToggleRef\.current\?\.focus\(\)/);
 });
 
 test("mobile menu toggle owns the drawer and opening naturally focuses its close control", () => {
-  const sidebar = read("src/components/Layout/Sidebar.tsx");
   const layout = read("src/components/Layout/MainLayout.tsx");
-  assert.match(sidebar, /id="primary-navigation-drawer"/);
-  assert.match(layout, /aria-controls="primary-navigation-drawer"/);
-  assert.match(layout, /aria-expanded=\{sidebarOpen\}/);
-  assert.match(sidebar, /closeButtonRef/);
-  assert.match(sidebar, /closeButtonRef\.current\?\.focus\(\)/);
+  assert.match(layout, /id="navigation-drawer"/);
+  assert.match(layout, /aria-controls="navigation-drawer"/);
+  assert.match(layout, /aria-expanded=\{drawerOpen\}/);
+  assert.match(layout, /querySelector<HTMLElement>/);
+  assert.match(layout, /first\?\.focus\(\)/);
 });
 
 test("dialog keyboard helper wraps Tab in both directions", () => {

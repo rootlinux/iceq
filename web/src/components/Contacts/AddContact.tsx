@@ -1,3 +1,7 @@
+// src/components/Contacts/AddContact.tsx
+//
+// Add-contact modal — Arctic Signal design.
+
 import { useCallback, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError } from "../../api/client";
@@ -43,10 +47,7 @@ export function AddContact(): JSX.Element {
     setSuccess(null);
 
     const trimmed = targetUIN.trim();
-    if (trimmed === "") {
-      setError(i18n.t("contacts.enterUin"));
-      return;
-    }
+    if (trimmed === "") { setError(i18n.t("contacts.enterUin")); return; }
 
     const parsed = Number.parseInt(trimmed, 10);
     if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -65,9 +66,7 @@ export function AddContact(): JSX.Element {
       setTargetUIN("");
     } catch (err) {
       setError(getAddContactErrorMessage(err, i18n.t));
-    } finally {
-      setSubmitting(false);
-    }
+    } finally { setSubmitting(false); }
   }
 
   return (
@@ -75,10 +74,13 @@ export function AddContact(): JSX.Element {
       <button
         type="button"
         ref={openerRef}
-        className="iceq-btn-secondary m-2 w-[calc(100%-1rem)]"
+        className="iceq-btn-secondary mx-3 mt-3 w-[calc(100%-1.5rem)]"
         onClick={() => setOpen(true)}
       >
-        + {i18n.t("contacts.add")}
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="mr-2">
+          <line x1="8" y1="2" x2="8" y2="14"/><line x1="2" y1="8" x2="14" y2="8"/>
+        </svg>
+        {i18n.t("contacts.add")}
       </button>
 
       {open && (
@@ -92,27 +94,27 @@ export function AddContact(): JSX.Element {
           <div className="iceq-modal" ref={dialogRef} onClick={(e) => e.stopPropagation()}>
             <div className="mb-4 flex items-start justify-between gap-4">
               <div>
-                <h2 id="add-contact-title" className="text-lg font-semibold text-text">
+                <h2 id="add-contact-title" className="text-lg font-semibold text-frozen">
                   {i18n.t("contacts.add")}
                 </h2>
-                <p className="mt-1 text-sm text-text-2">
-                  {i18n.t("contacts.addHelp")}
-                </p>
+                <p className="mt-1 text-sm text-mist">{i18n.t("contacts.addHelp")}</p>
               </div>
               <button
                 type="button"
-                className="iceq-btn-secondary"
+                className="iceq-btn-icon"
                 aria-label={i18n.t("contacts.closeAdd")}
                 onClick={closeModal}
                 disabled={submitting}
               >
-                ✕
+                <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                  <line x1="4" y1="4" x2="14" y2="14"/><line x1="14" y1="4" x2="4" y2="14"/>
+                </svg>
               </button>
             </div>
 
             <form onSubmit={(e) => void onSubmit(e)} className="space-y-3">
               <div>
-                <label htmlFor="add-contact-uin" className="mb-1 block text-xs text-text-2">
+                <label htmlFor="add-contact-uin" className="text-label text-mist">
                   {i18n.t("contacts.uin")}
                 </label>
                 <input
@@ -122,7 +124,7 @@ export function AddContact(): JSX.Element {
                   min="1"
                   inputMode="numeric"
                   autoComplete="off"
-                  className="iceq-input"
+                  className="iceq-input mt-1.5"
                   value={targetUIN}
                   onChange={(e) => setTargetUIN(e.target.value)}
                   disabled={submitting}
@@ -132,18 +134,11 @@ export function AddContact(): JSX.Element {
               </div>
 
               {error && (
-                <div role="alert" className="rounded-md border border-presence-dnd bg-surface p-2 text-sm">
-                  {error}
-                </div>
+                <div role="alert" className="iceq-alert-error">{error}</div>
               )}
 
               {success && (
-                <div
-                  role="status"
-                  className="rounded-md border border-presence-online bg-surface p-2 text-sm"
-                >
-                  {success}
-                </div>
+                <div role="status" className="iceq-alert-success">{success}</div>
               )}
 
               <div className="iceq-modal-buttons">

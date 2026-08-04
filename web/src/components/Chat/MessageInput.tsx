@@ -1,15 +1,9 @@
 // src/components/Chat/MessageInput.tsx
 //
-// The text input + send button. On send:
-//
-//   1. DM: signal.encryptMessage(recipientUin, plaintext)
-//   2. Group: send a group_msg frame for group:<group_id>
-//   3. Optimistic UI: addMessage with state="sending"
-//
-// Typing indicator: a 500ms debounced "typing" frame on
-// each keystroke. The server treats typing frames as
-// transient; the chat-store's per-conversation typing
-// window auto-clears after 5s.
+// Floating composer dock — Encrypted Aurora design.
+// Sits at the bottom of the active transmission plane with a
+// translucent frosted surface that gently increases channel
+// illumination on focus.
 
 import { useCallback, useRef, useState } from "react";
 import { useChatStore, conversationIdForPair } from "../../store/chatStore";
@@ -42,6 +36,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
   const selfUin = useAuthStore((s) => s.uin);
   const addMessage = useChatStore((s) => s.addMessage);
   const [text, setText] = useState("");
+  const [focused, setFocused] = useState(false);
   const [sending, setSending] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const [securityError, setSecurityError] = useState<string | null>(null);
@@ -52,12 +47,9 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
   const onChange = useCallback(
     (value: string) => {
       setText(value);
-      // Debounce the typing frame so we don't spam the
-      // server on every keystroke. The server also rate-
-      // limits; this is just a client courtesy.
       if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
       typingTimerRef.current = setTimeout(() => {
-		if (!permitsPrivacySignal("typing")) return;
+        if (!permitsPrivacySignal("typing")) return;
         const now = Date.now();
         if (now - lastTypingSentRef.current < TYPING_DEBOUNCE_MS) return;
         lastTypingSentRef.current = now;
@@ -68,12 +60,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
           type: "typing",
           id: cryptoRandomId(),
           ts: Date.now(),
-          payload: {
-            conversation_id: convId,
-            sender_uin: selfUin,
-            is_group: groupId !== undefined,
-            ...(groupId !== undefined ? { group_id: groupId } : {}),
-          },
+          payload: { conversation_id: convId, sender_uin: selfUin, is_group: groupId !== undefined, ...(groupId !== undefined ? { group_id: groupId } : {}) },
         });
       }, TYPING_DEBOUNCE_MS);
     },
@@ -98,17 +85,12 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
     const clientId = cryptoRandomId();
     const isGroup = groupId !== undefined;
     const convId = isGroup ? `group:${groupId}` : conversationIdForPair(selfUin, peerUin as number);
-    // ---- Optimistic UI: add a "sending" row ----
+
     const optimistic: Message = {
-      id: clientId,
-      conversation_id: convId,
-      sender_uin: selfUin,
-      receiver_uin: isGroup ? 0 : peerUin as number,
-      plaintext: trimmed,
-      content_type: "text",
-      created_at: new Date().toISOString(),
-      state: "sending",
-      is_outgoing: true,
+      id: clientId, conversation_id: convId, sender_uin: selfUin,
+      receiver_uin: isGroup ? 0 : peerUin as number, plaintext: trimmed,
+      content_type: "text", created_at: new Date().toISOString(),
+      state: "sending", is_outgoing: true,
     };
     addMessage(convId, optimistic);
     setText("");
@@ -124,78 +106,38 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         });
         const sealed = await sealGroupContent(operationNamespace,sender,{kind:GROUP_CONTENT_KIND,content_type:"text",text:trimmed});
         const payload: GroupMessagePayload = {
-          conversation_id: `group:${groupId}`,
-          group_id: groupId,
-          sender_uin: selfUin,
-          content: "",
-          content_type: "text",
-          client_id: clientId,
-          ciphertext: encodeGroupCiphertext(sealed),
-          msg_type: "group_ciphertext",
-          crypto_version: 1,
-          crypto_epoch: roster.crypto_epoch,
+          conversation_id: `group:${groupId}`, group_id: groupId, sender_uin: selfUin,
+          content: "", content_type: "text", client_id: clientId,
+          ciphertext: encodeGroupCiphertext(sealed), msg_type: "group_ciphertext",
+          crypto_version: 1, crypto_epoch: roster.crypto_epoch,
           expires_in_seconds: loadDisappearingSeconds(),
         };
-        const frame: Envelope<typeof payload> = {
-          type: "group_msg",
-          id: clientId,
-          ts: Date.now(),
-          payload,
-        };
         await delay(randomSendJitterMs());
-        send(frame);
+        send({ type: "group_msg", id: clientId, ts: Date.now(), payload } satisfies Envelope<typeof payload>);
         return;
       }
 
       const encoder = new TextEncoder();
       const sealed = await encryptMessage(peerUin as number, encoder.encode(trimmed),operationNamespace);
       const payload: MessagePayload = {
-        conversation_id: convId,
-        sender_uin: selfUin,
-        to_uin: peerUin as number,
-        receiver_uin: peerUin as number,
-        content: "",
-        content_type: "text",
-        client_id: clientId,
-        ciphertext: sealed.ciphertext,
-        msg_type: sealed.msgType,
+        conversation_id: convId, sender_uin: selfUin, to_uin: peerUin as number,
+        receiver_uin: peerUin as number, content: "", content_type: "text",
+        client_id: clientId, ciphertext: sealed.ciphertext, msg_type: sealed.msgType,
         expires_in_seconds: loadDisappearingSeconds(),
       };
-      const frame: Envelope<typeof payload> = {
-        type: "message",
-        id: cryptoRandomId(),
-        ts: Date.now(),
-        payload,
-      };
-      // Small random delay before the frame hits the wire: makes
-      // "user pressed send" harder to correlate precisely with a
-      // specific packet timestamp for a network-level observer.
       await delay(randomSendJitterMs());
-      send(frame);
-      // The server's first ack (state=delivered) will move
-      // the optimistic message from "sending" to "delivered"
-      // via the dispatch path in useWebSocket.
+      send({ type: "message", id: cryptoRandomId(), ts: Date.now(), payload } satisfies Envelope<typeof payload>);
     } catch (e) {
       const reason = e instanceof SignalError ? e.message : (e as Error).message;
       setSecurityError(reason);
       if (__DEV__) console.error("[send] encrypt failed:", reason);
-      // Mark the optimistic row as failed. The chat-store
-      // doesn't have a `markFailed` action, so we replace
-      // via setMessages.
       useChatStore.setState((s) => {
         const list = s.messagesByConversation[convId];
         if (!list) return s;
         const next = list.map((m) => (m.id === clientId ? { ...m, state: "failed" as const } : m));
-        return {
-          messagesByConversation: {
-            ...s.messagesByConversation,
-            [convId]: next,
-          },
-        };
+        return { messagesByConversation: { ...s.messagesByConversation, [convId]: next } };
       });
-    } finally {
-      setSending(false);
-    }
+    } finally { setSending(false); }
   };
 
   const handleAttachment = async (file: File): Promise<void> => {
@@ -224,56 +166,32 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
       }
       await attachmentGrantLifecycle.prepare(clientId, uploaded.object_key, peerUin as number);
       const attachment = {
-        object_key: uploaded.object_key,
-        manifest: uploaded.manifest,
+        object_key: uploaded.object_key, manifest: uploaded.manifest,
         name: uploaded.manifest.name ?? file.name,
-        mime_type: uploaded.manifest.mime_type,
-        size: uploaded.manifest.size,
+        mime_type: uploaded.manifest.mime_type, size: uploaded.manifest.size,
       };
       const optimistic: Message = {
-        id: clientId,
-        conversation_id: convId,
-        sender_uin: selfUin,
-        receiver_uin: peerUin as number,
-        plaintext: "",
-        content_type: "file",
-        file_object_key: uploaded.object_key,
-        attachment,
-        created_at: new Date().toISOString(),
-        state: "sending",
-        is_outgoing: true,
+        id: clientId, conversation_id: convId, sender_uin: selfUin,
+        receiver_uin: peerUin as number, plaintext: "", content_type: "file",
+        file_object_key: uploaded.object_key, attachment,
+        created_at: new Date().toISOString(), state: "sending", is_outgoing: true,
       };
       addMessage(convId, optimistic);
 
-      const attachmentEnvelope = {
-        kind: "iceq.attachment.v1",
-        object_key: uploaded.object_key,
-        manifest: uploaded.manifest,
-      };
+      const attachmentEnvelope = { kind: "iceq.attachment.v1", object_key: uploaded.object_key, manifest: uploaded.manifest };
       const attachmentPlaintext = JSON.stringify(attachmentEnvelope);
       const encoder = new TextEncoder();
       const sealed = await encryptMessage(peerUin as number, encoder.encode(attachmentPlaintext),operationNamespace);
       const payload: MessagePayload = {
-        conversation_id: convId,
-        sender_uin: selfUin,
-        to_uin: peerUin as number,
-        receiver_uin: peerUin as number,
-        content: "",
-        content_type: "file",
-        client_id: clientId,
-        ciphertext: sealed.ciphertext,
-        msg_type: sealed.msgType,
+        conversation_id: convId, sender_uin: selfUin, to_uin: peerUin as number,
+        receiver_uin: peerUin as number, content: "", content_type: "file",
+        client_id: clientId, ciphertext: sealed.ciphertext, msg_type: sealed.msgType,
         expires_in_seconds: loadDisappearingSeconds(),
       };
       await delay(randomSendJitterMs());
-      if (!send({
-        type: "message",
-        id: cryptoRandomId(),
-        ts: Date.now(),
-        payload,
-      } satisfies Envelope<typeof payload>)) {
-		throw new Error("message transport is unavailable");
-	  }
+      if (!send({ type: "message", id: cryptoRandomId(), ts: Date.now(), payload } satisfies Envelope<typeof payload>)) {
+        throw new Error("message transport is unavailable");
+      }
     } catch (e) {
       if(groupGrantCleanup) await Promise.allSettled(groupGrantCleanup.recipients.map(u=>revokeFileAccess(groupGrantCleanup!.objectKey,u)));
       await attachmentGrantLifecycle.fail(clientId).catch(() => undefined);
@@ -284,12 +202,7 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
         const list = s.messagesByConversation[convId];
         if (!list) return s;
         const next = list.map((m) => (m.id === clientId ? { ...m, state: "failed" as const } : m));
-        return {
-          messagesByConversation: {
-            ...s.messagesByConversation,
-            [convId]: next,
-          },
-        };
+        return { messagesByConversation: { ...s.messagesByConversation, [convId]: next } };
       });
     } finally {
       setAttaching(false);
@@ -297,44 +210,80 @@ export function MessageInput({ peerUin, groupId }: MessageInputProps): JSX.Eleme
     }
   };
 
+  const isDisabled = sending || attaching;
+  const canSend = !isDisabled && text.trim().length > 0;
+
   return (
-    <div className="border-t border-border p-3">
-      {securityError && <div role="alert" className="mb-2 text-sm text-red-400">{i18n.t("chat.sendBlocked")} {securityError}</div>}
+    <div
+      className="border-t border-ice-border p-3"
+      style={{
+        background: focused
+          ? "rgba(16,27,61,0.7)"
+          : "rgba(10,16,36,0.5)",
+        backdropFilter: "blur(12px)",
+        WebkitBackdropFilter: "blur(12px)",
+        transition: "background 300ms ease, box-shadow 300ms ease",
+        boxShadow: focused
+          ? "0 -1px 16px rgba(89,216,255,0.04)"
+          : "none",
+      }}
+    >
+      {securityError && (
+        <div role="alert" className="mb-2 text-xs text-destructive">
+          {i18n.t("chat.sendBlocked")} {securityError}
+        </div>
+      )}
+
       <div className="flex items-end gap-2">
+        {/* Hidden file input */}
         <input
           ref={fileInputRef}
           type="file"
           className="sr-only"
-          disabled={sending || attaching}
+          disabled={isDisabled}
           onChange={(e) => {
             const file = e.currentTarget.files?.[0];
             if (file) void handleAttachment(file);
           }}
         />
+
+        {/* Attach button */}
         <button
           type="button"
-          className="iceq-btn-secondary shrink-0"
+          className="iceq-btn-icon shrink-0"
           onClick={() => fileInputRef.current?.click()}
-          disabled={sending || attaching}
+          disabled={isDisabled}
           title={i18n.t("chat.attachEncrypted")}
           aria-label={i18n.t("chat.attachFile")}
         >
-          {attaching ? "..." : "+"}
+          {attaching ? (
+            <span className="iceq-spinner" style={{ width: 16, height: 16 }} />
+          ) : (
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+              <path d="M10 3v10M6 9l4-4 4 4M3 13v3a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3"/>
+            </svg>
+          )}
         </button>
+
+        {/* Textarea */}
         <textarea
           rows={1}
           value={text}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
           placeholder={i18n.t("chat.messagePlaceholder")}
-          className="iceq-input max-h-32 resize-y"
+          className="iceq-input max-h-32 flex-1 resize-y"
           disabled={sending}
         />
+
+        {/* Send button */}
         <button
           type="button"
-          className="iceq-btn-primary"
+          className="iceq-btn-primary shrink-0"
           onClick={() => void onSend()}
-          disabled={sending || text.trim().length === 0}
+          disabled={!canSend}
         >
           {i18n.t("common.send")}
         </button>

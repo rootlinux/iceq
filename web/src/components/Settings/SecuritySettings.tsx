@@ -1,5 +1,12 @@
-import { useEffect, useState } from "react";
+// src/components/Settings/SecuritySettings.tsx
+//
+// Security settings panel — Arctic Signal design.
+// Privacy toggles, identity fingerprint, peer verification,
+// panic PIN, panic wipe, recovery import.
+
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useDialogFocus } from "../../hooks/useDialogFocus";
 import { getActiveCryptoNamespace, loadIdentity } from "../../lib/indexeddb";
 import { SafetyQr } from "./SafetyQr";
 import {
@@ -36,9 +43,9 @@ export function SecuritySettings(): JSX.Element {
   const [panicPinInput, setPanicPinInput] = useState("");
   const [panicPassphraseInput, setPanicPassphraseInput] = useState("");
   const [panicMode, setPanicMode] = useState<PanicWipeMode>("idle");
-  const [fingerprintStatus, setFingerprintStatus] = useState<FingerprintStatus>({
-    kind: "loading",
-  });
+  const panicTriggerRef = useRef<HTMLButtonElement>(null);
+  const panicDialogRef = useDialogFocus(panicConfirmOpen, () => setPanicConfirmOpen(false), panicTriggerRef);
+  const [fingerprintStatus, setFingerprintStatus] = useState<FingerprintStatus>({ kind: "loading" });
   const [peerUin, setPeerUin] = useState("");
   const [peerSafety, setPeerSafety] = useState<PeerSafetyInspection | null>(null);
   const [peerError, setPeerError] = useState<string | null>(null);
@@ -73,9 +80,7 @@ export function SecuritySettings(): JSX.Element {
         setFingerprintStatus({ kind: "error" });
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
 
   async function handlePassphraseWipe(): Promise<void> {
@@ -83,42 +88,26 @@ export function SecuritySettings(): JSX.Element {
     setPanicBusy(true);
     try {
       const unlocked = await unlockSecurityVault(panicPassphraseInput);
-      if (!unlocked) {
-        setPanicError(i18n.t("security.panicWipeWrongPin"));
-        return;
-      }
+      if (!unlocked) { setPanicError(i18n.t("security.panicWipeWrongPin")); return; }
 
       const privateKey = await loadAndDecryptWipePrivateKey();
-      if (!privateKey) {
-        setPanicError(i18n.t("security.panicWipeFailed"));
-        return;
-      }
+      if (!privateKey) { setPanicError(i18n.t("security.panicWipeFailed")); return; }
 
       const challengeResp = await requestWipeChallenge();
       const challengeBytes = new Uint8Array(
         Uint8Array.from(atob(challengeResp.challenge), c => c.charCodeAt(0))
       );
-
       const sigBytes = await signWipeChallenge(challengeBytes, privateKey);
       const sigB64 = btoa(String.fromCharCode(...sigBytes));
-
       await panicWipeWithSignature(challengeResp.challenge_id, sigB64);
 
-      // Server accepted the wipe (202). Trigger destructive local cleanup:
-      // lock vault, clear tokens, destroy IndexedDB, clear caches, reset
-      // memory, redirect to login. Await the teardown so we know whether
-      // local cleanup succeeded.
       lockSecurityVault();
       try {
         await useAuthStore.getState().handleServerWipe();
-        // Local cleanup succeeded — clear the dialog.
         setPanicConfirmOpen(false);
+        navigate("/login", { replace: true });
       } catch {
-        // Local cleanup failed. The fail-closed cleanup-required marker is
-        // already set by startSessionTeardown. Keep the dialog open so the
-        // user sees the error banner; do not report the wipe as completed.
         setPanicError(i18n.t("cleanup.failed"));
-        // Keep panicConfirmOpen = true so the user can retry.
       }
     } catch (e) {
       lockSecurityVault();
@@ -139,6 +128,7 @@ export function SecuritySettings(): JSX.Element {
     try {
       await runConfirmedPanicWipe(() => true, storePanicWipe, panicPinInput);
       setPanicConfirmOpen(false);
+      navigate("/login", { replace: true });
     } catch (e: unknown) {
       if (e instanceof ApiError && e.code === "INVALID_PIN") {
         setPanicError(i18n.t("security.panicWipeWrongPin"));
@@ -158,69 +148,135 @@ export function SecuritySettings(): JSX.Element {
 
   return (
     <div className="iceq-settings-panel">
-      <h3>{i18n.t("security.title")}</h3>
-
+      {/* ── Privacy ────────────────────────────────────────────────── */}
       <PrivacySettings />
+
+      {/* ── Safety QR ──────────────────────────────────────────────── */}
       {fingerprintStatus.kind === "ready" && fingerprintStatus.fingerprint && (
-        <SafetyQr fingerprint={fingerprintStatus.fingerprint} />
-      )}
-      <div className="iceq-settings-row">
-        <div className="iceq-settings-status">
-          <strong>{i18n.t("security.verifyContact")}</strong>
-          <input aria-label={i18n.t("security.contactUin")} inputMode="numeric" value={peerUin} onChange={(event) => setPeerUin(event.target.value)} />
-          <button type="button" onClick={() => void inspectPeer()}>{i18n.t("security.loadSafety")}</button>
-          {peerError && <div role="alert">{peerError}</div>}
-          {peerSafety && (
-            <div>
-              <div>{peerSafety.number}</div>
-              <SafetyQr fingerprint={peerSafety.number} />
-              {peerSafety.changed && <div role="alert">{i18n.t("security.identityChanged")}</div>}
-              {peerSafety.changed && <button type="button" onClick={async () => { await acceptPeerIdentity(peerSafety.uin, peerSafety.identityKey,getActiveCryptoNamespace()); await inspectPeer(); }}>{i18n.t("security.acceptIdentity")}</button>}
-              {!peerSafety.verified && !peerSafety.changed && <button type="button" onClick={async () => { await verifyPeerIdentity(peerSafety.uin, peerSafety.identityKey,getActiveCryptoNamespace()); await inspectPeer(); }}>{i18n.t("security.markVerified")}</button>}
-              {peerSafety.verified && <div role="status">{i18n.t("security.verified")}</div>}
-            </div>
-          )}
+        <div className="iceq-settings-section">
+          <SafetyQr fingerprint={fingerprintStatus.fingerprint} />
         </div>
+      )}
+
+      {/* ── Verify a contact ───────────────────────────────────────── */}
+      <div className="iceq-settings-section">
+        <h3 className="text-sm font-semibold text-frozen">{i18n.t("security.verifyContact")}</h3>
+        <div className="flex gap-2">
+          <input
+            aria-label={i18n.t("security.contactUin")}
+            inputMode="numeric"
+            className="iceq-input flex-1 text-xs"
+            value={peerUin}
+            onChange={(event) => setPeerUin(event.target.value)}
+            placeholder={i18n.t("contacts.uinExample")}
+          />
+          <button type="button" className="iceq-btn-secondary text-xs" onClick={() => void inspectPeer()}>
+            {i18n.t("security.loadSafety")}
+          </button>
+        </div>
+        {peerError && <div role="alert" className="text-xs text-destructive">{peerError}</div>}
+        {peerSafety && (
+          <div className="mt-2 space-y-2">
+            <div className="break-all rounded border border-ice-border bg-deep-ice p-2 text-mono text-xs text-frozen select-all">
+              {peerSafety.number}
+            </div>
+            <SafetyQr fingerprint={peerSafety.number} />
+            {peerSafety.changed && (
+              <div role="alert" className="iceq-alert-warning text-xs">{i18n.t("security.identityChanged")}</div>
+            )}
+            {peerSafety.changed && (
+              <button type="button" className="iceq-btn-secondary text-xs w-full" onClick={async () => {
+                await acceptPeerIdentity(peerSafety.uin, peerSafety.identityKey, getActiveCryptoNamespace());
+                await inspectPeer();
+              }}>
+                {i18n.t("security.acceptIdentity")}
+              </button>
+            )}
+            {!peerSafety.verified && !peerSafety.changed && (
+              <button type="button" className="iceq-btn-primary text-xs w-full" onClick={async () => {
+                await verifyPeerIdentity(peerSafety.uin, peerSafety.identityKey, getActiveCryptoNamespace());
+                await inspectPeer();
+              }}>
+                {i18n.t("security.markVerified")}
+              </button>
+            )}
+            {peerSafety.verified && (
+              <div role="status" className="iceq-alert-success text-xs flex items-center gap-1.5">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="2.5 7 5.5 10 11.5 4"/></svg>
+                {i18n.t("security.verified")}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
+      {/* ── Panic PIN ──────────────────────────────────────────────── */}
       <PanicPinSettings />
 
-      <div className="iceq-settings-row">
-        <div className="iceq-settings-status">
-          <strong>{i18n.t("security.panicWipeTitle")}</strong>
-          <p>{i18n.t("security.panicWipeWarning")}</p>
-          <button type="button" disabled={panicBusy} onClick={openPanicWipe}>
-            {i18n.t("security.panicWipeAction")}
-          </button>
-          {panicError === i18n.t("security.panicWipeFailed") && <div role="alert">{panicError}</div>}
-        </div>
+      {/* ── Panic Wipe ─────────────────────────────────────────────── */}
+      <div className="iceq-settings-section border-destructive/30">
+        <h3 className="text-sm font-semibold text-destructive">{i18n.t("security.panicWipeTitle")}</h3>
+        <p className="text-xs text-mist">{i18n.t("security.panicWipeWarning")}</p>
+        <button
+          type="button"
+          ref={panicTriggerRef}
+          className="iceq-btn-destructive mt-2"
+          disabled={panicBusy}
+          onClick={openPanicWipe}
+        >
+          {i18n.t("security.panicWipeAction")}
+        </button>
+        {panicError === i18n.t("security.panicWipeFailed") && (
+          <div role="alert" className="mt-2 text-xs text-destructive">{panicError}</div>
+        )}
       </div>
 
+      {/* ── Recovery import ────────────────────────────────────────── */}
+      <div className="iceq-settings-section">
+        <h3 className="text-sm font-semibold text-frozen">{i18n.t("recovery.title")}</h3>
+        <p className="text-xs text-mist">{i18n.t("recovery.help")}</p>
+        <button type="button" className="iceq-btn-secondary mt-2" onClick={() => navigate("/recovery")}>
+          {i18n.t("recovery.importAction")}
+        </button>
+      </div>
+
+      {/* ── Local fingerprint ──────────────────────────────────────── */}
+      <div className="iceq-settings-section">
+        <h3 className="text-sm font-semibold text-frozen">{i18n.t("security.localFingerprint")}</h3>
+        <div className="break-all rounded border border-ice-border bg-deep-ice p-2 text-mono text-xs text-frozen select-all">
+          {renderFingerprint(fingerprintStatus, i18n.t)}
+        </div>
+        <p className="mt-1 text-xs text-mist-dim">{i18n.t("security.fingerprintHelp")}</p>
+      </div>
+
+      {/* ── Panic Wipe Confirmation Modal ──────────────────────────── */}
       {panicConfirmOpen && (
         <div
           className="iceq-modal-backdrop"
           role="dialog"
           aria-modal="true"
           aria-labelledby="panic-wipe-confirm-title"
+          ref={panicDialogRef}
           onClick={() => !panicBusy && setPanicConfirmOpen(false)}
         >
           <div className="iceq-modal" onClick={(e) => e.stopPropagation()}>
-            <h2 id="panic-wipe-confirm-title" className="text-lg font-semibold text-text">
+            <h2 id="panic-wipe-confirm-title" className="text-lg font-semibold text-destructive">
               {i18n.t("security.panicWipeAction")}
             </h2>
-            <p className="mt-1 text-sm text-text-2">{i18n.t("security.panicWipeConfirm")}</p>
+            <p className="mt-1 text-sm text-mist">{i18n.t("security.panicWipeConfirm")}</p>
 
-            <div className="mt-3 flex gap-2">
+            {/* Auth mode tabs */}
+            <div className="iceq-tabs mt-3">
               <button
                 type="button"
-                className={panicMode === "pin" ? "iceq-btn-primary text-xs" : "iceq-btn-secondary text-xs"}
+                className={`iceq-tab ${panicMode === "pin" ? "iceq-tab--active" : ""}`}
                 onClick={() => setPanicMode("pin")}
               >
                 {i18n.t("security.panicWipeEnterPin")}
               </button>
               <button
                 type="button"
-                className={panicMode === "passphrase" ? "iceq-btn-primary text-xs" : "iceq-btn-secondary text-xs"}
+                className={`iceq-tab ${panicMode === "passphrase" ? "iceq-tab--active" : ""}`}
                 onClick={() => setPanicMode("passphrase")}
               >
                 {i18n.t("setup.passphraseLabel")}
@@ -229,7 +285,7 @@ export function SecuritySettings(): JSX.Element {
 
             {panicMode === "pin" && (
               <div className="mt-3">
-                <label htmlFor="panic-wipe-pin" className="mb-1 block text-xs text-text-2">
+                <label htmlFor="panic-wipe-pin" className="text-label text-mist">
                   {i18n.t("security.panicWipeEnterPin")}
                 </label>
                 <input
@@ -239,42 +295,49 @@ export function SecuritySettings(): JSX.Element {
                   autoComplete="off"
                   maxLength={4}
                   pattern="[0-9]{4}"
-                  className="iceq-input"
+                  className="iceq-input mt-1"
                   value={panicPinInput}
                   onChange={(event) => setPanicPinInput(event.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
                   disabled={panicBusy}
                 />
-                <p className="mt-1 text-xs text-text-2">{i18n.t("security.panicWipeEnterPinHelp")}</p>
+                <p className="mt-1 text-xs text-mist-dim">{i18n.t("security.panicWipeEnterPinHelp")}</p>
               </div>
             )}
 
             {panicMode === "passphrase" && (
               <div className="mt-3">
-                <label htmlFor="panic-wipe-passphrase" className="mb-1 block text-xs text-text-2">
+                <label htmlFor="panic-wipe-passphrase" className="text-label text-mist">
                   {i18n.t("setup.passphraseInput")}
                 </label>
                 <input
                   id="panic-wipe-passphrase"
                   type="password"
                   autoComplete="off"
-                  className="iceq-input"
+                  className="iceq-input mt-1"
                   value={panicPassphraseInput}
                   onChange={(event) => setPanicPassphraseInput(event.target.value)}
                   disabled={panicBusy}
                 />
-                <p className="mt-1 text-xs text-text-2">{i18n.t("setup.createPassphraseHelp")}</p>
+                <p className="mt-1 text-xs text-mist-dim">{i18n.t("setup.createPassphraseHelp")}</p>
               </div>
             )}
 
-            {panicError && <div role="alert" className="mt-2 text-sm">{panicError}</div>}
+            {panicError && (
+              <div role="alert" className="iceq-alert-error mt-3 text-xs">{panicError}</div>
+            )}
 
             <div className="iceq-modal-buttons">
-              <button type="button" className="iceq-btn-secondary" disabled={panicBusy} onClick={() => setPanicConfirmOpen(false)}>
+              <button
+                type="button"
+                className="iceq-btn-secondary"
+                disabled={panicBusy}
+                onClick={() => setPanicConfirmOpen(false)}
+              >
                 {i18n.t("security.panicWipeCancel")}
               </button>
               <button
                 type="button"
-                className="iceq-btn-primary"
+                className="iceq-btn-destructive"
                 disabled={panicBusy}
                 onClick={() => {
                   setPanicBusy(true);
@@ -295,25 +358,6 @@ export function SecuritySettings(): JSX.Element {
           </div>
         </div>
       )}
-
-      <div className="iceq-settings-row">
-        <div className="iceq-settings-status">
-          <strong>{i18n.t("recovery.title")}</strong>
-          <p>{i18n.t("recovery.help")}</p>
-          <button type="button" onClick={() => navigate("/recovery")}>
-            {i18n.t("recovery.importAction")}
-          </button>
-        </div>
-      </div>
-
-      <div className="iceq-settings-row">
-        <div className="iceq-settings-status">
-          <strong>{i18n.t("security.localFingerprint")}</strong>
-          <div>{renderFingerprint(fingerprintStatus, i18n.t)}</div>
-          <p>{i18n.t("security.fingerprintHelp")}</p>
-        </div>
-      </div>
-
     </div>
   );
 }
@@ -326,10 +370,7 @@ function renderFingerprint(status: FingerprintStatus, translate: ReturnType<type
 
 async function fingerprintIdentityKey(publicKey: string): Promise<string> {
   const digest = new Uint8Array(
-    await globalThis.crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(publicKey),
-    ),
+    await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(publicKey)),
   );
   const groups: string[] = [];
   for (let i = 0; i < 8; i++) {

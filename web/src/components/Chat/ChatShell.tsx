@@ -1,19 +1,13 @@
 // src/components/Chat/ChatShell.tsx
 //
-// Top-level "what to render in the chat area" picker.
-// Renders the active conversation if one is selected,
-// otherwise a placeholder inviting the user to pick a
-// contact from the sidebar.
-//
-// Selection state is held in this component (not a global
-// store) because it's a UI-only concern. A real app
-// persists the active conversation id in the URL (e.g.
-// /app/dm/:uin) — that's a future step.
+// Conversation area picker — Encrypted Aurora.
+// Ice Bloom Q identity when no conversation is selected.
 
 import { ChatWindow } from "./ChatWindow";
 import { useChatStore } from "../../store/chatStore";
 import { useI18n } from "../../i18n";
 import { GroupChatWindow } from "../Groups/GroupChatWindow";
+import { IceQMark } from "../Brand/IceQMark";
 
 export function ChatShell(): JSX.Element {
   const i18n = useI18n();
@@ -21,10 +15,19 @@ export function ChatShell(): JSX.Element {
 
   if (!active) {
     return (
-      <div className="flex h-full items-center justify-center p-8 text-center text-text-2">
-        <div>
-          <div className="mb-2 text-lg text-text">{i18n.t("chat.welcome")}</div>
-          <div className="text-sm">{i18n.t("chat.selectContact")}</div>
+      <div className="flex h-full items-center justify-center p-8">
+        <div className="iceq-empty">
+          <div className="iceq-empty-icon" style={{ background: "transparent" }}>
+            <IceQMark size="lg" />
+          </div>
+          <div className="iceq-empty-title font-display">
+            {i18n.t("chat.welcome")}
+          </div>
+          <p className="iceq-empty-text mt-1 max-w-xs">
+            {i18n.t("chat.selectContact")}
+          </p>
+          {/* Secure channel motif below empty state */}
+          <div className="mt-6 w-40 secure-channel" data-secure="true" />
         </div>
       </div>
     );

@@ -1,8 +1,7 @@
 // src/components/Contacts/ContactItem.tsx
 //
-// A single contact row. Shows avatar, name, presence dot,
-// and (optionally) the last message preview if the chat
-// store knows about this conversation.
+// Single contact row — Arctic Signal design.
+// Avatar + name + presence dot + last message preview + unread badge.
 
 import { useContactStore } from "../../store/contactStore";
 import { useChatStore } from "../../store/chatStore";
@@ -40,27 +39,35 @@ export function ContactItem({ contact, onClick }: ContactItemProps): JSX.Element
         }
         onClick?.();
       }}
-      className="flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-surface focus:bg-surface focus:outline-none"
+      className="flex w-full items-center gap-3 px-3 py-2.5 text-left transition-all hover:bg-cobalt-hover/30 focus:bg-cobalt-hover/30 focus:outline-none rounded-lg mx-1.5 my-0.5"
     >
-      <div className="relative h-9 w-9 shrink-0 rounded-full bg-surface">
-        <div className="flex h-full w-full items-center justify-center rounded-full bg-border text-sm font-medium text-text">
+      <div className="relative shrink-0">
+        <div
+          className="iceq-avatar iceq-avatar--md"
+          style={{
+            background: status === "online"
+              ? "linear-gradient(135deg, rgba(76,225,161,0.2), rgba(89,216,255,0.1))"
+              : "linear-gradient(135deg, rgba(139,108,255,0.15), rgba(26,42,80,0.4))",
+            color: status === "online" ? "#4CE1A1" : "#9EADCB",
+          }}
+        >
           {initial}
         </div>
         <PresenceDot status={status} />
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <div className="min-w-0 flex-1 truncate text-sm font-medium text-text">
+          <div className="min-w-0 flex-1 truncate text-sm font-medium text-frozen">
             {contact.nickname ?? contact.username}
           </div>
           {unreadCount > 0 && (
-            <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-accent px-1.5 py-0.5 text-[10px] font-semibold leading-none text-bg">
-              {unreadCount}
+            <span className="iceq-badge--count">
+              {unreadCount > 99 ? "99+" : unreadCount}
             </span>
           )}
         </div>
         {preview && (
-          <div className="truncate text-xs text-text-2">{preview}</div>
+          <div className="truncate text-xs text-mist">{preview}</div>
         )}
       </div>
     </button>
