@@ -168,7 +168,7 @@ test("two real accounts exchange encrypted messages and an authenticated PDF", a
     await expect(receivedFile).toBeVisible({ timeout: 45_000 });
 
     const downloadPromise = b.page.waitForEvent("download");
-    await b.page.getByRole("link", { name: /download and decrypt/i }).click();
+    await b.page.getByRole("link", { name: /^download$/i }).click();
     const download = await downloadPromise;
     const stream = await download.createReadStream();
     const chunks: Buffer[] = [];
