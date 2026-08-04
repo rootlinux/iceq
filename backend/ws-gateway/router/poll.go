@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/iceq/iceq/shared/middleware"
+	"github.com/iceq/iceq/shared/models"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -102,7 +103,7 @@ func NewRedisPollStore(rdb *redis.Client) *RedisPollStore {
 }
 
 func (s *RedisPollStore) Enqueue(ctx context.Context, uin int64, envelope []byte) error {
-	if uin <= 0 || len(envelope) == 0 || !json.Valid(envelope) {
+	if uin <= 0 || len(envelope) == 0 || !json.Valid(envelope) || models.IsReservedServerControlEnvelope(envelope) {
 		return errors.New("invalid poll envelope")
 	}
 	var wire struct {
@@ -178,7 +179,11 @@ ready:
 	envelopes := make([]json.RawMessage, 0, req.Limit)
 	messageIDs := make([]string, 0, len(items))
 	for _, item := range items {
-		if !json.Valid(item.Envelope) {
+		if !json.Valid(item.Envelope) || models.IsReservedServerControlEnvelope(item.Envelope) {
+			// Old or externally-poisoned queue entries must never become an
+			// irreversible browser-local wipe. Advance past them without
+			// returning their payload to the client.
+			state.After = item.StreamID
 			continue
 		}
 		envelopes = append(envelopes, json.RawMessage(item.Envelope))

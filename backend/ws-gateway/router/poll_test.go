@@ -55,6 +55,27 @@ func TestPollReadsNonDestructivelyAndNextCursorAcknowledgesPreviousPage(t *testi
 	}
 }
 
+func TestPollRejectsReservedAccountWipedControl(t *testing.T) {
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	store := NewRedisPollStore(rdb)
+	ctx := context.Background()
+	reserved := []byte(`{"type":"account_wiped","id":"00000000-0000-4000-8000-000000000003","ts":1,"payload":{}}`)
+
+	if err := store.Enqueue(ctx, 42, reserved); err == nil {
+		t.Fatal("reserved terminal control was accepted into poll storage")
+	}
+	scope, _ := DirectRecipientScope(42)
+	items, err := store.acceptance.ReadAcceptedAfter(ctx, scope, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("reserved control persisted in poll storage: %#v", items)
+	}
+}
+
 func (s *pollStoreStub) Poll(_ context.Context, req PollRequest) (PollResult, error) {
 	s.req = req
 	return s.result, s.err

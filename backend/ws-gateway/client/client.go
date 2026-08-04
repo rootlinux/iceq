@@ -37,6 +37,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -242,11 +243,16 @@ type Client struct {
 
 	// done is closed by the readLoop when the connection
 	// ends. The writeLoop selects on it to break out of its
-	// range. closeOnce guards the close so a write error in
+	// range. shutdownOnce guards the close so a write error in
 	// the writeLoop and a read error in the readLoop can
 	// both signal shutdown without panicking.
-	done      chan struct{}
-	closeOnce func()
+	done                    chan struct{}
+	shutdownOnce            sync.Once
+	socketCloseOnce         sync.Once
+	wipeTerminateOnce       sync.Once
+	writeMu                 sync.Mutex
+	closeSocketFn           func(websocket.StatusCode, string) error
+	writeWipeNotificationFn func() error
 
 	// deps is the shared per-process bundle.
 	deps Deps
@@ -262,6 +268,7 @@ type Client struct {
 	// process's. May be nil if the Subscribe call failed —
 	// the connection still works for direct messages, it
 	// just won't receive presence-notify fan-out.
+	presenceMu  sync.Mutex
 	presenceSub *nats.Subscription
 }
 
@@ -280,12 +287,73 @@ func (c *Client) Deps() Deps { return c.deps }
 // which case the message is dropped and a future message will
 // likely fail too, triggering a read-deadline close).
 func (c *Client) TrySend(b []byte) bool {
+	if models.IsReservedServerControlEnvelope(b) {
+		return false
+	}
 	select {
 	case c.send <- b:
 		return true
 	default:
 		return false
 	}
+}
+
+// CloseWiped immediately terminates this authenticated connection with the
+// protocol's irreversible-account-deletion close code. It is safe to invoke
+// concurrently with the read/write loops; websocket.Conn.Close and shutdown
+// are both idempotent for this lifecycle.
+func (c *Client) CloseWiped() {
+	c.terminateWiped("account_wiped")
+}
+
+func (c *Client) terminateWiped(reason string) {
+	c.wipeTerminateOnce.Do(func() {
+		c.shutdown()
+		if err := c.writeWipeNotification(); err != nil {
+			log.Printf("[ws-gateway] terminal wipe notification write failed: %v", err)
+		}
+		c.closeSocket(CloseCodeWiped, reason)
+	})
+}
+
+// writeWipeNotification sends an authenticated terminal control frame before
+// the close handshake. Chromium can surface a proxied custom close as 1006;
+// the explicit frame ensures every supported browser still performs the same
+// fail-closed local destruction. It carries no user data or secret material.
+func (c *Client) writeWipeNotification() error {
+	if c.writeWipeNotificationFn != nil {
+		return c.writeWipeNotificationFn()
+	}
+	if c.ws == nil {
+		return nil
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return writeAccountWipedEnvelope(c.ws)
+}
+
+func writeAccountWipedEnvelope(ws *websocket.Conn) error {
+	envelope, err := models.NewEnvelope(models.EnvelopeTypeAccountWiped, map[string]any{})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return wsjson.Write(ctx, ws, envelope)
+}
+
+// closeSocket sends at most one protocol close frame. A wipe notification can
+// race the read-loop exit and ServeHTTP's final normal-close path; allowing
+// both frames onto the wire makes Chromium report an abnormal 1006 instead of
+// the security-significant 4403 code.
+func (c *Client) closeSocket(code websocket.StatusCode, reason string) {
+	c.socketCloseOnce.Do(func() {
+		if c.closeSocketFn != nil {
+			_ = c.closeSocketFn(code, reason)
+			return
+		}
+		_ = c.ws.Close(code, reason)
+	})
 }
 
 // ----------------------------------------------------------------------------
@@ -379,10 +447,12 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 		// Fail-closed: a Redis outage on the wipe check must
 		// NOT let a wiped user keep talking. The contract
 		// requires this. (See ws-gateway/CONTRACT.md.)
+		writeAccountWipedEnvelope(ws)
 		_ = ws.Close(CloseCodeWiped, "wipe_check_unavailable")
 		return
 	}
 	if wiped > 0 {
+		writeAccountWipedEnvelope(ws)
 		_ = ws.Close(CloseCodeWiped, "account_wiped")
 		return
 	}
@@ -396,7 +466,6 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 		done: done,
 		deps: deps,
 	}
-	c.closeOnce = syncCloseOnce(done)
 	if err := deps.Hub.Register(c); err != nil {
 		if errors.Is(err, ErrHubTooManyConnections) {
 			http.Error(w, "too many connections", http.StatusTooManyRequests)
@@ -404,6 +473,26 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+
+	// Close the check/register race: if the wipe committed after the initial
+	// Redis check but before this connection entered the hub, it could have
+	// missed the ephemeral account.wiped event. Recheck the durable marker or
+	// permanent user-row deletion after registration and before auth_ok,
+	// presence publication, queue draining, or application traffic.
+	postRegisterCtx, postRegisterCancel := context.WithTimeout(context.Background(), time.Second)
+	wipedOrMissing, wipeErr := deps.Manager.IsAccountWipedOrMissing(postRegisterCtx, uin)
+	postRegisterCancel()
+	if wipeErr != nil || wipedOrMissing {
+		deps.Hub.Unregister(c)
+		c.terminateWiped("account_wiped")
+		return
+	}
+	select {
+	case <-c.done:
+		deps.Hub.Unregister(c)
+		return
+	default:
 	}
 
 	authOK, err := models.NewEnvelope("auth_ok", map[string]any{
@@ -454,7 +543,7 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 			// updates for contacts. We log it and move on.
 			log.Printf("[ws-gateway] presence notify subscribe: %v", err)
 		} else {
-			c.presenceSub = sub
+			c.setPresenceSub(sub)
 		}
 	}
 
@@ -487,7 +576,7 @@ func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
 	if presenceEnabled {
 		publishPresence(deps.NATS, uin, models.PresenceStatusOffline)
 	}
-	_ = ws.Close(websocket.StatusNormalClosure, "bye")
+	c.closeSocket(websocket.StatusNormalClosure, "bye")
 }
 
 // ----------------------------------------------------------------------------
@@ -541,7 +630,7 @@ func (c *Client) readLoop() {
 		durablyWiped, derr := c.deps.Manager.IsAccountWiped(wipeCtx, c.uin)
 		if derr != nil || durablyWiped {
 			wipeCancel()
-			_ = c.ws.Close(CloseCodeWiped, "account_wiped")
+			c.terminateWiped("account_wiped")
 			return
 		}
 		wiped, werr := c.deps.Redis.Exists(wipeCtx, wipeCheckPrefix+strconv.FormatInt(c.uin, 10)).Result()
@@ -551,11 +640,11 @@ func (c *Client) readLoop() {
 			// let a wiped user keep talking. Closing
 			// here is the same posture as the connect-time
 			// check.
-			_ = c.ws.Close(CloseCodeWiped, "wipe_check_unavailable")
+			c.terminateWiped("wipe_check_unavailable")
 			return
 		}
 		if wiped > 0 {
-			_ = c.ws.Close(CloseCodeWiped, "account_wiped")
+			c.terminateWiped("account_wiped")
 			return
 		}
 
@@ -564,7 +653,7 @@ func (c *Client) readLoop() {
 		// budget before being kicked.
 		allowed, rateErr := c.checkRateLimit()
 		if rateErr != nil {
-			_ = c.ws.Close(websocket.StatusTryAgainLater, "rate_limit_unavailable")
+			c.closeSocket(websocket.StatusTryAgainLater, "rate_limit_unavailable")
 			return
 		}
 		if !allowed {
@@ -625,7 +714,9 @@ func (c *Client) writeLoop() {
 			// forcing every consumer through a Blob→
 			// string conversion is needless friction.
 			wctx, wcancel := context.WithTimeout(context.Background(), 5*time.Second)
+			c.writeMu.Lock()
 			err := c.ws.Write(wctx, websocket.MessageText, frame)
+			c.writeMu.Unlock()
 			wcancel()
 			if err != nil {
 				// Write error: the connection is
@@ -646,41 +737,29 @@ func (c *Client) writeLoop() {
 // ----------------------------------------------------------------------------
 
 func (c *Client) shutdown() {
-	c.closeOnce()
-	// Tear down the per-connection presence-notify
-	// subscription. We do this OUTSIDE closeOnce so the
-	// subscription teardown is independent of the done-channel
-	// signal (any code path that drops the subscription should
-	// drop the connection, and vice versa). Unsubscribe is
-	// idempotent on a nil receiver / nil sub so a Subscribe
-	// failure earlier in the lifecycle is safe here.
-	if c.presenceSub != nil {
-		_ = c.presenceSub.Unsubscribe()
+	c.shutdownOnce.Do(func() {
+		close(c.done)
+		// Tear down the per-connection presence-notify subscription in
+		// the same once-guard as the done channel. A wipe notification,
+		// read error and write error may all arrive concurrently.
+		c.presenceMu.Lock()
+		sub := c.presenceSub
 		c.presenceSub = nil
-	}
+		c.presenceMu.Unlock()
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
+	})
 }
 
-// syncCloseOnce returns a closure that closes ch on the first
-// call and is a no-op on every subsequent call. We implement
-// this locally rather than using sync.Once because we want the
-// call site to be a one-liner (c.closeOnce()) and we want
-// the close to happen on a non-error path, not just on
-// success.
-//
-// Storing the function in the struct also avoids the
-// "captured by value" hazard a sync.Once value would have.
-func syncCloseOnce(ch chan struct{}) func() {
-	var closed bool
-	var mu = make(chan struct{}, 1)
-	mu <- struct{}{} // pre-fill the semaphore
-	return func() {
-		<-mu
-		defer func() { mu <- struct{}{} }()
-		if closed {
-			return
-		}
-		closed = true
-		close(ch)
+func (c *Client) setPresenceSub(sub *nats.Subscription) {
+	c.presenceMu.Lock()
+	defer c.presenceMu.Unlock()
+	select {
+	case <-c.done:
+		_ = sub.Unsubscribe()
+	default:
+		c.presenceSub = sub
 	}
 }
 

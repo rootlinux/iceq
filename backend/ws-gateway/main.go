@@ -39,6 +39,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -179,7 +180,7 @@ func main() {
 	// msg.direct.*, msg.group.*, and notification.* are dead letters —
 	// the auth-service's publish to notification.<uin> reaches nobody,
 	// and contact requests/acceptances are invisible until manual reload.
-	if err := startNATSSubscribers(nc, h, pgPool); err != nil {
+	if err := startNATSSubscribers(nc, h, pgPool, mgr); err != nil {
 		log.Fatalf("nats subscribers: %v", err)
 	}
 
@@ -306,7 +307,21 @@ func main() {
 // subscriptions live for the lifetime of the process; the
 // returned *natsclient.Client's Drain handles the teardown
 // during shutdown.
-func startNATSSubscribers(nc *natsclient.Client, h *hub.Hub, pg *pgxpool.Pool) error {
+func startNATSSubscribers(nc *natsclient.Client, h *hub.Hub, pg *pgxpool.Pool, wipeChecker wipedAccountStateChecker) error {
+	// 0. account.wiped.* — ephemeral control-plane notification. It is a
+	// Core NATS subject outside every JetStream delivery stream, so it leaves
+	// no stored message or offline queue. The auth-service publishes it only
+	// after the destructive PG transaction commits.
+	if _, err := nc.Subscribe("account.wiped.*", func(m *natsMsg) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := handleAccountWipedNotification(ctx, h, wipeChecker, m.Subject); err != nil {
+			log.Printf("[ws-gateway] wipe notification verification failed")
+		}
+	}); err != nil {
+		return err
+	}
+
 	// 1. msg.direct.* — fan out to the recipient's local
 	//    connection(s), or enqueue if offline.
 	if _, err := nc.Subscribe("msg.direct.*", func(m *natsMsg) {
@@ -386,6 +401,41 @@ func startNATSSubscribers(nc *natsclient.Client, h *hub.Hub, pg *pgxpool.Pool) e
 	}
 
 	return nil
+}
+
+type wipedConnectionCloser interface {
+	CloseWiped(uin int64)
+}
+
+type wipedAccountStateChecker interface {
+	IsAccountWipedOrMissing(ctx context.Context, uin int64) (bool, error)
+}
+
+// handleAccountWipedNotification validates the single-token UIN suffix before
+// touching the hub. Keeping this parsing in a small helper makes malformed or
+// adversarial control subjects a tested no-op.
+func handleAccountWipedNotification(
+	ctx context.Context,
+	closer wipedConnectionCloser,
+	checker wipedAccountStateChecker,
+	subject string,
+) (bool, error) {
+	if !strings.HasPrefix(subject, "account.wiped.") {
+		return false, nil
+	}
+	uin, ok := parseTailUIN(subject, "account.wiped.")
+	if !ok || uin <= 0 {
+		return false, nil
+	}
+	verified, err := checker.IsAccountWipedOrMissing(ctx, uin)
+	if err != nil {
+		return false, err
+	}
+	if !verified {
+		return false, nil
+	}
+	closer.CloseWiped(uin)
+	return true, nil
 }
 
 // ----------------------------------------------------------------------------

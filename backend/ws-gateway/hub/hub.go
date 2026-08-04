@@ -41,6 +41,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iceq/iceq/shared/models"
 	"github.com/iceq/iceq/ws-gateway/client"
 	"github.com/redis/go-redis/v9"
 )
@@ -197,6 +198,24 @@ func (h *Hub) Unregister(c *client.Client) {
 	h.clients.Store(uin, next)
 }
 
+// CloseWiped closes every live connection for uin without creating an
+// undelivered queue entry. The slice is a snapshot; each Client owns its own
+// idempotent shutdown and will unregister through the normal ServeHTTP path.
+func (h *Hub) CloseWiped(uin int64) {
+	if uin <= 0 {
+		return
+	}
+	raw, ok := h.clients.Load(uin)
+	if !ok {
+		return
+	}
+	for _, c := range raw.([]*client.Client) {
+		// Close waits briefly for the WebSocket close handshake. Do not block
+		// the Core NATS subscription callback or another user's wipe event.
+		go c.CloseWiped()
+	}
+}
+
 // ----------------------------------------------------------------------------
 // Send. The single-target fan-out primitive. Writes envelope to
 // every active client for uin, OR enqueues to Redis if no
@@ -229,6 +248,12 @@ func (h *Hub) Send(ctx context.Context, uin int64, envelope []byte) error {
 		return nil
 	}
 	if len(envelope) == 0 {
+		return nil
+	}
+	if models.IsReservedServerControlEnvelope(envelope) {
+		// account_wiped is an authenticated terminal control, not ordinary
+		// application data. Only Client.CloseWiped may emit it after the
+		// gateway verifies durable account state; never persist or fan it out.
 		return nil
 	}
 	// Polling has its own bounded stream. It is intentionally independent of
@@ -270,7 +295,7 @@ func (h *Hub) Send(ctx context.Context, uin int64, envelope []byte) error {
 // queue. Durable JetStream consumption first commits the envelope to the
 // recipient Redis stream atomically; this method is only the low-latency wakeup.
 func (h *Hub) SendLive(uin int64, envelope []byte) {
-	if uin <= 0 || len(envelope) == 0 {
+	if uin <= 0 || len(envelope) == 0 || models.IsReservedServerControlEnvelope(envelope) {
 		return
 	}
 	raw, ok := h.clients.Load(uin)
