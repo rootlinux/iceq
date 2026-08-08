@@ -14,7 +14,7 @@
 # ----------------------------------------------------------------------------
 
 # ---- Stage 1: builder --------------------------------------------------------
-FROM golang:1.25.12-alpine AS builder
+FROM golang:1.26.5-alpine AS builder
 WORKDIR /src
 
 # Module download layer. The go.mod / go.sum live at backend/go.mod
