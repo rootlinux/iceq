@@ -51,7 +51,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     -o /out/key-service ./key-service
 
 # ---- Stage 2: runtime --------------------------------------------------------
-FROM alpine:3.20 AS runtime
+FROM alpine:3.24 AS runtime
 
 # ca-certificates is the only thing we need at runtime: the
 # service talks to Postgres and Redis over plain TCP, but
