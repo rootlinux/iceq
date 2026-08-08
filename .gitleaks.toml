@@ -1,0 +1,15 @@
+# Gitleaks configuration for IceQ.
+# Extends the default ruleset — only additions and overrides are listed.
+
+# ---------------------------------------------------------------------------
+# Allowlist: known test fixtures and example values that match secret patterns
+# but are not real credentials.
+# ---------------------------------------------------------------------------
+[allowlist]
+  description = "Known test fixtures and example values"
+
+  # Test UUID used throughout authorization_test.go as mock object keys.
+  # This is the well-known RFC 9562 example UUID, not a real secret.
+  regexes = [
+    '''123e4567-e89b-12d3-a456-426614174000''',
+  ]
