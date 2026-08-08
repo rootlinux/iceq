@@ -12,19 +12,19 @@ Last reviewed: 2026-08-08 (re-verified). “Complete” means the scoped reposit
 | 5. Frontend | Complete for scoped product phase | EN/TR typed catalogs, accessibility/source policies, safety QR, identity warnings, privacy/disappearing controls, PWA cache restrictions, WS plus polling fallback, group Sender Keys, and encrypted DM/group files are covered by `web/tests`. | Production browser/device acceptance remains outstanding; no-JS pages intentionally do not provide E2EE messaging. Push notifications are not implemented. |
 | 6. Delivery/release | Partial | The committed Security CI definition covers Go test/vet/govulncheck, web test/typecheck/build/audit, Compose config, and secret scanning. `docs/operator-runbook.md` covers release, backups, incidents, and rollback. Local results are recorded separately below and do not imply that CI or runtime gates ran. | Production deploy and real-user clearnet acceptance are explicitly outstanding. Docker-backed smoke is a separate runtime gate. Tor follows only after acceptance. |
 
-## Local verification evidence — 2026-08-08 (re-verified)
+## Local verification evidence — 2026-08-08 (re-verified with Go 1.25.12)
 
 | Gate | Exact result |
 |---|---|
-| `(cd backend && go test ./...)` | Exit 0. 19 packages with tests passed; 7 packages with no test files. |
-| `(cd backend && go vet ./...)` | Exit 0. |
-| `(cd backend && go test -race ./...)` | Not re-run locally (acceptance stack required for integration-tagged tests). Previously: race detector enabled; no races reported. |
-| `govulncheck ./...` | Not run locally (binary unavailable). CI workflow installs pinned `v1.1.4` and runs this gate on every push/PR. |
+| `(cd backend && go test ./...)` | Exit 0. 19 packages with tests passed; 7 packages with no test files. (Go 1.25.12) |
+| `(cd backend && go vet ./...)` | Exit 0. (Go 1.25.12) |
+| `(cd backend && go test -race ./...)` | Exit 0. All 19 packages passed; no races reported. (Go 1.25.12) |
+| `govulncheck ./...` | Exit 0. No reachable known vulnerabilities reported by govulncheck v1.6.0 for the verified toolchain (Go 1.25.12). The prior Go 1.25.3 toolchain had 16 reachable stdlib vulnerabilities which are all resolved in Go 1.25.12. |
 | `(cd web && npm test)` | Exit 0: **393 tests passed**, 0 failed/skipped/cancelled (previously 322 on 2026-07-27). |
 | `(cd web && npm run typecheck)` | Exit 0. |
 | `(cd web && npm run build)` | Exit 0. Pre-existing vendor `curveasm.js` compatibility warnings and Vite dynamic-import hints remain; build exit is zero. |
 | `(cd web && npm audit --audit-level=moderate)` | Exit 1 (2 moderate react-router component entries covering 3 advisory identifiers). See React Router security gate below. No high or critical. `react-router-dom@6.30.4` (exact), `react-router@6.30.4` (transitive). |
-| Playwright E2E | Not re-run locally (requires Docker acceptance stack). Previously 48/48 across Chromium desktop, Chromium Android, WebKit desktop, WebKit iOS. |
+| Playwright E2E | **68/68 passed** across Chromium desktop, Chromium Android, WebKit desktop, and WebKit iOS (re-verified 2026-08-08). |
 | `./deploy/scripts/check-compose-config.sh` | Exit 0 (re-verified). |
 | Five-storage Panic Wipe acceptance | Not re-run locally (requires Docker acceptance stack). Previously: Exit 0 across PostgreSQL, Redis, ScyllaDB, NATS JetStream, and MinIO. |
 | Disposable migration rehearsal | Not re-run locally. Previously: Exit 0 through migration 017. Backup/restore rehearsal remains pending. |
@@ -66,7 +66,9 @@ Migrations 014–017 are additive and guarded with `IF NOT EXISTS`:
 ```bash
 (cd backend && go test ./...)
 (cd backend && go vet ./...)
-# govulncheck is CI-only (pinned v1.1.4 in security-ci.yml); not a local gate
+(cd backend && go test -race ./...)
+# govulncheck requires: go install golang.org/x/vuln/cmd/govulncheck@latest
+(cd backend && govulncheck ./...)
 (cd web && npm test)
 (cd web && npm run typecheck)
 (cd web && npm run build)

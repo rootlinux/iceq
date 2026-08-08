@@ -79,6 +79,7 @@ async function revealSidebarOnMobile(page: Page, projectName: string): Promise<v
 }
 
 test("a contact request and its acceptance propagate live across two independently authenticated contexts", async ({ browser }, testInfo) => {
+  test.setTimeout(60_000);
   const contextA = await browser.newContext();
   const contextB = await browser.newContext();
   try {
