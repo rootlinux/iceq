@@ -12,7 +12,7 @@ require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/minio/minio-go/v7 v7.2.0
 	github.com/nats-io/nats.go v1.52.0
-	github.com/redis/go-redis/v9 v9.20.0
+	github.com/redis/go-redis/v9 v9.22.0
 	golang.org/x/crypto v0.51.0
 	nhooyr.io/websocket v1.8.17
 )
