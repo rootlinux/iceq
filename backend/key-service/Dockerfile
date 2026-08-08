@@ -20,7 +20,7 @@
 # ----------------------------------------------------------------------------
 
 # ---- Stage 1: builder --------------------------------------------------------
-FROM golang:1.25.12-alpine AS builder
+FROM golang:1.26.5-alpine AS builder
 WORKDIR /src
 
 # Cache the module download layer. Copying go.mod/go.sum first and
