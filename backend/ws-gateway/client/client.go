@@ -36,7 +36,9 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -186,6 +188,10 @@ type Deps struct {
 	MessageDeduper      MessageDeduper
 	RecipientQueueAcker RecipientQueueAcker
 	WakeAccepted        func(context.Context, int64) error
+	// AllowedOrigins is the set of origins permitted to open a WebSocket
+	// connection. An empty list allows all origins (development mode).
+	// In production this must be set to the trusted clearnet origin(s).
+	AllowedOrigins []string
 }
 
 type RecipientQueueAcker interface {
@@ -368,16 +374,24 @@ func (c *Client) closeSocket(code websocket.StatusCode, reason string) {
 // context drives cancellation: if the client disconnects before
 // the upgrade, r.Context() is cancelled and we abort.
 func ServeHTTP(deps Deps, w http.ResponseWriter, r *http.Request) {
+	// Origin validation for browser-initiated WebSocket connections.
+	// Non-browser clients (mobile apps, native tools) do not send an
+	// Origin header and are allowed through — the in-band JWT access-
+	// token authentication is the real security gate for those clients.
+	// Browser connections with a missing or malformed Origin are rejected
+	// (fail-closed) unless the allowed-origins list is empty (dev mode).
+	if !isOriginAllowed(deps.AllowedOrigins, r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+
 	// Accept the WebSocket upgrade. The nhooyr library hides
 	// the Sec-WebSocket-Accept handshake and the HTTP/1.1
 	// upgrade response; we just call Accept and get a *Conn.
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// No Origin check at the gateway. The web client and
-		// the mobile client both connect directly; an Origin
-		// check would block the mobile app, and Caddy already
-		// sets a CSP that mitigates the relevant XSRF risk.
-		// If a deployment needs a stricter policy, the
-		// InsecureSkipVerify flag is the single switch.
+		// Origin is already validated above — skip the library's
+		// default Host-based check which is too restrictive for
+		// multi-domain deployments.
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
@@ -929,3 +943,65 @@ func newUUID() string { return uuid.NewString() }
 // CloseCodeAuthTimeout is the value; this is a typed error
 // for matching.
 var errAuthTimeout = errors.New("auth timeout")
+
+// ----------------------------------------------------------------------------
+// Origin validation for cross-site WebSocket hijacking defence.
+// ----------------------------------------------------------------------------
+
+// isOriginAllowed returns true if the request's Origin header is permitted.
+//
+// Policy:
+//   - No allowed origins configured (empty list): allow everything (dev mode).
+//   - Origin header present + matches a configured origin: allow.
+//   - Origin header present + no match: reject (fail-closed).
+//   - Origin header absent (non-browser client): allow — the in-band JWT
+//     access-token authentication is the real gate.
+//   - Origin header malformed (unparseable URL): reject.
+func isOriginAllowed(allowed []string, r *http.Request) bool {
+	if len(allowed) == 0 {
+		// Development mode: no origins configured, allow everything.
+		return true
+	}
+
+	// Distinguish "no Origin header" (non-browser client) from
+	// "Origin header present but empty/whitespace" (malformed).
+	originValues, hasOrigin := r.Header["Origin"]
+	if !hasOrigin || len(originValues) == 0 {
+		// Non-browser client (mobile app, native tool, curl).
+		// These clients authenticate via the in-band JWT access token;
+		// the Origin check is only meaningful for browser contexts.
+		return true
+	}
+	origin := strings.TrimSpace(originValues[0])
+	if origin == "" {
+		// Header is present but empty or whitespace-only.
+		// Browsers never send this; treat as malformed.
+		return false
+	}
+
+	// Normalise: strip trailing slash so "https://iceq.space/" and
+	// "https://iceq.space" are treated as the same origin.
+	origin = strings.TrimSuffix(origin, "/")
+
+	// Reject obviously malformed origins that would never match.
+	if origin == "null" {
+		return false
+	}
+
+	// Verify the origin is a parseable absolute URL with a scheme and host.
+	// Browsers always send a well-formed Origin header; a parse failure
+	// indicates a malformed or adversarial request.
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+
+	for _, a := range allowed {
+		a = strings.TrimSuffix(strings.TrimSpace(a), "/")
+		if a == origin {
+			return true
+		}
+	}
+
+	return false
+}

@@ -77,9 +77,20 @@ type config struct {
 	JWTSecret       string
 	PostgresDSN     string
 	ShutdownTimeout time.Duration
+	AllowedOrigins  []string
 }
 
 func loadConfig() config {
+	origins := envOr("ICEQ_WS_ALLOWED_ORIGINS", "")
+	var allowed []string
+	if origins != "" {
+		for _, o := range strings.Split(origins, ",") {
+			o = strings.TrimSpace(o)
+			if o != "" {
+				allowed = append(allowed, o)
+			}
+		}
+	}
 	return config{
 		Port:            envOr("PORT", "8082"),
 		NATSURL:         envOr("ICEQ_NATS_URL", "nats://nats:4222"),
@@ -88,6 +99,7 @@ func loadConfig() config {
 		JWTSecret:       envOr("ICEQ_JWT_SECRET", ""),
 		PostgresDSN:     envOr("ICEQ_PG_DSN", "postgres://postgres:postgres@postgres:5432/iceq?sslmode=disable"),
 		ShutdownTimeout: 15 * time.Second,
+		AllowedOrigins:  allowed,
 	}
 }
 
@@ -193,6 +205,7 @@ func main() {
 		PG:                  pgPool,
 		Dispatch:            router.Dispatch,
 		RecipientQueueAcker: acceptanceStore,
+		AllowedOrigins:      cfg.AllowedOrigins,
 		WakeAccepted: func(ctx context.Context, uin int64) error {
 			return replayAccepted(ctx, acceptanceStore, h, uin)
 		},

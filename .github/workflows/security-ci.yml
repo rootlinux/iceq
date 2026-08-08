@@ -2,7 +2,7 @@ name: Security CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, release/clearnet-rc1-public]
   pull_request:
   workflow_dispatch:
 

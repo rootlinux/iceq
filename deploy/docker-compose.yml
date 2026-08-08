@@ -505,7 +505,14 @@ services:
   # ==========================================================================
   tor:
     profiles: ["tor"]
-    image: goldy/tor-hidden-service:latest
+    # goldy/tor-hidden-service was last pushed 2023-01-08 (Tor 0.4.7.12).
+    # The image is pinned to the latest versioned tag to avoid :latest drift.
+    # Tor is disabled by default (profiles: ["tor"]) and deferred until
+    # clearnet acceptance. A project-controlled replacement (deploy/Dockerfile.tor)
+    # based on Alpine's tor package is available when the upstream image
+    # becomes unsuitable. Do not enable Tor in production without operator
+    # rehearsal and external onion reachability verification.
+    image: goldy/tor-hidden-service:v0.4.7.12-54c0e54
     container_name: iceq-tor
     restart: unless-stopped
     networks:
@@ -646,6 +653,7 @@ services:
       ICEQ_REDIS_ADDR: redis:6379
       ICEQ_NATS_URL: nats://nats:4222
       PORT: 8082
+      ICEQ_WS_ALLOWED_ORIGINS: ${ICEQ_WS_ALLOWED_ORIGINS:-}
     depends_on:
       postgres:
         condition: service_healthy

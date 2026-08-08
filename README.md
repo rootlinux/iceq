@@ -13,7 +13,7 @@
 
 </div>
 
-IceQ is a self-hostable encrypted messenger. Direct messages use Signal Protocol primitives (X3DH + Double Ratchet) and groups use client-side Sender Keys — the server only ever receives ciphertext. It ships as a set of independent Go microservices behind Caddy, a React/TypeScript PWA frontend, and an opt-in Tor hidden-service profile, with a panic-wipe feature that durably erases an account across every storage layer on demand.
+IceQ is a self-hostable encrypted messenger. Direct messages use Signal Protocol primitives (X3DH + Double Ratchet) and groups use client-side Sender Keys — message and attachment content is end-to-end encrypted so the server stores and relays ciphertext for those payloads. It ships as a set of independent Go microservices behind Caddy, a React/TypeScript PWA frontend, and an opt-in Tor hidden-service profile, with a panic-wipe feature that durably erases an account across every storage layer on demand.
 
 The server remains trusted for key-bundle distribution, membership, routing, availability, metadata handling, and delivery of the web application itself — see [E2EE Design](#e2ee-design) and the [threat model](docs/threat-model.md) for exactly what is and isn't covered. **The implementation has not yet received an independent cryptographic audit** — see [Security Status](docs/security-status.md) before any production use.
 

@@ -245,21 +245,25 @@ type AuthUser struct {
 }
 
 // AuthTokens is the frontend-facing token envelope.
+// RefreshToken is excluded from JSON serialization: it is delivered
+// exclusively through the HttpOnly Secure SameSite=Strict cookie so
+// JavaScript cannot read the long-lived credential. The access token
+// remains readable for Bearer-header REST calls and WebSocket auth.
 type AuthTokens struct {
 	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
+	RefreshToken string `json:"-"`
 }
 
 // LoginResponse is the success body of POST /api/auth/login.
-// Both tokens are returned so the client can use the access token
-// immediately and stash the refresh token for the next 7 days.
+// The access token is returned for immediate use; the refresh token
+// is delivered exclusively through the HttpOnly cookie and never
+// appears in JSON.
 type LoginResponse struct {
-	AccessToken  string     `json:"access_token"`
-	RefreshToken string     `json:"refresh_token"`
-	UIN          int64      `json:"uin"`
-	Username     string     `json:"username"`
-	User         AuthUser   `json:"user"`
-	Tokens       AuthTokens `json:"tokens"`
+	AccessToken string     `json:"access_token"`
+	UIN         int64      `json:"uin"`
+	Username    string     `json:"username"`
+	User        AuthUser   `json:"user"`
+	Tokens      AuthTokens `json:"tokens"`
 }
 
 // RefreshRequest is the body of POST /api/auth/refresh.
@@ -277,9 +281,10 @@ func (r *RefreshRequest) Validate() error {
 }
 
 // RefreshResponse is the success body of POST /api/auth/refresh.
+// The refresh token is delivered exclusively through the HttpOnly
+// cookie and never appears in JSON.
 type RefreshResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
+	AccessToken string `json:"access_token"`
 }
 
 // LogoutRequest is the optional body of POST /api/auth/logout.

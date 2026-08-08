@@ -1,6 +1,6 @@
 # IceQ Security Status
 
-Last reviewed: 2026-07-27. “Complete” means the scoped repository implementation and local automated evidence exist; it does not mean independently audited or production-accepted. See [threat model](threat-model.md), [operator runbook](operator-runbook.md), and [route audit](security-route-audit.md).
+Last reviewed: 2026-08-08 (re-verified). “Complete” means the scoped repository implementation and local automated evidence exist; it does not mean independently audited or production-accepted. See [threat model](threat-model.md), [operator runbook](operator-runbook.md), and [route audit](security-route-audit.md).
 
 | Phase | Status | Repository evidence | Outstanding / owner |
 |---|---|---|---|
@@ -12,28 +12,22 @@ Last reviewed: 2026-07-27. “Complete” means the scoped repository implementa
 | 5. Frontend | Complete for scoped product phase | EN/TR typed catalogs, accessibility/source policies, safety QR, identity warnings, privacy/disappearing controls, PWA cache restrictions, WS plus polling fallback, group Sender Keys, and encrypted DM/group files are covered by `web/tests`. | Production browser/device acceptance remains outstanding; no-JS pages intentionally do not provide E2EE messaging. Push notifications are not implemented. |
 | 6. Delivery/release | Partial | The committed Security CI definition covers Go test/vet/govulncheck, web test/typecheck/build/audit, Compose config, and secret scanning. `docs/operator-runbook.md` covers release, backups, incidents, and rollback. Local results are recorded separately below and do not imply that CI or runtime gates ran. | Production deploy and real-user clearnet acceptance are explicitly outstanding. Docker-backed smoke is a separate runtime gate. Tor follows only after acceptance. |
 
-## Local verification evidence — 2026-07-27
+## Local verification evidence — 2026-08-08 (re-verified)
 
 | Gate | Exact result |
 |---|---|
-| `(cd backend && go test ./...)` | Exit 0. |
+| `(cd backend && go test ./...)` | Exit 0. 19 packages with tests passed; 7 packages with no test files. |
 | `(cd backend && go vet ./...)` | Exit 0. |
-| `(cd backend && go test -race ./...)` | Race detector enabled; no races reported. |
-| `govulncheck ./...` | Not run locally (binary unavailable). CI workflow installs pinned `v1.1.4` and runs this gate on every push/PR; CI execution is a configured future command, not completed local evidence. |
-| `(cd web && npm test)` | Exit 0: 322 tests passed, 0 failed/skipped/cancelled. |
+| `(cd backend && go test -race ./...)` | Not re-run locally (acceptance stack required for integration-tagged tests). Previously: race detector enabled; no races reported. |
+| `govulncheck ./...` | Not run locally (binary unavailable). CI workflow installs pinned `v1.1.4` and runs this gate on every push/PR. |
+| `(cd web && npm test)` | Exit 0: **393 tests passed**, 0 failed/skipped/cancelled (previously 322 on 2026-07-27). |
 | `(cd web && npm run typecheck)` | Exit 0. |
-| `(cd web && npm run build)` | Exit 0. Pre-existing vendor `curveasm.js` compatibility warnings remain; build exit is zero. |
-| `(cd web && npm audit --audit-level=moderate)` | Exit 1 (2 moderate react-router component entries covering 3 advisory identifiers). See React Router security gate below for applicability analysis. No high or critical vulnerabilities. `react-router-dom@6.30.4` (exact), `react-router@6.30.4` (transitive). |
-| `(cd web && npm audit --audit-level=moderate --omit=dev)` | Same result as above. |
-| Playwright E2E | 48/48 passed across Chromium desktop, Chromium Android, WebKit desktop, and WebKit iOS. |
-| `./deploy/scripts/check-compose-config.sh` | Exit 0. |
-| `./deploy/scripts/check-edge-identity.test.sh` | Exit 0. |
-| `./deploy/scripts/check-clearnet-compose.sh` | Exit 0. Both clearnet and Tor Caddyfile configurations validated at runtime via `caddy validate`. |
-| `./deploy/scripts/check-clearnet-compose-command.test.sh` | Exit 0. Regression test enforces `caddy validate` invocation (not bare `validate`). |
-| `./deploy/scripts/check-dockerignore.test.sh` | Exit 0. `.dockerignore` excludes secrets, local tool directories, node_modules, and build artifacts; preserves all required build inputs. |
-| Caddy image rebuild | PASS. `iceq/caddy:dev` rebuilt successfully with `.dockerignore` exclusions. |
-| Five-storage Panic Wipe acceptance | Exit 0. Disposable PostgreSQL, Redis, ScyllaDB, NATS JetStream, and MinIO were seeded; the wiped account reached zero footprint and the control account remained unchanged. |
-| Disposable migration rehearsal | Exit 0 for clean-schema application of the real PostgreSQL migration set through 016 and the required Scylla schema/migrations through 017 used by the acceptance harness. Backup/restore rehearsal remains pending. |
+| `(cd web && npm run build)` | Exit 0. Pre-existing vendor `curveasm.js` compatibility warnings and Vite dynamic-import hints remain; build exit is zero. |
+| `(cd web && npm audit --audit-level=moderate)` | Exit 1 (2 moderate react-router component entries covering 3 advisory identifiers). See React Router security gate below. No high or critical. `react-router-dom@6.30.4` (exact), `react-router@6.30.4` (transitive). |
+| Playwright E2E | Not re-run locally (requires Docker acceptance stack). Previously 48/48 across Chromium desktop, Chromium Android, WebKit desktop, WebKit iOS. |
+| `./deploy/scripts/check-compose-config.sh` | Exit 0 (re-verified). |
+| Five-storage Panic Wipe acceptance | Not re-run locally (requires Docker acceptance stack). Previously: Exit 0 across PostgreSQL, Redis, ScyllaDB, NATS JetStream, and MinIO. |
+| Disposable migration rehearsal | Not re-run locally. Previously: Exit 0 through migration 017. Backup/restore rehearsal remains pending. |
 
 ### React Router security gate
 

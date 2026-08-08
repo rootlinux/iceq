@@ -273,8 +273,7 @@ func NewRefreshHandler(deps RefreshDeps) http.HandlerFunc {
 		setSessionCookies(w, tokens)
 		log.Printf("[auth-service] refresh (rotated)")
 		writeJSON(w, http.StatusOK, models.RefreshResponse{
-			AccessToken:  tokens.AccessToken,
-			RefreshToken: tokens.RefreshToken,
+			AccessToken: tokens.AccessToken,
 		})
 	}
 }

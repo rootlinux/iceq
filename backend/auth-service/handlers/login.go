@@ -302,10 +302,9 @@ func NewLoginHandler(deps LoginDeps) http.HandlerFunc {
 		setSessionCookies(w, tokens)
 		log.Printf("[auth-service] login successful")
 		writeJSON(w, http.StatusOK, models.LoginResponse{
-			AccessToken:  tokens.AccessToken,
-			RefreshToken: tokens.RefreshToken,
-			UIN:          uin,
-			Username:     username,
+			AccessToken: tokens.AccessToken,
+			UIN:         uin,
+			Username:    username,
 			User: models.AuthUser{
 				UIN:      uin,
 				Username: username,
