@@ -18,7 +18,7 @@
 # ----------------------------------------------------------------------------
 
 # ---- Stage 1: builder ------------------------------------------------------
-FROM node:20-alpine AS builder
+FROM node:25-alpine AS builder
 WORKDIR /app
 
 # Install deps first for cache friendliness. package-lock.json
