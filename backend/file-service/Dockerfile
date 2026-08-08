@@ -43,7 +43,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     -o /out/file-service ./file-service
 
 # ---- Stage 2: runtime --------------------------------------------------------
-FROM alpine:3.20 AS runtime
+FROM alpine:3.24 AS runtime
 
 RUN apk add --no-cache ca-certificates wget && \
     addgroup -S iceq && adduser -S iceq -G iceq
