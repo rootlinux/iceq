@@ -11,13 +11,28 @@ onion_script="$repo_root/deploy/scripts/onion-address.sh"
 # Static validation uses a non-secret fixture and never starts the signer.
 export ICEQ_EDGE_IDENTITY_HMAC_SECRET=${ICEQ_EDGE_IDENTITY_HMAC_SECRET:-01234567890123456789012345678901}
 
+# Honour ICEQ_ENV_FILE (CI supplies .env.example so docker compose can
+# resolve required variables like ICEQ_NATS_TOKEN).
+# ICEQ_ENV_FILE is interpreted relative to the Compose project directory
+# (deploy/) because it is also interpolated into env_file: directives.
+# The --env-file flag always receives the absolute path.
+if [ -n "${ICEQ_ENV_FILE:-}" ]; then
+  case "$ICEQ_ENV_FILE" in
+    /*) env_file_flag="--env-file $ICEQ_ENV_FILE" ;;
+    *)  env_file_flag="--env-file $repo_root/deploy/$ICEQ_ENV_FILE" ;;
+  esac
+else
+  env_file_flag=""
+fi
+
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
   exit 1
 }
 
 compose_services() {
-  docker compose -f "$compose_file" "$@" config --services
+  # shellcheck disable=SC2086
+  docker compose -f "$compose_file" $env_file_flag "$@" config --services
 }
 
 default_services=$(compose_services)
@@ -32,7 +47,7 @@ printf '%s\n' "$default_services" | grep -qx caddy-tor &&
 printf '%s\n' "$tor_services" | grep -qx caddy-tor ||
   fail "the tor profile must include the isolated Tor edge"
 
-default_config=$(docker compose -f "$compose_file" config)
+default_config=$(docker compose -f "$compose_file" $env_file_flag config)
 printf '%s\n' "$default_config" | grep -Eq '^[[:space:]]+tor:$' &&
   fail "default resolved Compose configuration contains the Tor service"
 printf '%s\n' "$default_config" | grep -Eq 'condition:.*tor|tor:.*condition' &&
