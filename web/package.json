@@ -36,7 +36,7 @@
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^6.0.3",
     "autoprefixer": "^10.4.19",
-    "fake-indexeddb": "^6.2.5",
+    "fake-indexeddb": "^6.2.6",
     "postcss": "^8.4.39",
     "sharp": "^0.35.3",
     "tailwindcss": "^3.4.6",
